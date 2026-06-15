@@ -54,6 +54,10 @@ The article moves the resistor from R2584 over to R2577. You don't have to be
 that tidy: **I just bridged R2577 with a blob of solder and it booted from SD on
 the first try** — a solid pull-up to Vcc beats the 20k pull-down.
 
+![Where R2577 and R2584 sit on the board, magnified](images/r2577-location.jpg)
+
+*R2577 (the SD pull-up to add/bridge) and the factory R2584, under a loupe.*
+
 Two things that make life easier:
 
 - **With no MicroSD inserted, the board falls back to JTAG mode automatically.**
@@ -183,3 +187,37 @@ and not the 7020.
 Two LEDs (D18 and H18) alternate at about 1–2 Hz. That's the whole toolchain
 working end to end. Head to [Step 1](../01-board-bringup-blink/) for what the
 design actually does and why it's built the way it is.
+
+## Expansion board reference
+
+The shield (an AliExpress EBAZ4205 adapter) carries an HDMI connector, four LEDs,
+four buttons, and a 5V DC jack, and plugs onto the board's DATA1/DATA2/DATA3 edge
+connectors.
+
+![EBAZ4205 expansion board: HDMI, 5V jack, buttons, LEDs, labelled GPIO](images/expansion-board.jpg)
+
+**HDMI is "family B" wiring — TMDS clock on F19/F20.** Two incompatible HDMI
+pinouts exist for these adapters; the other one ("family A", clock on H16/H17)
+gives a blank screen here, because on this board H16/H17 are the UART. Step 3
+uses family B.
+
+| Function | FPGA pins |
+|----------|-----------|
+| TMDS clock | F19 / F20 |
+| TMDS data 0/1/2 | D19/D20, C20/B20, B19/A20 |
+| LED1..LED4 | D18, H18, E19, K17 (active high) |
+| KEY1..KEY4 | P19, T19, U20, U19 (active low) |
+
+All verified on hardware. The bitstreams map **FPGA pins** to functions, not the
+silkscreen labels.
+
+Full DATA1/2/3 connector → FPGA pin map:
+
+![EBAZ4205 DATA1/2/3 connector to FPGA pin map](images/data-connectors-pinout.jpg)
+
+## Further reading
+
+Theodore Okelo's [Getting started with the EBAZ4205
+(Zynq-7000)](https://theokelo.co.ke/getting-starting-with-ebaz4205-zynq-7000/) is
+a great walkthrough and the source for a lot of the board specifics here — the
+boot-mode resistor, the JTAG-on-no-card behaviour, and the boot-mode switch idea.

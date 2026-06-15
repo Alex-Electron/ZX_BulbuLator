@@ -95,6 +95,10 @@ So far:
   input: the four shield buttons freeze the blink, force the LEDs on or off, or
   speed them up. Small lessons in active-low inputs, two-flop synchronizers, and
   gating a counter.
+- **[Step 3 — Primitive HDMI: colour bars](research/03-hdmi-bars/).** First
+  picture on the screen — eight 720p colour bars. The first design that needs the
+  PS for a clean pixel clock, and the one where I learned FCLK0 only reaches the
+  fabric after `ps7_post_config` enables the PS→PL level shifters.
 
 More steps get added as I get them working.
 
