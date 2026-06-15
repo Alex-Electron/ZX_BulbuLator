@@ -1,9 +1,8 @@
 # Step 4 — HDMI with button-switched patterns
 
 Step 3 put a still image on the screen. This adds interactivity: the four shield
-buttons change what's drawn. It's the full demo that first ran on the 7020,
-rebuilt for the 7010. Same video path as Step 3 (PS7 → FCLK0 → MMCM → rgb2dvi),
-same flash recipe — only the pattern generator is richer.
+buttons change what's drawn. Same video path as Step 3 (PS7 → FCLK0 → MMCM →
+rgb2dvi), same flash recipe — only the pattern generator is richer.
 
 ## What's on screen
 

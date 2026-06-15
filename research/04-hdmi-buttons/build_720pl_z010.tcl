@@ -1,7 +1,5 @@
-# HDMI 1280x720 demo with buttons — PORTED to the real chip xc7z010clg400-1.
-# Same sources and same XDC as the z020 build (clg400 package => identical pins),
-# so the buttons behave exactly the same. Only the -part changes.
-# Expected bitstream size ~2_083_852 bytes (7010), NOT ~4_045_691 (7020).
+# HDMI 1280x720 demo with buttons for xc7z010clg400-1.
+# Expected bitstream size ~2,083,867 bytes.
 # Build from this script's directory; expects pattern_gen.v, clkgen.v, hdmi.xdc
 # alongside it (the runner copies pattern_gen3.v -> pattern_gen.v, clkgen2.v ->
 # clkgen.v, hdmi_btn720.xdc -> hdmi.xdc).

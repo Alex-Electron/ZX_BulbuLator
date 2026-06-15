@@ -24,11 +24,9 @@ checked on real hardware.
 
 ## Target board
 
-The primary board, from 2026-06-15 on, is the EBAZ4205 with the Zynq-7010
-(`XC7Z010`). It is the most common version of this board on the second-hand
-market, so the cores get built and tested against it first. The 7020
-(`XC7Z020`) is a secondary target; it needs its own FSBL and the J8 header
-soldered on. Details are in [`docs/HARDWARE.md`](docs/HARDWARE.md).
+The board is the EBAZ4205 with the Zynq-7010 (`XC7Z010`), the most common version
+of this board on the second-hand market. Everything here is built and tested
+against it. Details are in [`docs/HARDWARE.md`](docs/HARDWARE.md).
 
 ## What it should do
 
@@ -99,9 +97,9 @@ So far:
   picture on the screen — eight 720p colour bars. The first design that needs the
   PS for a clean pixel clock, and the one where I learned FCLK0 only reaches the
   fabric after `ps7_post_config` enables the PS→PL level shifters.
-- **[Step 4 — HDMI with button-switched patterns](research/04-hdmi-buttons/).**
-  The full 7020 demo brought up on the 7010: a bouncing square plus colour bars,
-  gradient, and checkerboard, switched live with the four shield buttons.
+- **[Step 4 — HDMI with button-switched patterns](research/04-hdmi-buttons/).** A
+  bouncing square plus colour bars, gradient, and checkerboard, switched live with
+  the four shield buttons.
 
 More steps get added as I get them working.
 

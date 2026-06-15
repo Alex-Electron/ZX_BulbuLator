@@ -179,8 +179,7 @@ vivado -mode batch -source build_blink_z010.tcl
 ```
 
 Target part is `xc7z010clg400-1`. You should get a `blink_z010.bit` of about
-2,083,856 bytes — that exact size is a handy check that the build hit the 7010
-and not the 7020.
+2,083,856 bytes — that exact size is a handy check that the build hit the 7010.
 
 ## Result
 

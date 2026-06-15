@@ -5,24 +5,14 @@
 ## Board: EBAZ4205
 
 The EBAZ4205 is a Zynq-7000 board pulled out of Ebang Bitcoin mining gear. It is
-cheap and easy to find, which is the whole reason it was picked for this
-project.
+cheap and easy to find, which is the whole reason it was picked for this project.
 
-These boards come with one of two chips:
+The target is the **Zynq-7010** (`XC7Z010`) version — the most common one on the
+second-hand market, so building and testing against it keeps the work lined up
+with what most people actually have in hand. Everything here targets
+`xc7z010clg400-1`.
 
-| Variant | Chip      | Role in this project                            |
-|---------|-----------|-------------------------------------------------|
-| 7010    | `XC7Z010` | Primary target, from 2026-06-15                 |
-| 7020    | `XC7Z020` | Secondary; needs its own FSBL and a soldered J8 |
-
-### Why the 7010 is primary
-
-The 7010 is simply the version most people have. Building and testing against it
-first keeps the work lined up with what is actually sitting on desks. The 7020
-has more logic, but it is rarer and needs extra bring-up (a separate FSBL, the
-J8 header soldered on), so it stays the secondary board for now.
-
-PetaLinux 2024.1 already boots on the 7010 board here.
+PetaLinux 2024.1 already boots on the board here.
 
 ## Expansion shield
 

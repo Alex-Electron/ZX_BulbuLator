@@ -72,7 +72,7 @@ vivado -mode batch -source build_blink_z010.tcl
 
 The result is `blink_z010.bit`, about 2,083,856 bytes. That size is the fixed
 configuration length of the 7010, so it doubles as a sanity check that the build
-targeted the right device (a 7020 bitstream is roughly 4,045,000 bytes).
+targeted the right device.
 
 A pre-built `blink_z010.bit` is included here.
 
