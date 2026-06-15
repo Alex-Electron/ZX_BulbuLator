@@ -1,3 +1,7 @@
+# macOS / YandexDisk junk
+.DS_Store
+._*
+
 # Prerequisites
 *.d
 

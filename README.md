@@ -8,6 +8,11 @@ A hardware ZX Spectrum emulator on a Xilinx Zynq SoC. The plan is to take the
 MiST / MiSTer Spectrum cores and bring them up on the cheap, easy-to-find
 EBAZ4205 board, reworking them for the Xilinx architecture along the way.
 
+![EBAZ4205 board wired to the HDMI/audio and buttons expansion shield](docs/images/board.jpg)
+
+*The EBAZ4205 (Zynq-7010) next to the HDMI / audio + buttons shield, powered up
+and running.*
+
 The biggest change from the original cores is memory. MiST drives an external
 SDRAM controller; here the Spectrum RAM sits in on-chip BRAM and is reached over
 AXI, which takes a lot of timing and routing pain off the table on this board.
