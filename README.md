@@ -1,5 +1,7 @@
 # BulbuLator
 
+![BulbuLator — ZX Spectrum on Zynq-7010 (EBAZ4205)](docs/images/splash.jpg)
+
 Developed by: Alexander Lavrinovich<br>
 GitHub: https://github.com/Alex-Electron<br>
 Email: EU1L@mail.ru
