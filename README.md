@@ -80,6 +80,10 @@ what it proves and what tripped me up. They live in [`research/`](research/).
 
 So far:
 
+- **[Step 0 — Setup & wiring](research/00-setup/).** Starting from a bare board:
+  power, the SD boot-mode strap, hooking up a JTAG programmer (a normal cable or
+  a Raspberry Pi Pico), installing Vivado, and flashing a bitstream — enough for
+  someone with no FPGA background to get to a blinking LED.
 - **[Step 1 — LED blink](research/01-board-bringup-blink/).** The smallest "is
   this board even alive" test: a counter on the chip's internal oscillator
   blinking two LEDs in anti-phase. It proved that power, JTAG, and PL

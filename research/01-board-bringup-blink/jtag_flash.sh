@@ -4,14 +4,16 @@
 # Logs to /tmp/flash_z010.log
 exec > /tmp/flash_z010.log 2>&1
 BIT="${1:?need bit path}"
-HWS=/tools/Xilinx/Vivado_Lab/2023.1/bin/hw_server
-VLAB=/tools/Xilinx/Vivado_Lab/2023.1/bin/vivado_lab
+# Override these for your machine: VIVADO_LAB, HW_SERVER, XVCD_PICO.
+VLAB="${VIVADO_LAB:-$(command -v vivado_lab || echo /tools/Xilinx/Vivado_Lab/2023.1/bin/vivado_lab)}"
+HWS="${HW_SERVER:-$(dirname "$VLAB")/hw_server}"
+XVCD="${XVCD_PICO:-$HOME/xvc-pico/daemon/xvcd-pico}"
 
 echo "=== flashing: $BIT ($(date +%T)) ==="
 if [ "$(ss -ltn 2>/dev/null | grep -c :2542)" = "0" ]; then
   echo "restart xvcd-pico"
   sudo -n pkill -9 -f xvcd-pico 2>/dev/null; sleep 1; sudo -n rm -f /tmp/xvcd.log
-  sudo -n bash -c 'setsid /home/lavrinovich/xvc-pico/daemon/xvcd-pico >/tmp/xvcd.log 2>&1 </dev/null &'
+  sudo -n bash -c "setsid '$XVCD' >/tmp/xvcd.log 2>&1 </dev/null &"
   sleep 3
 fi
 if [ "$(ss -ltn 2>/dev/null | grep -c :3121)" = "0" ]; then
