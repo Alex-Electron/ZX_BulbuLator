@@ -26,7 +26,8 @@ checked on real hardware.
 
 The board is the EBAZ4205 with the Zynq-7010 (`XC7Z010`), the most common version
 of this board on the second-hand market. Everything here is built and tested
-against it. Details are in [`docs/HARDWARE.md`](docs/HARDWARE.md).
+against it. There are also boards with a custom-soldered `XC7Z020` (more logic,
+but pricier) — see [`docs/HARDWARE.md`](docs/HARDWARE.md) for details.
 
 ## What it should do
 

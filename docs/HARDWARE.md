@@ -12,6 +12,13 @@ second-hand market, so building and testing against it keeps the work lined up
 with what most people actually have in hand. Everything here targets
 `xc7z010clg400-1`.
 
+There are also boards out there with a **custom-soldered `XC7Z020`** in place of
+the 7010 — the same board, but with more programmable logic. You can buy those
+too; they cost more, since the bigger chip is an aftermarket rework rather than
+how these boards originally shipped. (I have one of those as well.) The package
+is identical (`clg400`), so the pinout matches and a 7020 build is just a change
+of `-part`.
+
 PetaLinux 2024.1 already boots on the board here.
 
 ## Expansion shield
