@@ -91,6 +91,10 @@ So far:
   flash cleanly with the patched ("soft edges") Pico firmware, and that a design
   clocked from the PS stays dark until FCLK0 is brought up over JTAG — which is
   exactly why the blink runs off the internal oscillator instead.
+- **[Step 2 — Buttons drive the LEDs](research/02-buttons-and-leds/).** Adds
+  input: the four shield buttons freeze the blink, force the LEDs on or off, or
+  speed them up. Small lessons in active-low inputs, two-flop synchronizers, and
+  gating a counter.
 
 More steps get added as I get them working.
 
