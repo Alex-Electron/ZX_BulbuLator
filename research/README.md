@@ -12,6 +12,7 @@ verified on real hardware.
 | [02 — Buttons drive the LEDs](02-buttons-and-leds/) | Reading the four shield buttons (active-low, synchronized) and using them to change the LEDs |
 | [03 — Primitive HDMI: colour bars](03-hdmi-bars/) | First picture on screen — eight 720p colour bars, clocked from the PS (the level-shifter / `ps7_post_config` lesson) |
 | [04 — HDMI with button-switched patterns](04-hdmi-buttons/) | A bouncing square and four patterns (bars, gradient, checkerboard) the shield buttons switch between |
+| [05 — HDMI audio: the square beeps](05-hdmi-beep/) | First sound — the bouncing square beeps over HDMI audio when it hits a wall, using the hdl-util/hdmi core |
 
 More steps get added here as the bring-up continues (FCLK0 over JTAG, HDMI
 output, buttons, sound, and so on).

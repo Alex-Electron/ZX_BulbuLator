@@ -101,6 +101,9 @@ So far:
 - **[Step 4 — HDMI with button-switched patterns](research/04-hdmi-buttons/).** A
   bouncing square plus colour bars, gradient, and checkerboard, switched live with
   the four shield buttons.
+- **[Step 5 — HDMI audio: the square beeps](research/05-hdmi-beep/).** First sound:
+  the bouncing square plays a beep over HDMI audio every time it hits a wall,
+  using the open-source hdl-util/hdmi core for the TMDS and audio packets.
 
 More steps get added as I get them working.
 
