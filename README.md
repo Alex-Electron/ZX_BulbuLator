@@ -66,10 +66,29 @@ Flashing the dense bitstreams used to fail until a Raspberry Pi Pico running
 custom XVC firmware (slow slew, 2 mA drive) sorted it out. Next job is a full
 physical PS/2 keyboard through the matrix logic.
 
-## Research
+## Learning the board
 
-Bring-up steps and experiments, each with sources and a ready bitstream, live in
-[`research/`](research/). Step 1 is the board bring-up LED blink.
+I'm figuring this board out as I go — Zynq, the EBAZ4205, and FPGA work in
+general are new ground for me — so this repo doubles as a lab notebook. Instead
+of dropping a finished emulator, the plan is to bring the board up one small,
+verified experiment at a time and write down what actually happened, dead ends
+included. When something only works after three tries, that's the part worth
+recording.
+
+Each step is self-contained: sources, a ready-to-flash bitstream, and notes on
+what it proves and what tripped me up. They live in [`research/`](research/).
+
+So far:
+
+- **[Step 1 — LED blink](research/01-board-bringup-blink/).** The smallest "is
+  this board even alive" test: a counter on the chip's internal oscillator
+  blinking two LEDs in anti-phase. It proved that power, JTAG, and PL
+  configuration all work. Along the way I learned that dense bitstreams only
+  flash cleanly with the patched ("soft edges") Pico firmware, and that a design
+  clocked from the PS stays dark until FCLK0 is brought up over JTAG — which is
+  exactly why the blink runs off the internal oscillator instead.
+
+More steps get added as I get them working.
 
 ## License
 

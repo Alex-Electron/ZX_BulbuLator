@@ -31,13 +31,18 @@ the batch), so check silkscreen against your board. The rule is the same: one
 
 A green power LED on the board lights when 5V is applied.
 
-### JTAG: xvc-pico on the build host
+### JTAG programmer
 
-Programming goes through a Raspberry Pi Pico running the xvc-pico firmware,
-connected to the board's JTAG header. Use the firmware with the "soft edges"
-patch (slow slew rate + 2 mA drive); without it, dense bitstreams fail with
-BAD_PACKET. The stack on the host is `xvcd-pico` (XVC server on :2542) →
-`hw_server` (:3121) → `vivado_lab`.
+You need a JTAG programmer that Vivado can talk to. Any Vivado-compatible cable
+works — a Digilent or Xilinx adapter, an FTDI-based one, or, what I use here, a
+Raspberry Pi Pico running the xvc-pico firmware over XVC. It's just one of the
+options.
+
+If you take the Pico route, use the firmware with the "soft edges" patch (slow
+slew rate + 2 mA drive); without it, dense bitstreams fail with BAD_PACKET. The
+stack is then `xvcd-pico` (XVC server on :2542) → `hw_server` (:3121) →
+`vivado_lab`, which is what `jtag_flash.sh` here drives. With any other cable you
+can skip that and just use the Vivado Hardware Manager directly.
 
 ## What it does
 
