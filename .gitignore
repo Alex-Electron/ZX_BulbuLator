@@ -2,58 +2,32 @@
 .DS_Store
 ._*
 
-# Prerequisites
-*.d
+# Vivado / Vitis build artifacts.
+# This repo commits only sources and prebuilt bitstreams; the full projects are
+# built elsewhere, so the generated project tree never needs to land here.
+*.jou
+*.log
+*.str
+.Xil/
+*.cache/
+*.hw/
+*.runs/
+*.gen/
+*.sim/
+*.ip_user_files/
+*.dcp
+*.xpr
+*.xsa
+xsim.dir/
+webtalk*.jou
+webtalk*.log
+usage_statistics_webtalk*
+.jobs/
 
-# Object files
-*.o
-*.ko
-*.obj
-*.elf
-
-# Linker output
-*.ilk
-*.map
-*.exp
-
-# Precompiled Headers
-*.gch
-*.pch
-
-# Libraries
-*.lib
-*.a
-*.la
-*.lo
-
-# Shared objects (inc. Windows DLLs)
-*.dll
-*.so
-*.so.*
-*.dylib
-
-# Executables
-*.exe
-*.out
-*.app
-*.i*86
-*.x86_64
-*.hex
-
-# Debug files
-*.dSYM/
-*.su
-*.idb
-*.pdb
-
-# Kernel Module Compile Results
-*.mod*
-*.cmd
-.tmp_versions/
-modules.order
-Module.symvers
-Mkfile.old
-dkms.conf
-
-# debug information files
-*.dwo
+# Intentionally NOT ignored (these are the point of the repo):
+#   *.bit / *.bin  — bitstreams and boot images
+#   *.uf2          — Pico firmware
+#   *.v *.sv *.vhd — HDL sources
+#   *.xdc          — constraints
+#   *.tcl *.sh     — build/flash scripts
+#   *.hex          — memory init / ROM images
