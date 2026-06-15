@@ -10,6 +10,15 @@ oscillator. HDMI needs a clean, exact pixel clock (74.25 MHz for 720p), and the
 only stable clock on this board comes from the PS, derived from the 33.333 MHz
 crystal.
 
+**Why not take the crystal directly?** On the EBAZ4205 the 33.333 MHz crystal is
+wired only to the PS clock input — there's no board trace from it to a
+clock-capable PL pin. The PS PLLs make every clock, and the PL gets them over the
+FCLK0–3 lines. So "clock from the crystal" *is* what happens here: crystal →
+IO-PLL → FCLK0 → PL. The internal oscillator (CFGMCLK) used in Steps 1–2 needs no
+crystal but drifts too much for video. The only way to feed the PL a crystal-
+clean clock without the PS would be to wire an external oscillator onto a
+clock-capable PL pin (some DATA-header pins are MRCC) — a hardware mod.
+
 ## How the video is built
 
 ```
@@ -40,17 +49,21 @@ the fabric (the H18 heartbeat stayed dark).
 The missing piece was **`ps7_post_config`**, which enables the PS→PL **level
 shifters** (`LVL_SHFTR_EN`). FCLK0 was being generated the whole time, but
 without the level shifters on, it never crossed from the PS into the PL. The
-working order is the same one an FSBL uses on boot:
+working order is the same one an FSBL uses on boot: bring the clocks up, load the
+PL, then enable the level shifters.
 
-```
-ps7_init           ;# clocks up, FCLK0 = 100 MHz
-fpga -file ...      ;# load the PL bitstream
-ps7_post_config    ;# enable PS→PL level shifters → FCLK0 reaches the fabric
-```
+[`flash_stripes.sh`](flash_stripes.sh) does this over JTAG in two reliable parts:
 
-[`flash_stripes.sh`](flash_stripes.sh) does exactly that over JTAG (it drives
-`xsdb`), using [`ps7_init_fclk.tcl`](ps7_init_fclk.tcl) for the FCLK0=100 MHz
-setup. With a normal SD boot, the FSBL handles this sequence for you.
+1. **Program the PL with `vivado_lab`** (`program_hw_devices`, with retries). This
+   is the robust path. An earlier version used xsdb's `fpga -file` and it failed
+   intermittently on the dense bitstream (`DONE PIN is not HIGH`), so it's gone.
+2. **Bring up the PS clock with `xsdb`:** `ps7_init` (FCLK0 = 100 MHz from
+   [`ps7_init_fclk.tcl`](ps7_init_fclk.tcl)) then `ps7_post_config` (level
+   shifters). The already-loaded MMCM re-locks on the new clock and the bars
+   appear.
+
+With a normal SD boot, the FSBL does all of part 2 for you, so you'd only load
+the PL.
 
 ## Build
 
@@ -71,9 +84,9 @@ Target part `xc7z010clg400-1`, output ~2,083,867 bytes. A prebuilt
 bash flash_stripes.sh hdmi_stripes_z010.bit
 ```
 
-Look for `PS7_INIT_DONE → FPGA_PROGRAMMED → PS7_POST_CONFIG_DONE`. (Any
-Vivado-supported JTAG cable works; see [Step 0](../00-setup/). The script is
-written for the Pico/xvc-pico setup.)
+You should see `End of startup status: HIGH` from part 1, then `PS7_INIT_DONE`
+and `PS7_POST_CONFIG_DONE` from part 2. (Any Vivado-supported JTAG cable works;
+see [Step 0](../00-setup/). The script is written for the Pico/xvc-pico setup.)
 
 ## Expected result
 
