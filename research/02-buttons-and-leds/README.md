@@ -21,11 +21,10 @@ hold a button and:
 With nothing pressed, the LEDs blink in anti-phase, same as Step 1. The LEDs are
 D18 and H18, the same two as Step 1.
 
-> **Note on the physical buttons.** Which button (the silkscreen KEY1–KEY4) lands
-> on which pin depends on how your expansion board is wired. On my board the
-> middle two came out swapped from the labels — the key I'd call KEY2 acts as
-> "off" and KEY3 as "on". The pin → function mapping above is what the bitstream
-> actually does; the physical labels may differ, so press each and see.
+> **Note.** The mapping above is by **FPGA pin**, which is what the bitstream
+> fixes. Which physical button (the silkscreen KEY1–KEY4) reaches which pin
+> depends on how your expansion board is wired, so go by the pin — wire the
+> buttons to P19/T19/U20/U19 and they behave as listed.
 
 ## How it works
 
