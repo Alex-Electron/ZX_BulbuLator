@@ -32,22 +32,43 @@ Two common options:
 
 A green LED on the board lights when power is good. Don't go further until it's lit.
 
-## 2. Boot mode = SD card (soldering)
+## 2. Boot mode
 
-Set the board to boot from the SD card. We program the PL over JTAG while the PS
-is running, and a clean SD boot leaves the PS in a known-good state.
+The EBAZ4205 picks its boot source from two strap pins — IO0 (MIO5) and IO2
+(MIO4) — set by a handful of resistors near the NAND chip:
 
-- **Solder the MicroSD socket** if your board doesn't have one (many ship without).
-- **Move the 0-ohm boot-select resistor to the SD position.** On this board that
-  is **R2577** (moved off the NAND position, **R2584**). This drives the MIO[5:4]
-  boot strap to SD. Designators shift between board revisions (R2577 / R2584 /
-  R2585 show up depending on the batch) — match the silkscreen, the idea is the
-  same: one 0-ohm resistor, NAND position vs SD position.
-- Put a **bootable image** on the card so the PS comes up. Building your own
-  FSBL/U-Boot/PetaLinux is a later step; for now a community EBAZ4205 PetaLinux
-  or PYNQ SD image works. (The blink itself is pure PL and uses the chip's own
-  oscillator, but the board still needs to boot far enough that JTAG PL
-  programming is clean.)
+| Mode | IO0 (MIO5) | IO2 (MIO4) |
+|------|:----------:|:----------:|
+| JTAG | 0 | 0 |
+| NAND | 0 | 1 |
+| SD   | 1 | 1 |
+
+![EBAZ4205 boot-strap schematic and truth table](images/Boot-Mode.jpg)
+
+Out of the factory the board is in **NAND** mode: `R2584` (20k) pulls IO0 to GND
+and `R2578` (20k) pulls IO2 to Vcc. To get **SD** mode you only need IO0 high
+(IO2 is already high), so add the IO0 pull-up at **R2577** — the empty "NC"
+position right next to R2584.
+
+The article moves the resistor from R2584 over to R2577. You don't have to be
+that tidy: **I just bridged R2577 with a blob of solder and it booted from SD on
+the first try** — a solid pull-up to Vcc beats the 20k pull-down.
+
+Two things that make life easier:
+
+- **With no MicroSD inserted, the board falls back to JTAG mode automatically.**
+  For pure JTAG work you can leave the card out and not touch the resistors at all.
+- The MicroSD socket is **already populated on most boards** — no soldering there.
+
+For the blink in Step 1 the bitstream goes in over JTAG, so you don't need a
+bootable card yet; building an SD boot image is a later step.
+
+Next time I'd rather flip boot modes with a **switch or jumper** than re-solder —
+the article's author wired up two SPDT switches for exactly that. The solder
+bridge on R2577 is permanent-but-fine for now.
+
+Boot-strap details and schematic from the
+[theokelo.co.ke EBAZ4205 guide](https://theokelo.co.ke/getting-starting-with-ebaz4205-zynq-7000/).
 
 ## 3. Install the software
 
@@ -78,20 +99,26 @@ reboots as a JTAG adapter. (This is the "soft edges" build — slow slew rate an
 errors. Source: the `zynq-dense-bitstreams` branch of the fork, also offered
 upstream as [kholia/xvc-pico#3](https://github.com/kholia/xvc-pico/pull/3).)
 
-**Wire the Pico to the board's JTAG header.** Both are 3.3V, so they connect
-directly. The signal names match — no crossing of TDI/TDO.
+**Wire the Pico to the board's JTAG header.** The JTAG header is **J8** (pins
+labelled TDI, TDO, TCK, TMS, VCC). The serial console, if you want it later, sits
+on **J7** (VCC, RXD, TXD, GND).
 
-| JTAG signal | Pico        | EBAZ4205 JTAG header |
-|-------------|-------------|----------------------|
-| TDI         | GPIO16      | TDI                  |
-| TDO         | GPIO17      | TDO                  |
-| TCK         | GPIO18      | TCK                  |
-| TMS         | GPIO19      | TMS                  |
-| GND         | pin 23      | GND                  |
+![EBAZ4205 J7 (UART) and J8 (JTAG) headers](images/uart-jtag.jpg)
 
-The EBAZ4205 JTAG header pin order, top to bottom, is: **3.3V, GND, TCK, TDO,
-TDI, TMS**. Match by name on the silkscreen. You don't need to connect the
-header's 3.3V to the Pico — just the four signals and a common GND.
+Both the Pico and the board run at 3.3V, so they connect directly, and the signal
+names line up — no crossing of TDI/TDO.
+
+| JTAG signal | Pico   | EBAZ4205 J8 |
+|-------------|--------|-------------|
+| TDI         | GPIO16 | TDI         |
+| TDO         | GPIO17 | TDO         |
+| TCK         | GPIO18 | TCK         |
+| TMS         | GPIO19 | TMS         |
+| GND         | pin 23 | GND         |
+
+You don't need to wire J8's VCC to the Pico — just the four signals plus a common
+ground. (Header photo from the [xvc-pico](https://github.com/Alex-Electron/xvc-pico)
+project's EBAZ4205 notes.)
 
 **Run the XVC daemon on the host.** It bridges the Pico's USB to a Xilinx
 Virtual Cable on TCP port 2542. Either build it from the
