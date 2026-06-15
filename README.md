@@ -66,6 +66,11 @@ Flashing the dense bitstreams used to fail until a Raspberry Pi Pico running
 custom XVC firmware (slow slew, 2 mA drive) sorted it out. Next job is a full
 physical PS/2 keyboard through the matrix logic.
 
+## Research
+
+Bring-up steps and experiments, each with sources and a ready bitstream, live in
+[`research/`](research/). Step 1 is the board bring-up LED blink.
+
 ## License
 
 [MIT](LICENSE) © Alexander Lavrinovich
