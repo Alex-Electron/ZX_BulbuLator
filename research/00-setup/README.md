@@ -75,7 +75,8 @@ it shows up as a `RPI-RP2` drive. Copy
 [`firmware/xvcPico_v2_soft_edges.uf2`](firmware/) onto that drive. The Pico
 reboots as a JTAG adapter. (This is the "soft edges" build — slow slew rate and
 2 mA drive — which is what makes dense bitstreams flash without BAD_PACKET
-errors.)
+errors. Source: the `zynq-dense-bitstreams` branch of the fork, also offered
+upstream as [kholia/xvc-pico#3](https://github.com/kholia/xvc-pico/pull/3).)
 
 **Wire the Pico to the board's JTAG header.** Both are 3.3V, so they connect
 directly. The signal names match — no crossing of TDI/TDO.
