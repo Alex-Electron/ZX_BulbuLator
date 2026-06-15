@@ -1,5 +1,9 @@
 # BulbuLator
 
+Developed by: Alexander Lavrinovich<br>
+GitHub: https://github.com/Alex-Electron<br>
+Email: EU1L@mail.ru
+
 A hardware ZX Spectrum emulator on a Xilinx Zynq SoC. The plan is to take the
 MiST / MiSTer Spectrum cores and bring them up on the cheap, easy-to-find
 EBAZ4205 board, reworking them for the Xilinx architecture along the way.

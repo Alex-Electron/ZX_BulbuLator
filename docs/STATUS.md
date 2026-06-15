@@ -1,5 +1,7 @@
 # Status
 
+> Developed by: Alexander Lavrinovich · GitHub: https://github.com/Alex-Electron · Email: EU1L@mail.ru
+
 Last updated: 2026-06-15
 
 ## Done

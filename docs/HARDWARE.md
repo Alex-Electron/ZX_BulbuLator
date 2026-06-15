@@ -1,5 +1,7 @@
 # Hardware
 
+> Developed by: Alexander Lavrinovich · GitHub: https://github.com/Alex-Electron · Email: EU1L@mail.ru
+
 ## Board: EBAZ4205
 
 The EBAZ4205 is a Zynq-7000 board pulled out of Ebang Bitcoin mining gear. It is
