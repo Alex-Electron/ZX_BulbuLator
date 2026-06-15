@@ -11,6 +11,7 @@ verified on real hardware.
 | [01 — Board bring-up: LED blink](01-board-bringup-blink/) | Power, JTAG → PL path, and a running bitstream, using only the chip's internal oscillator |
 | [02 — Buttons drive the LEDs](02-buttons-and-leds/) | Reading the four shield buttons (active-low, synchronized) and using them to change the LEDs |
 | [03 — Primitive HDMI: colour bars](03-hdmi-bars/) | First picture on screen — eight 720p colour bars, clocked from the PS (the level-shifter / `ps7_post_config` lesson) |
+| [04 — HDMI with button-switched patterns](04-hdmi-buttons/) | The full 7020 demo on the 7010: a bouncing square and four patterns the shield buttons switch between |
 
 More steps get added here as the bring-up continues (FCLK0 over JTAG, HDMI
 output, buttons, sound, and so on).

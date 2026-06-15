@@ -99,6 +99,9 @@ So far:
   picture on the screen — eight 720p colour bars. The first design that needs the
   PS for a clean pixel clock, and the one where I learned FCLK0 only reaches the
   fabric after `ps7_post_config` enables the PS→PL level shifters.
+- **[Step 4 — HDMI with button-switched patterns](research/04-hdmi-buttons/).**
+  The full 7020 demo brought up on the 7010: a bouncing square plus colour bars,
+  gradient, and checkerboard, switched live with the four shield buttons.
 
 More steps get added as I get them working.
 
