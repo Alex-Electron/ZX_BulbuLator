@@ -22,6 +22,22 @@ and matches — including the ULA quirks the timing test programs poke at.
   `LOAD ""` / the Tape Loader picks it up.
 - **Boots from SD** (FSBL configures the PL from `BOOT.BIN`), or over JTAG.
 
+## Proof it works — and the timing holds
+
+![ULA128 timing test running on the board](images/ula128-timing-test.jpg)
+
+*The ULA128 timing test — a program written to expose ULA/contention inaccuracies.
+It renders cleanly here and matches ZEsarUX, so the core's timing holds up.*
+
+![Ringo loading from tape, with multicolour loading-border stripes](images/ringo-loading.jpg)
+
+*Ringo loading from tape through the J19 input — the multicolour loading border
+(itself timing-critical) comes through correctly.*
+
+![Ringo running in-game on the board](images/ringo-game.jpg)
+
+*…and Ringo in-game.*
+
 ## Not reinventing the wheel
 
 The Spectrum itself is the open-source **Atlas `zx`** core (T80 Z80, the ULA, AY via

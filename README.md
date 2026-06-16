@@ -15,6 +15,12 @@ EBAZ4205 board, reworking them for the Xilinx architecture along the way.
 *The EBAZ4205 (Zynq-7010) next to the HDMI / audio + buttons shield, powered up
 and running.*
 
+![The ZX Spectrum 128 boot menu running on the board over HDMI](docs/images/spectrum-128-menu.jpg)
+
+*And here it is working — the genuine © 1986 Sinclair ZX Spectrum 128 boot menu
+(Tape Loader / 128 BASIC / Calculator / 48 BASIC / Tape Tester) on the EBAZ4205 over
+HDMI. The full build is [Step 6](research/06-zx-spectrum-128/).*
+
 The biggest change from the original cores is memory. MiST drives an external
 SDRAM controller; here the Spectrum RAM sits in on-chip BRAM and is reached over
 AXI, which takes a lot of timing and routing pain off the table on this board.
