@@ -1,6 +1,6 @@
 # Hardware
 
-> Developed by: Alexander Lavrinovich · GitHub: https://github.com/Alex-Electron · Email: EU1L@mail.ru
+> Developed by: Alexander Lavrinovich · GitHub: https://github.com/Alex-Electron · Email: lavrinovich.alex@gmail.com
 
 ## Board: EBAZ4205
 

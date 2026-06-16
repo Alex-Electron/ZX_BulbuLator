@@ -1,7 +1,7 @@
 `timescale 1ns/1ps
 //-------------------------------------------------------------------------------------------------
 // bulbulator_zx_top.v
-// Contact: EU1L@mail.ru
+// Contact: lavrinovich.alex@gmail.com
 //-------------------------------------------------------------------------------------------------
 // Top-level integration of the Atlas ZX Spectrum 128K core on the EBAZ4205 board
 // (Xilinx Zynq xc7z010clg400-1), with HDMI video + audio output (720p50).

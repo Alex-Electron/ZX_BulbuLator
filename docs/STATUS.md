@@ -1,6 +1,6 @@
 # Status
 
-> Developed by: Alexander Lavrinovich · GitHub: https://github.com/Alex-Electron · Email: EU1L@mail.ru
+> Developed by: Alexander Lavrinovich · GitHub: https://github.com/Alex-Electron · Email: lavrinovich.alex@gmail.com
 
 Last updated: 2026-06-15
 

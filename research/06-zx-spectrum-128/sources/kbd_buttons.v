@@ -1,5 +1,5 @@
 //-------------------------------------------------------------------------------------------------
-// kbd_buttons.v   -   Contact: EU1L@mail.ru
+// kbd_buttons.v   -   Contact: lavrinovich.alex@gmail.com
 //-------------------------------------------------------------------------------------------------
 // Four EBAZ4205 expansion-board push-buttons -> PS/2-set-2 scan-code TAPS for the
 // Atlas ZX core (main.v / keyboard.v).

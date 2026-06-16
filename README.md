@@ -4,7 +4,7 @@
 
 Developed by: Alexander Lavrinovich<br>
 GitHub: https://github.com/Alex-Electron<br>
-Email: EU1L@mail.ru
+Email: lavrinovich.alex@gmail.com
 
 A hardware ZX Spectrum emulator on a Xilinx Zynq SoC. The plan is to take the
 MiST / MiSTer Spectrum cores and bring them up on the cheap, easy-to-find
@@ -58,12 +58,13 @@ menu, save states, tape emulation, ROM switcher, soft-USB, fast-forward), is in
 
 A snapshot is below; the live state lives in [`docs/STATUS.md`](docs/STATUS.md).
 
-The 128K core (A-Z80 / T80) is imported and the top module builds in Vivado. The
-HDMI / audio shield is up and putting out a clean 50 Hz (720×576@50Hz). On-board
-buttons are mapped to keyboard half-rows (QAOP + Space), enough to play games.
-Flashing the dense bitstreams used to fail until a Raspberry Pi Pico running
-custom XVC firmware (slow slew, 2 mA drive) sorted it out. Next job is a full
-physical PS/2 keyboard through the matrix logic.
+The **ZX Spectrum 128 now runs on the board** ([Step 6](research/06-zx-spectrum-128/)):
+the original 128 boot menu over 720p50 HDMI with sound, the four shield buttons
+driving the menu, tape loading through an audio pin, and standalone SD boot — the
+display checks out against ZEsarUX. It's built on the open-source Atlas `zx` core;
+the dense bitstream loads over PCAP, since plain JTAG configuration trips a
+`BAD_PACKET` bug on this setup. Next up is more accuracy (multicolour ULA, demos),
+DivMMC/ESXDOS loading from SD, and eventually bigger machines that need PS DDR.
 
 ## Learning the board
 
@@ -104,9 +105,32 @@ So far:
 - **[Step 5 — HDMI audio: the square beeps](research/05-hdmi-beep/).** First sound:
   the bouncing square plays a beep over HDMI audio every time it hits a wall,
   using the open-source hdl-util/hdmi core for the TMDS and audio packets.
+- **[Step 6 — A ZX Spectrum 128](research/06-zx-spectrum-128/).** It all comes
+  together: a real ZX Spectrum 128 on the board, built on the open-source Atlas
+  `zx` core — 720p50 HDMI video and sound, the four shield buttons drive the boot
+  menu, it loads games from tape through a pin, and it boots from SD on its own.
+  The hard-won lessons are in the notes: an inverted keyboard `make` bit that made
+  the menu run in circles, floating buttons that needed pull-ups, the original
+  128 ROM (with Tape Tester) vs the +2 one, and a dense bitstream that only
+  configures over PCAP, not plain JTAG.
 
 More steps get added as I get them working.
+
+## Changelog
+
+- **2026-06-16 — Step 6: a ZX Spectrum 128.** The first real machine on the board —
+  128 boot menu, 720p50 HDMI video + sound, the buttons driving the menu, tape
+  loading through a pin, and standalone SD boot, on the Atlas `zx` core.
+- **2026-06-15 — Steps 0–5: board bring-up.** Setup & wiring, LED blink, buttons,
+  HDMI colour bars, button-switched patterns, and HDMI audio — the runway the
+  Spectrum sits on.
+- **2026-06-15 — Project start.** Idea recorded; targeting the EBAZ4205 (Zynq-7010).
 
 ## License
 
 [MIT](LICENSE) © Alexander Lavrinovich
+
+The MIT licence covers this project's own work (the board-top, scripts, and notes).
+The cores it builds on keep their own licences — see each step's credits and the
+upstream projects ([Atlas `zx`](https://github.com/AtlasFPGA/zx),
+[hdl-util/hdmi](https://github.com/hdl-util/hdmi)).

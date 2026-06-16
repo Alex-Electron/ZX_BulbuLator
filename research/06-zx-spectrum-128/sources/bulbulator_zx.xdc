@@ -1,5 +1,5 @@
 # bulbulator_zx.xdc  -  EBAZ4205 (xc7z010clg400-1), Atlas ZX Spectrum 128K + HDMI.
-# Contact: EU1L@mail.ru
+# Contact: lavrinovich.alex@gmail.com
 # HDMI / LED / voltage block kept verbatim from the proven Step-5 (hdmi-beep) build.
 
 # ---- HDMI TMDS: "family B" pinout (clock F19/F20). Bank 35. Driven by OBUFDS. ----

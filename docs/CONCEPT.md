@@ -1,6 +1,6 @@
 # Concept
 
-> Developed by: Alexander Lavrinovich · GitHub: https://github.com/Alex-Electron · Email: EU1L@mail.ru
+> Developed by: Alexander Lavrinovich · GitHub: https://github.com/Alex-Electron · Email: lavrinovich.alex@gmail.com
 
 BulbuLator takes the MiST / MiSTer ZX Spectrum cores and brings them up on the
 EBAZ4205 board (Zynq-7000). The main architectural difference from the original

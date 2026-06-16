@@ -121,10 +121,16 @@ is documented at the top of `build_bulbulator_zx.tcl`. A prebuilt
 
 ## Flash it — two ways
 
-**SD card (standalone, recommended).** Copy [`flash/BOOT.BIN`](flash/) to the root of a
-FAT32-formatted micro-SD, set the board to SD boot (see [Step 0](../00-setup/)), insert,
-power on. The Spectrum comes up by itself. `BOOT.BIN` = Zynq FSBL + our bitstream + a
-do-nothing app; the FSBL brings up the clocks/DDR and configures the PL.
+**SD card (standalone, recommended).** Take the [`flash/BOOT.BIN`](flash/) file from this
+step and copy it to the **top level (root) of the SD card** — it must be named `BOOT.BIN`
+and sit in the root, **not** inside any folder. (The `flash/` above is just where the file
+lives in this repo; you do **not** create a `flash` folder on the card.) The card needs a
+single **FAT32** partition — most micro-SD cards are already FAT32, so usually you just
+drop the file on; otherwise format it FAT32 first. Then set the board to SD boot (see
+[Step 0](../00-setup/)), insert the card, and power on — the Spectrum comes up by itself.
+`BOOT.BIN` = Zynq FSBL + our bitstream + a do-nothing app; the FSBL brings up the
+clocks/DDR and configures the PL. The Zynq BootROM only reads `BOOT.BIN` from the root of
+the first FAT partition, so nothing else on the card matters.
 
 **JTAG / PCAP (no SD).** Because the dense bitstream won't take plain JTAG config, use the
 PCAP loader (load to DDR with verification, then PS configures the PL):
