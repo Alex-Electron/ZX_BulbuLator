@@ -5,7 +5,7 @@
 #   06-zx-spectrum-128/
 #     sources/           <- this dir (our board-top) + rom128.hex (from get_rom.sh)
 #     zx/                <- git clone -b ebaz4205-vivado https://github.com/Alex-Electron/zx
-#     hdmi/              <- git clone https://github.com/hdl-util/hdmi
+#     hdmi/              <- git clone https://github.com/Alex-Electron/hdmi  (our fork of hdl-util/hdmi)
 #
 # Then, from sources/:   vivado -mode batch -source build_bulbulator_zx.tcl
 # ($readmemh reads rom128.hex relative to the working dir, so run it from sources/.)

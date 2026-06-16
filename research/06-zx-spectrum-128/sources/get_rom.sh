@@ -10,7 +10,8 @@
 # +2 (Amstrad) ROM, whose boot menu has no "Tape Tester". The original 128 toastrack
 # ROM does: its menu is Tape Loader / 128 BASIC / Calculator / 48 BASIC / Tape Tester.
 set -e
-BASE=https://raw.githubusercontent.com/rastersoft/fbzx/master/data/spectrum-roms
+# Our fork of rastersoft/fbzx, kept so this keeps working if upstream moves.
+BASE=https://raw.githubusercontent.com/Alex-Electron/fbzx/master/data/spectrum-roms
 
 curl -fsSL -o 128-0.rom "$BASE/128-0.rom"   # ROM 0: 128 editor + boot menu (has Tape Tester)
 curl -fsSL -o 128-1.rom "$BASE/128-1.rom"   # ROM 1: the 48 BASIC ROM

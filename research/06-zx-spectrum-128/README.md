@@ -110,7 +110,7 @@ You need Vivado 2023.1 (full, for synthesis) and the part `xc7z010clg400-1`.
 ```bash
 cd sources/
 git clone -b ebaz4205-vivado https://github.com/Alex-Electron/zx        # the Atlas core, with the T80 fix
-git clone https://github.com/hdl-util/hdmi                              # the HDMI core
+git clone https://github.com/Alex-Electron/hdmi                         # the HDMI core (our fork of hdl-util/hdmi)
 bash get_rom.sh                                                         # downloads + builds rom128.hex
 vivado -mode batch -source build_bulbulator_zx.tcl                      # → bulbulator_zx_z010.bit
 ```
@@ -178,8 +178,12 @@ DDR_FRAMEBUFFER_PLAN.md  researched-but-not-needed DDR framebuffer plan
   Wallner) and **JT49** (Jose Tejada). Please see the upstream project for its terms;
   we redistribute only our board-top + a forked, attributed copy of the core.
 - **HDMI**: [hdl-util/hdmi](https://github.com/hdl-util/hdmi) by Sameer Puri & contributors
-  (MIT / Apache-2.0).
+  (MIT / Apache-2.0); we build from our fork [Alex-Electron/hdmi](https://github.com/Alex-Electron/hdmi).
 - **128 ROM**: the © 1986 Sinclair/Amstrad ZX Spectrum 128 ROM, distributed under
   Amstrad's permission for emulation; fetched (not shipped) by `get_rom.sh` from the
-  [fbzx](https://github.com/rastersoft/fbzx) project.
+  [fbzx](https://github.com/rastersoft/fbzx) project, via our fork
+  [Alex-Electron/fbzx](https://github.com/Alex-Electron/fbzx).
 - Our board-top and scripts are this project's own work.
+
+We keep our own forks of every upstream project we build on, so the build stays
+reproducible even if upstream moves — always crediting and tracking the originals.
