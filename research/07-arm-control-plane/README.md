@@ -185,7 +185,7 @@ PS-side helpers, same as Step 6.)
 With the PL configured (PCAP or SD) and `xsdb` attached over the Pico:
 
 ```tcl
-# (flash/m2_poke.tcl does this end to end)
+# (m2_poke.tcl does this end to end)
 mwr 0x40000004 0x1                 ;# HALT the Z80
 # spin until STATUS bit0 (HALT_ACK) = 1
 mwr 0x40000010 0x00015800          ;# RAM_ADDR = bank-5 attributes (0x14000 + 0x1800)
@@ -213,7 +213,8 @@ same pattern again.
 ```
 sources/             integrated build: the Step-6 board + axi_ctl.v + inject_cdc.v, XDC, build script, get_rom.sh
 m1-handshake-test/   standalone bare-PS7 AXI handshake bitstream + its flash/test script (built first)
-flash/               BOOT.BIN (SD), ps7_init_fclk.tcl + pcap_load.tcl (PCAP), m2_poke.tcl (the halt+paint demo)
+flash/               how to get the design onto the board: BOOT.BIN (SD boot) + ps7_init_fclk.tcl + pcap_load.tcl (the JTAG/PCAP config helpers)
+m2_poke.tcl              the demo run by the ARM: halt the Z80, paint the screen (invoked by bulb_m2_run.sh)
 bulbulator_zx_z010.bit   prebuilt integrated bitstream
 bulb_pcap_run.sh         PCAP loader (dev flashing)
 bulb_m2_run.sh           PCAP-configure → halt → paint, end to end
