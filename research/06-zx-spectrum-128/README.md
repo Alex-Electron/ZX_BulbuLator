@@ -203,7 +203,10 @@ DDR_FRAMEBUFFER_PLAN.md  researched-but-not-needed DDR framebuffer plan
   [fbzx](https://github.com/rastersoft/fbzx) project, via our fork
   [Alex-Electron/fbzx](https://github.com/Alex-Electron/fbzx).
 - **Tape input front-end**: the *Tape Load Reader* squarer circuit is from the
-  [Murmulator](https://murmulator.ru/) project.
+  [Murmulator](https://murmulator.ru/) project — schematics at
+  [AlexEkb4ever/MURMULATOR_classical_scheme](https://github.com/AlexEkb4ever/MURMULATOR_classical_scheme)
+  (GPL-3.0). It's an external hardware front-end wired to J19; we credit and link it, and don't
+  redistribute its files.
 - Our board-top and scripts are this project's own work.
 
 We keep our own forks of every upstream project we build on, so the build stays

@@ -69,8 +69,11 @@ the original 128 boot menu over 720p50 HDMI with sound, the four shield buttons
 driving the menu, tape loading through an audio pin, and standalone SD boot — the
 display checks out against ZEsarUX. It's built on the open-source Atlas `zx` core;
 the dense bitstream loads over PCAP, since plain JTAG configuration trips a
-`BAD_PACKET` bug on this setup. Next up is more accuracy (multicolour ULA, demos),
-DivMMC/ESXDOS loading from SD, and eventually bigger machines that need PS DDR.
+`BAD_PACKET` bug on this setup. [Step 7](research/07-arm-control-plane/) then wakes up the
+idle ARM with an AXI control plane — it can now **halt the Z80 and read/write the Spectrum's
+memory live** (the ARM paints the screen while the CPU is frozen), the foundation for loading
+games from SD. Next is the `.sna` snapshot loader on the ARM, then bigger machines that need
+PS DDR.
 
 ## Learning the board
 
@@ -119,11 +122,22 @@ So far:
   the menu run in circles, floating buttons that needed pull-ups, the original
   128 ROM (with Tape Tester) vs the +2 one, and a dense bitstream that only
   configures over PCAP, not plain JTAG.
+- **[Step 7 — Waking up the ARM](research/07-arm-control-plane/).** The other half of
+  the chip — the ARM — sat idle through Step 6. This adds an AXI register interface so the
+  PS can **halt the Z80 and read/write the Spectrum's memory live**. Two milestones on
+  hardware: the bare-metal AXI handshake (built and proven *first*, before integrating), then
+  the ARM freezing the Z80 and painting its screen straight over the bus. It's the
+  [speccy2010](https://github.com/mborik/speccy2010) blueprint on Zynq, and the foundation for
+  loading games from SD. The bitstream is a clean superset of Step 6 — nothing regressed.
 
 More steps get added as I get them working.
 
 ## Changelog
 
+- **2026-06-16 — Step 7: waking up the ARM.** An AXI PS↔PL control plane — the ARM can now
+  halt the Z80 and write the Spectrum's memory, proven live on HDMI (the ARM paints the
+  screen while the CPU is frozen). The bare-metal handshake first, then halt + screen-poke.
+  Zero edits to the Atlas core; the foundation for SD game loading.
 - **2026-06-16 — Step 6: a ZX Spectrum 128.** The first real machine on the board —
   128 boot menu, 720p50 HDMI video + sound, the buttons driving the menu, tape
   loading through a pin, and standalone SD boot, on the Atlas `zx` core.
@@ -140,3 +154,8 @@ The MIT licence covers this project's own work (the board-top, scripts, and note
 The cores it builds on keep their own licences — see each step's credits and the
 upstream projects ([Atlas `zx`](https://github.com/AtlasFPGA/zx),
 [hdl-util/hdmi](https://github.com/hdl-util/hdmi)).
+
+The tape input uses the *Tape Load Reader* front-end circuit from the
+[Murmulator](https://murmulator.ru/) project
+([schematics](https://github.com/AlexEkb4ever/MURMULATOR_classical_scheme), GPL-3.0) — an
+external hardware add-on wired to the board, credited and linked here, not redistributed.
