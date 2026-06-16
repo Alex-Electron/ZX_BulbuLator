@@ -33,11 +33,9 @@ What's new is what the ARM can now do over `M_AXI_GP0`:
 
 ## Proof it works
 
-![The ARM has halted the Z80 and painted the Spectrum's screen from the PS](images/arm-paints-screen.jpg)
-
-*The ARM froze the Z80 mid-menu and filled the screen's attribute area over AXI — the whole
+The ARM froze the Z80 mid-menu and filled the screen's attribute area over AXI — the whole
 display turns red while the CPU is held. Un-halt and the Spectrum carries on. This is the PS
-reaching into the PL's memory, live.*
+reaching into the PL's memory, live. (Hardware photo to follow.)
 
 ## Why this and not another demo
 
