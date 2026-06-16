@@ -145,11 +145,14 @@ the PS-side helpers.)
 ## Run it
 
 - **Menu:** T19/P19 move the cursor, U20 selects, U19 is Break.
-- **Load a game from tape:** wire your TAP/WAV player's output to **J19** (= `DATA2-09`)
-  and ground; on the Spectrum pick *Tape Loader* (or `LOAD ""`), start the audio, and the
-  loading stripes appear. J19 is a 3.3 V digital input with a pull-down — a line-level
-  signal may be too quiet; use a hot/headphone-level output, or a small comparator
-  front-end if it won't latch.
+- **Load a game from tape.** J19 is a 3.3 V *digital* input, so the analogue tape audio
+  has to be squared into a clean logic level first. We used the **Tape Load Reader**
+  front-end from the [Murmulator](https://murmulator.ru/) project — a small two-transistor
+  squarer (AC-coupled audio in, a clean `LOAD IN` out). Wire its `LOAD IN` to **J19**
+  (= `DATA2-09`) and share a ground with your player; on the Spectrum pick *Tape Loader*
+  (or `LOAD ""`), start the TAP/WAV audio, and the loading stripes appear.
+
+  ![Tape Load Reader front-end, from the Murmulator project](images/tape-load-reader.png)
 - **LEDs:** H18 blinks (alive); D18 (lock) stays off — cosmetic, the shield LED is
   active-low against a steady "locked" level.
 
@@ -183,6 +186,8 @@ DDR_FRAMEBUFFER_PLAN.md  researched-but-not-needed DDR framebuffer plan
   Amstrad's permission for emulation; fetched (not shipped) by `get_rom.sh` from the
   [fbzx](https://github.com/rastersoft/fbzx) project, via our fork
   [Alex-Electron/fbzx](https://github.com/Alex-Electron/fbzx).
+- **Tape input front-end**: the *Tape Load Reader* squarer circuit is from the
+  [Murmulator](https://murmulator.ru/) project.
 - Our board-top and scripts are this project's own work.
 
 We keep our own forks of every upstream project we build on, so the build stays
