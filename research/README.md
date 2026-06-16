@@ -13,6 +13,8 @@ verified on real hardware.
 | [03 — Primitive HDMI: colour bars](03-hdmi-bars/) | First picture on screen — eight 720p colour bars, clocked from the PS (the level-shifter / `ps7_post_config` lesson) |
 | [04 — HDMI with button-switched patterns](04-hdmi-buttons/) | A bouncing square and four patterns (bars, gradient, checkerboard) the shield buttons switch between |
 | [05 — HDMI audio: the square beeps](05-hdmi-beep/) | First sound — the bouncing square beeps over HDMI audio when it hits a wall, using the hdl-util/hdmi core |
+| [06 — A ZX Spectrum 128](06-zx-spectrum-128/) | It all comes together: a real ZX Spectrum 128 on the board — HDMI video + audio, the shield buttons drive the boot menu, it loads games from tape through a pin, and boots from SD. Built on the Atlas `zx` core |
 
-More steps get added here as the bring-up continues (FCLK0 over JTAG, HDMI
-output, buttons, sound, and so on).
+Steps 0–5 are the runway; Step 6 is the first actual machine. From here the
+bring-up notes turn into porting cores (more accuracy, more demos, and eventually
+bigger machines that need PS DDR).

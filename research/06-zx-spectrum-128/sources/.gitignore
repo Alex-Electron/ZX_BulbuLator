@@ -1,0 +1,9 @@
+zx/
+hdmi/
+*.rom
+rom128.hex
+*.dcp
+*.bit.bin
+.Xil/
+vivado*.log
+vivado*.jou
