@@ -53,6 +53,9 @@ module fb_capture_rr (
     reg        trig;                  // pulse: a completed line is ready to stream
     reg        rd_lb;                 // line buffer to stream
     reg [8:0]  ll;                    // captured pixel count of that line
+    localparam SKIP = 8;              // dead vblank lines to drop after vsync -> reclaimed for the bottom border
+    reg [3:0]  skip_cnt;              // counts SKIP lines after vsync before capture begins
+    reg        armed;                 // skipping the vblank, not yet capturing
 
     wire sx_max = (sx >= FB_W-1);
     wire sy_max = (sy >= FB_H-1);
@@ -66,19 +69,28 @@ module fb_capture_rr (
         if (!resetn) begin
             sx<=0; sy<=0; sx_max_pending<=0; sy_over<=0; wr_lb<=1'b0;
             trig<=1'b0; rd_lb<=1'b0; ll<=0; started_w<=1'b0;
+            skip_cnt<=0; armed<=1'b0;
         end else begin
             trig <= 1'b0;
             if (!enable) started_w <= 1'b0;
             if (wr_ce) begin
                 if (vs_lead) begin
-                    sy<=0; sx<=0; sx_max_pending<=0; sy_over<=0;
-                    started_w <= enable;
+                    sx<=0; sx_max_pending<=0; sy_over<=0;
+                    skip_cnt <= SKIP; armed <= 1'b1;        // drop SKIP dead vblank lines first
+                    started_w <= 1'b0;
                 end else if (hs_lead) begin
-                    if (started_w && !sy_over) begin       // a captured line just ended -> stream it
-                        ll<=sx; rd_lb<=wr_lb; wr_lb<=~wr_lb; trig<=1'b1;
+                    if (armed) begin
+                        if (skip_cnt == 4'd0) begin          // vblank dropped -> begin capture at line 0
+                            armed <= 1'b0; started_w <= enable;
+                            sy<=0; sx<=0; sx_max_pending<=0; sy_over<=0;
+                        end else skip_cnt <= skip_cnt - 4'd1;
+                    end else begin
+                        if (started_w && !sy_over) begin     // a captured line just ended -> stream it
+                            ll<=sx; rd_lb<=wr_lb; wr_lb<=~wr_lb; trig<=1'b1;
+                        end
+                        sx<=0; sx_max_pending<=0;
+                        if (sy_max) sy_over<=1'b1; else sy<=sy+1'b1;
                     end
-                    sx<=0; sx_max_pending<=0;
-                    if (sy_max) sy_over<=1'b1; else sy<=sy+1'b1;
                 end else if (~blank && started_w) begin
                     if (sx_max) sx_max_pending<=1'b1; else sx<=sx+1'b1;
                 end

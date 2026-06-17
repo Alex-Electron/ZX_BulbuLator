@@ -103,7 +103,7 @@ module inject_cdc
             arm_memWr <= 1'b1;
             arm_memA  <= {2'b01, addr_lat};
             arm_memQ  <= data_lat;
-            arm_vmmA2 <= addr_lat[13:0];
+            arm_vmmA2 <= {addr_lat[15], addr_lat[12:0]};
             ack_tog   <= ~ack_tog;
         end
         if (cpu_halt_sp) begin

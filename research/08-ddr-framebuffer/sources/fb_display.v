@@ -32,10 +32,10 @@ module fb_display (
     // src row 287) and right (cut only a thin black strip, src cols 356..359). The border region is
     // real content (ula128 stripes / demo border FX) -> do not over-crop it. HMARGIN/VMARGIN are FIXED
     // (not re-centred) so the perfect top-left edge stays put; the window just grows down + right.
-    localparam SX0     = 0,   SY0 = 39;         // first source col/row shown (top trim kept)
-    localparam CROP_W  = 356, CROP_H = 249;     // src cols 0..355 x rows 39..287
+    localparam SX0     = 0,   SY0 = 31;         // capture shifted +8 (vblank reclaimed): top stays, bottom +8
+    localparam CROP_W  = 356, CROP_H = 257;     // src cols 0..355 x rows 31..287 (full bottom border)
     localparam HPIC    = CROP_W << 1;           // 712
-    localparam VPIC    = CROP_H << 1;           // 498
+    localparam VPIC    = CROP_H << 1;           // 514
     localparam HMARGIN = 320;                   // FIXED - anchors the perfect LEFT edge
     localparam VMARGIN = 120;                   // FIXED - anchors the perfect TOP edge
 
@@ -43,7 +43,7 @@ module fb_display (
                   (cy >= VMARGIN) && (cy < VMARGIN + VPIC);
 
     wire [8:0]  rd_sx = SX0 + ((cx - HMARGIN) >> 1);   // 0..319
-    wire [8:0]  rd_sy = SY0 + ((cy - VMARGIN) >> 1);   // 39..278
+    wire [8:0]  rd_sy = SY0 + ((cy - VMARGIN) >> 1);   // 31..287
     wire [16:0] lin   = rd_sy * FB_W + rd_sx;       // linear pixel 0..103679
     wire [12:0] rd_word = lin[16:4];                // /16  -> 64-bit word
     wire [3:0]  rd_nib  = lin[3:0];                 // %16  -> which 4-bit pixel
