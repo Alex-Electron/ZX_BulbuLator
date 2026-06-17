@@ -1,5 +1,7 @@
 # Step 2 — Buttons drive the LEDs
 
+Languages: **English** · [Русский](README.ru.md)
+
 Step 1 proved a bitstream runs on the board. This one adds *input*: the four
 shield buttons now change what the two LEDs do. Same idea as before — clocked
 from the chip's internal oscillator (`STARTUPE2` / `CFGMCLK`), no PS, no external

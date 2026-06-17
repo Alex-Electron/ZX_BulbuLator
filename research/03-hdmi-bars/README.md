@@ -1,5 +1,7 @@
 # Step 3 — Primitive HDMI: colour bars
 
+Languages: **English** · [Русский](README.ru.md)
+
 The first picture on the screen. Eight static vertical colour bars at 1280x720,
 output over HDMI. No animation, no menu — the simplest thing that proves the
 whole video path works.

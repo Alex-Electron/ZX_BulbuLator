@@ -1,5 +1,7 @@
 # Step 6 — A ZX Spectrum 128 on the EBAZ4205
 
+Languages: **English** · [Русский](README.ru.md)
+
 This is the big one. Steps 0–5 were the runway: power, JTAG, blink, buttons, HDMI
 video, HDMI audio. Here it all comes together into a **real, timing-accurate ZX
 Spectrum 128** running on a ~$10 board — HDMI video and sound, the four shield

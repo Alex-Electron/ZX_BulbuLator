@@ -1,5 +1,7 @@
 # Step 8 — Tear-free video: a DDR double-buffered framebuffer
 
+Languages: **English** · [Русский](README.ru.md)
+
 Steps 6 and 7 put a real, timing-accurate ZX Spectrum 128 on screen and woke the ARM up to
 drive it. But the video had one honest flaw: a **single on-chip framebuffer**. The Spectrum
 core renders into a BRAM at its own ~50.02 Hz, and the HDMI side scans it out at exactly

@@ -1,5 +1,7 @@
 # Step 7 — Waking up the ARM: a PS↔PL control plane
 
+Languages: **English** · [Русский](README.ru.md)
+
 The EBAZ4205 has two halves: the FPGA fabric (PL) and a dual-core ARM Cortex-A9 (PS).
 Steps 0–6 used only the fabric — the whole Spectrum lives there, and the ARM did nothing
 but hand us a 100 MHz clock. That's half the chip idle.

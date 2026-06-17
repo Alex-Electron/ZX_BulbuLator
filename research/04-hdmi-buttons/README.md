@@ -1,5 +1,7 @@
 # Step 4 — HDMI with button-switched patterns
 
+Languages: **English** · [Русский](README.ru.md)
+
 Step 3 put a still image on the screen. This adds interactivity: the four shield
 buttons change what's drawn. Same video path as Step 3 (PS7 → FCLK0 → MMCM →
 rgb2dvi), same flash recipe — only the pattern generator is richer.

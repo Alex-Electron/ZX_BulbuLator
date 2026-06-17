@@ -1,14 +1,17 @@
 # BulbuLator
 
+Languages: **English** · [Русский](README.ru.md)
+
 ![BulbuLator — ZX Spectrum on Zynq-7010 (EBAZ4205)](docs/images/splash.jpg)
 
 Developed by: Alexander Lavrinovich<br>
 GitHub: https://github.com/Alex-Electron<br>
 Email: lavrinovich.alex@gmail.com
 
-A hardware ZX Spectrum emulator on a Xilinx Zynq SoC. The plan is to take the
-MiST / MiSTer Spectrum cores and bring them up on the cheap, easy-to-find
-EBAZ4205 board, reworking them for the Xilinx architecture along the way.
+A hardware ZX Spectrum emulator on a Xilinx Zynq SoC: bring up an open ZX Spectrum
+core on the cheap, easy-to-find EBAZ4205 board, reworking it for the Xilinx
+architecture along the way. The published build runs on the open **Atlas `zx`**
+core; the MiST / MiSTer cores stay as a fallback for the machines Atlas doesn't cover.
 
 ![EBAZ4205 board wired to the HDMI/audio and buttons expansion shield](docs/images/board.jpg)
 
@@ -62,7 +65,7 @@ menu, save states, tape emulation, ROM switcher, soft-USB, fast-forward), is in
 
 ## Status
 
-A snapshot is below; the live state lives in [`docs/STATUS.md`](docs/STATUS.md).
+Where things stand right now:
 
 The **ZX Spectrum 128 now runs on the board** ([Step 6](research/06-zx-spectrum-128/)):
 the original 128 boot menu over 720p50 HDMI with sound, the four shield buttons

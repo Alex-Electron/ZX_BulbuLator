@@ -1,5 +1,7 @@
 # Step 1 — Board bring-up: self-clocked LED blink
 
+Languages: **English** · [Русский](README.ru.md)
+
 The first thing to do with a fresh EBAZ4205 (Zynq-7010) is prove three things at
 once: the board powers up, the JTAG path reaches the PL, and a bitstream
 actually runs. This step does that with the smallest design that can't really go

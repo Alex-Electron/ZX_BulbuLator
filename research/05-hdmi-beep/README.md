@@ -1,5 +1,7 @@
 # Step 5 — HDMI audio: the square beeps off the walls
 
+Languages: **English** · [Русский](README.ru.md)
+
 First sound. The bouncing square is back, and now every time it hits an edge it
 plays a short **beep — carried over HDMI audio**, not a separate jack. A monitor
 with speakers plays it straight from the HDMI cable.

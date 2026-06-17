@@ -1,5 +1,7 @@
 # Step 0 — Setup: from a bare board to a flashed bitstream
 
+Languages: **English** · [Русский](README.ru.md)
+
 This is the from-scratch guide. By the end you'll have the board powered, a JTAG
 link to it, the software installed, and the prebuilt Step 1 bitstream flashed —
 two LEDs blinking. No prior FPGA experience assumed.
