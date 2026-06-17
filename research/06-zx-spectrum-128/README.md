@@ -38,6 +38,16 @@ It renders cleanly here and matches ZEsarUX, so the core's timing holds up.*
 
 *…and Ringo in-game.*
 
+The tapes behind the timing shot ship in [`tests/`](tests/) so you can reproduce them on
+your own board — load them through the J19 tape input (see **Run it**):
+
+- **`ula128.tap`** — the ULA 128 timing test (azesmbog). If its border stripes and the
+  paper/border boundary render cleanly and match ZEsarUX, the core's 128 ULA timing is right.
+- **`AYtest_v0.2.tap`** — an AY-3-8910 / YM PSG sound test, to check the 128's chip audio
+  in the HDMI stream.
+
+Each ships as the original `.tap` (load from tape) and as a 128K `.z80` snapshot.
+
 ## Not reinventing the wheel
 
 The Spectrum itself is the open-source **Atlas `zx`** core (T80 Z80, the ULA, AY via
@@ -185,6 +195,7 @@ this core; the researched plan is kept in
 sources/   our board-top (clock_zx, mem_zx, framebuffer, kbd_buttons, top, hdmi_wrap),
            the XDC, the portable build script, and get_rom.sh
 flash/     BOOT.BIN (SD), ps7_init_fclk.tcl + pcap_load.tcl (PCAP)
+tests/     ula128.tap + AYtest_v0.2.tap (+ .z80 snapshots) — load-from-tape timing & sound checks
 bulbulator_zx_z010.bit   prebuilt bitstream
 bulb_pcap_run.sh         PCAP ("armoured train") loader
 DDR_FRAMEBUFFER_PLAN.md  researched-but-not-needed DDR framebuffer plan
@@ -207,6 +218,9 @@ DDR_FRAMEBUFFER_PLAN.md  researched-but-not-needed DDR framebuffer plan
   [AlexEkb4ever/MURMULATOR_classical_scheme](https://github.com/AlexEkb4ever/MURMULATOR_classical_scheme)
   (GPL-3.0). It's an external hardware front-end wired to J19; we credit and link it, and don't
   redistribute its files.
+- **Test tapes** in `tests/` (`ula128`, `AYtest`) are third-party ZX scene test programs,
+  included unmodified so you can verify timing and sound on real hardware; all rights remain
+  with their original authors.
 - Our board-top and scripts are this project's own work.
 
 We keep our own forks of every upstream project we build on, so the build stays
