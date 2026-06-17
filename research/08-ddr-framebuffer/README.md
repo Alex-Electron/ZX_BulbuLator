@@ -4,17 +4,17 @@ Steps 6 and 7 put a real, timing-accurate ZX Spectrum 128 on screen and woke the
 drive it. But the video had one honest flaw: a **single on-chip framebuffer**. The Spectrum
 core renders into a BRAM at its own ~50.02 Hz, and the HDMI side scans it out at exactly
 50.000 Hz. Those two rates are *not* locked, so the read pointer slowly drifts through the
-write pointer — and on any frame where the picture changes (a border effect, a demo, a
-shadow-screen flip) you see a **horizontal tear seam crawling down the screen**.
+write pointer. The moment the picture is moving (a border effect, a running demo, a
+shadow-screen flip), you get a **horizontal tear seam crawling down the screen**.
 
 On the menu and most games you never notice. On a border-effect demo like *Mescaline
 Synesthesia* it is impossible to miss: a bright line marching top-to-bottom, over and over.
 
-This step fixes it the right way. The 256×192 screen plus border is only **~51 KB** as a
-4-bit-per-pixel source frame, so it fits trivially in PS DDR. We **double/triple-buffer that
+So this step does it properly. The 256×192 screen plus border is only **~51 KB** as a
+4-bit-per-pixel source frame, which fits in PS DDR with room to spare. We **double/triple-buffer that
 source frame in DDR** and only ever swap which buffer the scanout reads **on the HDMI vblank**.
-The scanout always sees a *complete, stable* frame — no tearing, ever — including across
-bank-5 ↔ bank-7 shadow-screen switches. The on-chip BRAM upscaler (pillarbox, palette,
+The scanout always sees a *complete, stable* frame, so nothing tears: not the screen, not the
+border, not even a bank-5 ↔ bank-7 shadow-screen switch. The on-chip BRAM upscaler (pillarbox, palette,
 720p50) is reused unchanged, so on-chip memory usage stays exactly where it was: **60/60 BRAM**.
 
 The result is verified on hardware: *Mescaline* and the `ula128` timing test run with **no tear
@@ -24,19 +24,27 @@ down to an imperceptible micro-stutter every ~50 s instead of a constant moving 
 ## The pipeline
 
 Everything that was a single BRAM `framebuffer` is now a chain across two clock domains and
-PS DDR, glued together with the **AXI-HP** port whose latency we measured back in Step 7:
+PS DDR, glued together with the **AXI-HP** port whose latency we measured back in Step 7. The
+two clock-domain crossings are the arrows that jump between the coloured boxes below: capture →
+FIFO (spclk → fclk100), and loader → display (fclk100 → clk_pixel, inside the display BRAM):
 
-```
- Spectrum (spclk ~56.7 MHz)                         fclk100 (100 MHz)                 HDMI (clk_pixel 74.25 MHz)
- ┌───────────────┐   ┌────────────┐   ┌──────────┐   ┌──────────┐   ┌────────────┐    ┌──────────┐   ┌──────────┐
- │ video.v RGBI  │──▶│ fb_capture │──▶│ async    │──▶│ fb_wr_axi│──▶│  PS DDR    │◀──│ fb_loader │──▶│fb_display│──▶ HDMI
- │ (the core)    │   │  _rr       │   │  _fifo   │   │ (HP0 wr) │   │ 3 buffers  │   │ (HP0 rd)  │   │+upscaler │
- └───────────────┘   └────────────┘   └──────────┘   └──────────┘   └────────────┘    └──────────┘   └──────────┘
-                       re-raster        gray-code      16-beat        51 KB ×3        once per          BRAM, x2
-                       to 360/line      CDC FIFO       bursts         @0x0FF0_0000     vblank            pillarbox
-                                                                          ▲
-                                                   fb_bufmgr3 ── swaps the read pointer on HDMI vblank ──┘
-                                                  (triple buffer: the writer never waits on the reader)
+```mermaid
+flowchart LR
+    subgraph SP["Spectrum · spclk ~56.7 MHz"]
+        VID["video.v RGBI<br/>(the core)"] --> CAP["fb_capture_rr<br/>re-raster → 360 px/line"]
+    end
+    subgraph F1["fclk100 · 100 MHz"]
+        FIFO["async_fifo<br/>gray-code CDC FIFO"]
+        WR["fb_wr_axi<br/>S_AXI_HP0 write<br/>16-beat bursts"]
+        RD["fb_loader<br/>S_AXI_HP0 read<br/>once per vblank"]
+        BUF["fb_bufmgr3<br/>triple buffer"]
+    end
+    subgraph PX["HDMI · clk_pixel 74.25 MHz"]
+        DISP["fb_display<br/>BRAM ×2 + pillarbox upscaler"] --> OUT["HDMI 720p50"]
+    end
+    DDR[("PS DDR<br/>3 × 51 KB<br/>@0x0FF0_0000")]
+    CAP --> FIFO --> WR --> DDR --> RD --> DISP
+    BUF -. "latches the displayed buffer<br/>on HDMI vblank" .-> DDR
 ```
 
 - **`fb_capture_rr`** (Spectrum domain) re-rasters the core's video to exactly **360 pixels × 288
@@ -85,6 +93,17 @@ border — important, because the **border is real content** (the `ula128` test 
 stripes there). The displayed window is 356×249 source → ×2 → 712×498, framed in a dark-grey
 pillarbox inside 1280×720.
 
+## A demo that exercises it
+
+![esh2 — full-screen multicolour with a timing-driven border, tear-free through the DDR buffer](images/esh2_128.jpg)
+
+*`esh2` (an Escher-tessellation 128K demo) running through the DDR framebuffer. The red/blue
+check pattern is painted **into the border** by cycle-exact ULA timing, which is exactly the
+kind of effect the single buffer used to tear on. Here it sits still. That it comes out clean
+also tells me the core's Sinclair-128 raster timing is right. The tape is in
+[`demos/`](demos/) — `esh2_128.tap` (load it from cassette through the Step-6 J19 input) plus a
+128K `.z80` snapshot for the Step-7 ARM injector.*
+
 ## Build from source
 
 `sources/` has the whole set. The flow (run on the build host where Vivado lives):
@@ -125,5 +144,6 @@ ddr_inject_run.sh         PCAP-configure + inject a .z80 demo over the control p
 sources/                  all RTL + the build .tcl + .xdc (DDR chain + shared glue + core deps list)
 flash/                    BOOT.BIN (SD image) + build_boot.sh + bifs + fsbl.bin/idle.bin + pcap_load.tcl
 standalone-tests/         Phase 1a / Phase 2a bring-up harnesses for the DDR path
+demos/                    verified tear-free demos (esh2_128: .tap to load from tape + .z80 snapshot)
 images/                   hardware photos
 ```

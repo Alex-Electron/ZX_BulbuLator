@@ -72,8 +72,10 @@ the dense bitstream loads over PCAP, since plain JTAG configuration trips a
 `BAD_PACKET` bug on this setup. [Step 7](research/07-arm-control-plane/) then wakes up the
 idle ARM with an AXI control plane — it can now **halt the Z80 and read/write the Spectrum's
 memory live** (the ARM paints the screen while the CPU is frozen), the foundation for loading
-games from SD. Next is the `.sna` snapshot loader on the ARM, then bigger machines that need
-PS DDR.
+games from SD. [Step 8](research/08-ddr-framebuffer/) then makes the video **tear-free** by
+buffering the ZX frame in PS DDR — triple-buffered, swapped on the HDMI vblank — the first real
+use of that AXI-HP path to DDR. Next is the `.sna` snapshot loader on the ARM, then bigger
+machines.
 
 ## Learning the board
 
@@ -129,11 +131,21 @@ So far:
   the ARM freezing the Z80 and painting its screen straight over the bus. It's the
   [speccy2010](https://github.com/mborik/speccy2010) blueprint on Zynq, and the foundation for
   loading games from SD. The bitstream is a clean superset of Step 6 — nothing regressed.
+- **[Step 8 — Tear-free video](research/08-ddr-framebuffer/).** The single on-chip framebuffer
+  tore on border-effect demos — the Spectrum's ~50.02 Hz and HDMI's 50.000 Hz aren't locked, so
+  the read pointer drifts through the write pointer. This buffers the whole 51 KB ZX frame in PS
+  DDR — a MiSTer-style triple buffer — and swaps the scanout only on the HDMI vblank, so the
+  picture is tear-free everywhere, including bank-5/bank-7 shadow-screen flips. It's the first
+  real use of the Step-7 AXI-HP path to PS DDR, and on-chip BRAM stays 60/60.
 
 More steps get added as I get them working.
 
 ## Changelog
 
+- **2026-06-17 — Step 8: tear-free DDR framebuffer.** The ZX frame is triple-buffered in PS DDR
+  over AXI-HP and swapped only on the HDMI vblank — no more tear seam on border demos or
+  shadow-screen flips. Verified with the `ula128` timing test and the *Mescaline* / `esh2`
+  border demos; on-chip BRAM unchanged at 60/60.
 - **2026-06-16 — Step 7: waking up the ARM.** An AXI PS↔PL control plane — the ARM can now
   halt the Z80 and write the Spectrum's memory, proven live on HDMI (the ARM paints the
   screen while the CPU is frozen). The bare-metal handshake first, then halt + screen-poke.

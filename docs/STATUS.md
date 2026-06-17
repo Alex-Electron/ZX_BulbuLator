@@ -2,24 +2,28 @@
 
 > Developed by: Alexander Lavrinovich · GitHub: https://github.com/Alex-Electron · Email: lavrinovich.alex@gmail.com
 
-Last updated: 2026-06-15
+Last updated: 2026-06-17
 
 ## Done
 
-The ZX Spectrum 128K core (A-Z80 / T80) is imported and its top module builds in
-Vivado 2023.1 on the ThinkPad. The HDMI / audio shield is up and outputs a clean
-50 Hz, 720×576@50Hz, with no flicker. On-board buttons are mapped to keyboard
-half-rows (QAOP + Space); the Space/M split works and the game Ringo loads and
-plays. Flashing the dense bitstreams is solved: a Pi Pico running custom XVC
-firmware (slow slew, 2 mA drive) gets the 128K cores onto the board over JTAG in
-seconds, first try. The toolchain (Vivado, Vitis, JTAG daemons) now lives on the
-ThinkPad.
+A real ZX Spectrum 128 runs on the EBAZ4205 (7010): the 128 boot menu over 720p50
+HDMI with sound, the four shield buttons driving the menu, tape loading through an
+audio pin, and standalone SD boot — built on the open-source Atlas `zx` core, with the
+display checked against ZEsarUX (Step 6). The dense bitstream loads over PCAP, since
+plain JTAG configuration trips a `BAD_PACKET` bug on this setup. The ARM is no longer
+idle: an AXI control plane lets the PS halt the Z80 and read or write the Spectrum's
+memory live (Step 7). And the video is tear-free now — the ZX frame is triple-buffered
+in PS DDR and swapped only on the HDMI vblank, so border demos and shadow-screen flips
+stop tearing (Step 8). Demos and timing tests inject over the control plane and come up
+clean: mescaline, esh2, the ula128 timing test.
 
 ## Doing
 
-Moving the primary target over to the 7010 board and re-checking the cores on
-it.
+Running demos and 128-timing tests over the control plane and checking them on real
+hardware; turning the ARM's halt-and-poke into a proper bare-metal `.sna` / `.z80` SD
+loader.
 
 ## Next
 
-Wire up a full physical PS/2 keyboard through the matrix logic (`zx_kbd.sv`).
+The `.sna` loader on the ARM (bank-7 paging + the I/O ports), then the bigger machines
+the proven PS DDR path now unlocks — Pentagon 1024, NES with large ROMs.

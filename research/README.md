@@ -14,6 +14,8 @@ verified on real hardware.
 | [04 — HDMI with button-switched patterns](04-hdmi-buttons/) | A bouncing square and four patterns (bars, gradient, checkerboard) the shield buttons switch between |
 | [05 — HDMI audio: the square beeps](05-hdmi-beep/) | First sound — the bouncing square beeps over HDMI audio when it hits a wall, using the hdl-util/hdmi core |
 | [06 — A ZX Spectrum 128](06-zx-spectrum-128/) | It all comes together: a real ZX Spectrum 128 on the board — HDMI video + audio, the shield buttons drive the boot menu, it loads games from tape through a pin, and boots from SD. Built on the Atlas `zx` core |
+| [07 — Waking up the ARM: a PS↔PL control plane](07-arm-control-plane/) | An AXI register interface so the idle ARM can halt the Z80 and read/write the Spectrum's memory live — the foundation for SD game loading. A clean superset of Step 6 |
+| [08 — Tear-free video: a DDR double-buffered framebuffer](08-ddr-framebuffer/) | Buffers the 51 KB ZX frame in PS DDR (triple-buffered, swapped on the HDMI vblank) so border-effect demos and shadow-screen flips stop tearing — the first real use of the AXI-HP path to DDR |
 
 Steps 0–5 are the runway; Step 6 is the first actual machine. From here the
 bring-up notes turn into porting cores (more accuracy, more demos, and eventually
