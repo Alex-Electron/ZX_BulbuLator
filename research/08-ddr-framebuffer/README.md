@@ -86,12 +86,14 @@ This took a few hardware iterations. The non-obvious ones:
 ## What you see, and the output window
 
 The captured 360×288 contains the 256×192 screen, the ZX border, and (because the ULA scanline
-wraps) the *left* border tucked onto the right. The output window is cropped in `fb_display`
-(display-side only, the 6480-word capture contract untouched): it drops the 8-line black vblank
-strip at the top and a thin black strip at the right edge, and keeps the screen plus a clean
-border — important, because the **border is real content** (the `ula128` test draws its timing
-stripes there). The displayed window is 356×249 source → ×2 → 712×498, framed in a dark-grey
-pillarbox inside 1280×720.
+wraps) the *left* border tucked onto the right. To fit the whole frame, `fb_capture_rr` starts 8
+lines after vsync: it drops the dead black vblank lines (which we'd never show) and spends them
+on the *bottom* border instead, so the full bottom border is captured rather than clipped. The
+output window is then cropped in `fb_display` (display-side only, the 6480-word capture contract
+untouched): a thin black strip at the right edge goes, and the screen plus a clean border on all
+four sides stays — important, because the **border is real content** (the `ula128` test draws its
+timing stripes there). The displayed window is 356×257 source → ×2 → 712×514, framed in a
+dark-grey pillarbox inside 1280×720.
 
 ## A demo that exercises it
 
@@ -103,6 +105,37 @@ kind of effect the single buffer used to tear on. Here it sits still. That it co
 also tells me the core's Sinclair-128 raster timing is right. The tape is in
 [`demos/`](demos/) — `esh2_128.tap` (load it from cassette through the Step-6 J19 input) plus a
 128K `.z80` snapshot for the Step-7 ARM injector.*
+
+## A no-snow variant
+
+The 128 has a real "snow" hardware bug: when the I register points into the screen page
+(0x40–0x7F), the refresh cycle makes the ULA fetch the wrong byte and flickering specks crawl
+over the picture. The Atlas core reproduces it faithfully — it shows up on timing tests like
+*IR Contention 128*, and real hardware (and Retro Virtual Machine) snow there too. It is correct,
+but it is also noise, and most software keeps the I register clear of that page precisely to
+avoid it.
+
+So there is a second build with the snow switched off, offered as an option. Everything else is
+identical — contention timing, floating bus, the tear-free DDR path — only the snow artifact is
+gone, because the video fetch always uses the raster address. Real games and demos look the same
+either way; the difference only shows on snow-test programs.
+
+- **Faithful (default):** `bulbulator_zx_ddr.bit` / `flash/BOOT.BIN` — snow on, like a real 128.
+- **No-snow:** `bulbulator_zx_ddr_nosnow.bit` / `flash/BOOT_NOSNOW.BIN` — clean.
+
+It is one guard in the Atlas core's `memory.v`, on the video-fetch address `vmmA1`:
+
+```verilog
+`ifdef NO_SNOW
+assign vmmA1 = { vmmPage, va[12:7], va[6:0] };                            // raster address only
+`else
+assign vmmA1 = { vmmPage, va[12:7], !rfsh && addr01 ? a[6:0] : va[6:0] }; // faithful ULA snow
+`endif
+```
+
+`sources/build_bulbulator_ddr_nosnow.tcl` synthesises with `-verilog_define NO_SNOW`, and
+`ddr_inject_nosnow_run.sh` injects a `.z80` onto the no-snow bitstream over JTAG. (Once a
+keyboard is wired this becomes a runtime key toggle, so one bitstream does both.)
 
 ## Build from source
 
@@ -138,12 +171,14 @@ header for the bootgen-on-modern-glibc workaround.
 ## Files
 
 ```
-bulbulator_zx_ddr.bit     the bitstream (Atlas ZX-128 + Step-7 control plane + DDR framebuffer)
-ddr_full_run.sh           PCAP-configure the bitstream over JTAG
-ddr_inject_run.sh         PCAP-configure + inject a .z80 demo over the control plane
-sources/                  all RTL + the build .tcl + .xdc (DDR chain + shared glue + core deps list)
-flash/                    BOOT.BIN (SD image) + build_boot.sh + bifs + fsbl.bin/idle.bin + pcap_load.tcl
-standalone-tests/         Phase 1a / Phase 2a bring-up harnesses for the DDR path
-demos/                    verified tear-free demos (esh2_128: .tap to load from tape + .z80 snapshot)
-images/                   hardware photos
+bulbulator_zx_ddr.bit         the bitstream (Atlas ZX-128 + Step-7 control plane + DDR framebuffer)
+bulbulator_zx_ddr_nosnow.bit  the same, with the ULA snow effect disabled (clean variant)
+ddr_full_run.sh               PCAP-configure the bitstream over JTAG
+ddr_inject_run.sh             PCAP-configure + inject a .z80 demo over the control plane
+ddr_inject_nosnow_run.sh      the same, onto the no-snow bitstream
+sources/                      all RTL + build .tcl (incl. the _nosnow build) + .xdc + core deps list
+flash/                        BOOT.BIN + BOOT_NOSNOW.BIN (SD images) + build_boot.sh + bifs + fsbl/idle
+standalone-tests/             Phase 1a / Phase 2a bring-up harnesses for the DDR path
+demos/                        verified tear-free demos (esh2_128: .tap + .z80 snapshot)
+images/                       hardware photos
 ```

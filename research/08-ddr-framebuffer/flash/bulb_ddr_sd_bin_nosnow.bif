@@ -1,0 +1,5 @@
+the_ROM_image: {
+  [bootloader, load = 0x0, startup = 0x0] /home/lavrinovich/ddrfb/fsbl.bin
+  /home/lavrinovich/ddrfb/bulbulator_zx_ddr_nosnow.bit
+  [load = 0x00100000, startup = 0x00100000] /home/lavrinovich/ddrfb/idle.bin
+}
