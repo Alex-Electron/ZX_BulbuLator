@@ -1,0 +1,5 @@
+the_ROM_image: {
+  [bootloader, load = 0x0, startup = 0x0] fsbl.bin
+  ../bulbulator_zx_kbd.bit
+  [load = 0x00100000, startup = 0x00100000] idle.bin
+}
