@@ -185,11 +185,11 @@ the PS-side helpers.)
   active-low against a steady "locked" level.
 
 Note on the framebuffer: at this step it's a single buffer. The Spectrum frame rate
-(~50 Hz) and 720p50 are nearly identical, so the read/write seam parks off-screen and on
-the menu and ordinary games the picture is stable and correct (matches ZEsarUX). The catch,
-found later, is that the two rates aren't *exactly* locked (~50.02 vs 50.000 Hz), so on
-border-effect demos the seam slowly crawls down the screen — which is what
-[Step 8](../08-ddr-framebuffer/) fixes by moving the frame into a triple-buffered PS DDR
+(~50 Hz) and 720p50 are nearly identical, so the read/write seam parks off-screen, and on
+the menu and in ordinary games the picture is stable and correct (matches ZEsarUX). The
+catch, which showed up later, is that the two rates aren't *exactly* locked (~50.02 vs
+50.000 Hz), so on border-effect demos the seam slowly crawls down the screen. That's what
+[Step 8](../08-ddr-framebuffer/) fixes, by moving the frame into a triple-buffered PS DDR
 framebuffer. The original research is in
 [`DDR_FRAMEBUFFER_PLAN.md`](DDR_FRAMEBUFFER_PLAN.md); Step 8 is the realized version.
 
