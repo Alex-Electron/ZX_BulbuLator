@@ -184,12 +184,14 @@ the PS-side helpers.)
 - **LEDs:** H18 blinks (alive); D18 (lock) stays off — cosmetic, the shield LED is
   active-low against a steady "locked" level.
 
-Note on the framebuffer: it's a single buffer. Because the Spectrum frame rate (~50 Hz)
-and 720p50 are nearly identical, the read/write seam parks off-screen and the picture is
-stable and correct (matches ZEsarUX). A DDR double/triple-buffer is **not needed** for
-this core; the researched plan is kept in
-[`DDR_FRAMEBUFFER_PLAN.md`](DDR_FRAMEBUFFER_PLAN.md) for when a bigger machine (Pentagon
-1024, NES with large ROMs, …) actually needs PS DDR.
+Note on the framebuffer: at this step it's a single buffer. The Spectrum frame rate
+(~50 Hz) and 720p50 are nearly identical, so the read/write seam parks off-screen and on
+the menu and ordinary games the picture is stable and correct (matches ZEsarUX). The catch,
+found later, is that the two rates aren't *exactly* locked (~50.02 vs 50.000 Hz), so on
+border-effect demos the seam slowly crawls down the screen — which is what
+[Step 8](../08-ddr-framebuffer/) fixes by moving the frame into a triple-buffered PS DDR
+framebuffer. The original research is in
+[`DDR_FRAMEBUFFER_PLAN.md`](DDR_FRAMEBUFFER_PLAN.md); Step 8 is the realized version.
 
 ## Files
 
@@ -200,7 +202,7 @@ flash/     BOOT.BIN (SD), ps7_init_fclk.tcl + pcap_load.tcl (PCAP)
 tests/     ula128.tap + AYtest_v0.2.tap (+ .z80 snapshots) — load-from-tape timing & sound checks
 bulbulator_zx_z010.bit   prebuilt bitstream
 bulb_pcap_run.sh         PCAP ("armoured train") loader
-DDR_FRAMEBUFFER_PLAN.md  researched-but-not-needed DDR framebuffer plan
+DDR_FRAMEBUFFER_PLAN.md  the original DDR framebuffer plan (realized in Step 8)
 ```
 
 ## Credits & licences

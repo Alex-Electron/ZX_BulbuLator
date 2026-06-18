@@ -1,5 +1,7 @@
 # DDR Framebuffer — architecture & build plan (Bulbulator ZX, EBAZ4205 7010)
 
+> Realized in [Step 8](../08-ddr-framebuffer/). This is the original research plan.
+
 Goal: move the video framebuffer from on-chip BRAM (full at 60/60, single-buffer → stationary
 read/write tear band at top + corner) to **PS DDR, double/triple buffered** → tear-free + full overscan.
 Principle: **don't reinvent** — reuse proven IP + the m1nl adapter + our hdl-util.

@@ -157,7 +157,7 @@ bash bulb_pcap_run.sh bulbulator_zx_z010.bit.bin   # .bit.bin via: bootgen -proc
 
 ![Передняя панель Tape Load Reader из проекта Murmulator](images/tape-load-reader.png) - **Светодиоды:** H18 мигает (работает); D18 (блокировка) не горит — это чисто косметический эффект, светодиод экрана работает по схеме «активный низ» на фоне постоянного уровня «заблокировано».
 
-Примечание по поводу фреймбуфера: это единый буфер. Поскольку частота обновления Spectrum (~50 Гц) и 720p50 практически одинаковы, граница чтения/записи находится за пределами экрана, а изображение стабильное и корректное (совпадает с ZEsarUX). Двойной/тройной буфер DDR для этого ядра **не нужен**; разработанный план хранится в файле [`DDR_FRAMEBUFFER_PLAN.md`](DDR_FRAMEBUFFER_PLAN.md) на случай, если более мощной машине (Pentagon 1024, NES с большими ПЗУ и т. д.) действительно понадобится PS DDR.
+Примечание про фреймбуфер: на этом шаге он одинарный. Частоты Spectrum (~50 Гц) и 720p50 почти совпадают, поэтому граница чтения/записи стоит за пределами экрана, и в меню и обычных играх картинка стабильна и корректна (совпадает с ZEsarUX). Загвоздка, которая вылезла позже: точного совпадения частот нет (~50,02 против 50,000 Гц), так что на демо с эффектами в бордюре эта граница медленно ползёт вниз по экрану — это и устраняет [Шаг 8](../08-ddr-framebuffer/), перенося кадр в фреймбуфер с тройной буферизацией в PS DDR. Исходное исследование лежит в [`DDR_FRAMEBUFFER_PLAN.md`](DDR_FRAMEBUFFER_PLAN.md); Шаг 8 — его реализация.
 
 ## Файлы
 
@@ -168,7 +168,7 @@ flash/     BOOT.BIN (SD), ps7_init_fclk.tcl + pcap_load.tcl (PCAP)
 tests/     ula128.tap + AYtest_v0.2.tap (+ .z80 snapshots) — load-from-tape timing & sound checks
 bulbulator_zx_z010.bit   prebuilt bitstream
 bulb_pcap_run.sh         PCAP ("armoured train") loader
-DDR_FRAMEBUFFER_PLAN.md  researched-but-not-needed DDR framebuffer plan
+DDR_FRAMEBUFFER_PLAN.md  the original DDR framebuffer plan (realized in Step 8)
 ```
 
 ## Авторы и лицензии

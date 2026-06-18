@@ -1,5 +1,7 @@
 # Hardware
 
+Languages: **English** · [Русский](HARDWARE.ru.md)
+
 > Developed by: Alexander Lavrinovich · GitHub: https://github.com/Alex-Electron · Email: lavrinovich.alex@gmail.com
 
 ## Board: EBAZ4205
