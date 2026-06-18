@@ -1,12 +1,15 @@
 # Concept
 
+Languages: **English** · [Русский](CONCEPT.ru.md)
+
 > Developed by: Alexander Lavrinovich · GitHub: https://github.com/Alex-Electron · Email: lavrinovich.alex@gmail.com
 
-BulbuLator takes the MiST / MiSTer ZX Spectrum cores and brings them up on the
-EBAZ4205 board (Zynq-7000). The main architectural difference from the original
-cores is memory: instead of the external SDRAM controller MiST uses, the
-Spectrum RAM sits in on-chip BRAM and is reached over AXI. That alone removes a
-whole class of timing and routing problems on this board.
+BulbuLator brings up an open ZX Spectrum core on the EBAZ4205 board (Zynq-7000).
+The published build runs on the Atlas `zx` core; the MiST / MiSTer cores stay as
+a fallback for the machines Atlas doesn't cover. The main architectural
+difference from those original cores is memory: instead of an external SDRAM
+controller, the Spectrum RAM sits in on-chip BRAM and is reached over AXI. That
+alone removes a whole class of timing and routing problems on this board.
 
 ## Cores
 

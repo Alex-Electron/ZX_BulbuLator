@@ -6,7 +6,9 @@ Languages: **English** · [Русский](README.ru.md)
 
 Developed by: Alexander Lavrinovich<br>
 GitHub: https://github.com/Alex-Electron<br>
-Email: lavrinovich.alex@gmail.com
+Email: lavrinovich.alex@gmail.com<br>
+Co-author: AI<br>
+Russian translation: DeepL
 
 A hardware ZX Spectrum emulator on a Xilinx Zynq SoC: bring up an open ZX Spectrum
 core on the cheap, easy-to-find EBAZ4205 board, reworking it for the Xilinx
