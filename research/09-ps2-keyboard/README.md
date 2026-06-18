@@ -9,7 +9,7 @@ Languages: **English** · [Русский](README.ru.md)
 Steps 6–8 drove the boot menu with the four shield buttons. That was enough to pick a menu
 item, but you couldn't *type*. This step wires a real **PS/2 keyboard** to the board, so the
 Spectrum behaves like a Spectrum. It also maps the control keys (reset, NMI) to the de-facto
-Speccy-emulator layout.
+Speccy-emulator layout, and folds the Spectrum's awkward Extended-mode chord onto one key: Alt.
 
 ## The keyboard was already half-built
 
@@ -72,7 +72,9 @@ Typing, cursor and the two shifts come straight from `keyboard.v`:
 - letters, digits, **Enter**, **Space**, **Backspace** (= DELETE), **Esc** (= BREAK), and the
   cursor keys **↑ ↓ ← →**;
 - **Shift** = Caps Shift (CS), **Ctrl** = Symbol Shift (SS) — so `Ctrl`+key gives the red
-  symbols and BASIC tokens.
+  symbols and BASIC tokens;
+- **Alt** = a one-key shortcut into the Spectrum's Extended mode (the green and red keyword
+  tokens) — see below.
 
 The control keys follow the de-facto Speccy-emulator standard (Murmulator / ESPectrum / MiSTer):
 
@@ -84,6 +86,21 @@ The control keys follow the de-facto Speccy-emulator standard (Murmulator / ESPe
 
 Reserved for the OSD / loader steps, not wired yet: `F1` = help, `F5` = file loader,
 `F12` = OSD menu, `Ctrl`/`Shift`+`F1…F10` = snapshot slots.
+
+## Alt — the Extended-mode key
+
+The green and red keyword tokens printed above and below each Spectrum key live in "Extended
+mode". On real hardware you reach it with a two-shift chord: hold Caps Shift and Symbol Shift
+together for the `E` cursor, let go, then press a key. Alt does the whole two-shift sequence for you:
+hold it and tap a key for the red token below the key, or tap Alt on its own and then a key for
+the green token above.
+
+Alt doesn't remap anything. Press it and the fabric fires a short synthetic Caps+Symbol Shift
+chord into the keyboard stream, which arms the ROM's `E` mode, then holds Symbol Shift for as long
+as Alt stays down, so the next key lands as the red extended token. The chord lasts
+about 60 ms, long enough for the ROM's 50 Hz keyboard scan to catch it. None of it touches the
+Atlas core: the synthetic codes ride the same `{strb, make, code}` mux as the keys and the
+buttons, so `Ctrl+Alt+Del` and the rest still decode exactly as they did before.
 
 ## The two reset levels
 
@@ -124,8 +141,10 @@ flowchart LR
     KBD["PS/2 keyboard<br/>Murmulator front-end<br/>(4k7 pull-ups, +5V)"] --> PINS["G19 / H20<br/>DATA2 header"]
     PINS --> SYNC["2-flop sync<br/>to spclk"]
     SYNC --> PS2["ps2.v<br/>11-bit frame + parity<br/>to {strb,make,code}"]
-    BTN["4 shield buttons<br/>kbd_buttons.v"] --> MUX{"key mux<br/>PS/2 wins"}
+    BTN["4 shield buttons<br/>kbd_buttons.v"] --> MUX{"key mux<br/>synthetic / PS/2 / buttons"}
     PS2 --> MUX
+    PS2 --> ALT["Alt chord gen<br/>synthetic Caps+Symbol Shift<br/>(Extended mode)"]
+    ALT --> MUX
     MUX --> KEYB["keyboard.v<br/>scan-code to 8x5 matrix"]
     KEYB --> CORE["Atlas core (main)"]
     PS2 --> HOT["hotkey decoder<br/>F11 / Ctrl+Alt+Del / Ctrl+Alt+Ins"]
@@ -156,7 +175,7 @@ workaround on modern glibc;
 ## Files
 
 ```
-sources/bulbulator_zx_ddr_top.v   full top: Step-8 design + ps2 + key mux + hotkey decoder + reset logic
+sources/bulbulator_zx_ddr_top.v   full top: Step-8 design + ps2 + key mux + hotkey decoder + Alt Extended-mode chord + reset logic
 sources/bulbulator_ddr.xdc        the .xdc, now with PS2_CLK=G19 and PS2_DATA=H20
 standalone-tests/                 the PS/2 read-test: ps2_test_top.v + ps2_axi.v + .xdc + build_ps2_test.tcl + ps2_test_run.sh (flash+read) / ps2_read_only.sh (re-read)
 bulbulator_zx_kbd.bit             prebuilt bitstream (keyboard + the normalised key map) — flash over JTAG

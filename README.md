@@ -80,7 +80,7 @@ memory live** (the ARM paints the screen while the CPU is frozen), the foundatio
 games from SD. [Step 8](research/08-ddr-framebuffer/) then makes the video **tear-free** by
 buffering the ZX frame in PS DDR — triple-buffered, swapped on the HDMI vblank — the first real
 use of that AXI-HP path to DDR. [Step 9](research/09-ps2-keyboard/) adds a real PS/2 keyboard with
-a normalised control-key map (reset / NMI). Next is the on-screen menu and SD game loader on the
+a normalised control-key map (reset / NMI, plus an Extended-mode key). Next is the on-screen menu and SD game loader on the
 ARM, then bigger machines.
 
 ## Learning the board
@@ -146,7 +146,8 @@ So far:
 - **[Step 9 — A real PS/2 keyboard](research/09-ps2-keyboard/).** A PS/2 keyboard on two pins,
   muxed with the four buttons — the Atlas core already had the receiver and the matrix decoder,
   the buttons just faked the key-taps. Plus a normalised control-key map: `F11` = hard/cold reset
-  (wipes RAM), `Ctrl+Alt+Del` = soft reset, `Ctrl+Alt+Ins` = NMI. The lesson worth keeping: a
+  (wipes RAM), `Ctrl+Alt+Del` = soft reset, `Ctrl+Alt+Ins` = NMI, plus Alt as a one-key Extended-mode shortcut.
+  The lesson worth keeping: a
   reset must not reset the DDR video pipeline — an AXI-HP master reset mid-burst hangs and freezes
   the picture. The on-screen menu and SD game loader come next.
 
@@ -156,7 +157,7 @@ More steps get added as I get them working.
 
 - **2026-06-18 — Step 9: a real PS/2 keyboard.** A PS/2 keyboard on two pins, muxed with the four
   buttons (the Atlas core already shipped `ps2.v` + `keyboard.v`); a normalised key map — `F11`
-  hard/cold reset with a RAM wipe, `Ctrl+Alt+Del` soft, `Ctrl+Alt+Ins` NMI — and an SD-bootable
+  hard/cold reset with a RAM wipe, `Ctrl+Alt+Del` soft, `Ctrl+Alt+Ins` NMI, plus Alt for the Spectrum's Extended mode — and an SD-bootable
   image. The OSD menu and SD game loader are the next chapter.
 - **2026-06-17 — Step 8: tear-free DDR framebuffer.** The ZX frame is triple-buffered in PS DDR
   over AXI-HP and swapped only on the HDMI vblank — no more tear seam on border demos or

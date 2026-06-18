@@ -321,10 +321,48 @@ module bulbulator_zx_ddr_top
         .strb(kbd_strb), .make(kbd_make), .code(kbd_code)
     );
 
-    // Merge the real PS/2 keyboard with the 4 buttons (PS/2 wins on a simultaneous strobe).
-    wire       kb_strb = ps2_strb | kbd_strb;
-    wire       kb_make = ps2_strb ? ps2_make : kbd_make;
-    wire [7:0] kb_code = ps2_strb ? ps2_code : kbd_code;
+    //=============================================================================================
+    // Alt = ZX Extended mode (the red lower-row token). On the Alt press edge, inject a short
+    // Caps+Symbol Shift chord (this arms the ROM's "E" mode), then hold Symbol Shift while Alt
+    // stays down - so the next key, pressed with Alt held, prints the red extended token. A quick
+    // Alt tap (released before any key) leaves E-mode armed with no shift held -> the next key
+    // gives the green top token instead. Done as synthetic scan-code events fed into the keyboard
+    // stream (no Atlas-core edit): CS = 0x12, SS = 0x14, make = 0 press / make = 1 release.
+    //=============================================================================================
+    localparam [17:0] ALT_PULSE = 18'd210000;   // ~60 ms @ 3.5 MHz pe3M5: spans >=2 of the ROM's 50 Hz key scans
+    reg        alt_d2   = 1'b0;
+    reg [2:0]  alt_st   = 3'd0;                  // 0 idle / 1 SS-down / 3 chord-hold then CS-up / 5 held while Alt
+    reg [17:0] alt_tmr  = 18'd0;
+    reg        syn_strb = 1'b0, syn_make = 1'b1;
+    reg [7:0]  syn_code = 8'h00;
+    always @(posedge spclk) if (pe3M5) begin
+        alt_d2   <= alt_h;
+        syn_strb <= 1'b0;                         // default: emit nothing on this enable tick
+        case (alt_st)
+            3'd0: if (alt_h & ~alt_d2) begin                                  // Alt just pressed
+                      syn_strb <= 1'b1; syn_make <= 1'b0; syn_code <= 8'h12;  //   -> Caps Shift down
+                      alt_st   <= 3'd1;
+                  end
+            3'd1: begin                                                       //   -> Symbol Shift down
+                      syn_strb <= 1'b1; syn_make <= 1'b0; syn_code <= 8'h14;
+                      alt_tmr  <= ALT_PULSE; alt_st <= 3'd3;
+                  end
+            3'd3: if (alt_tmr == 18'd0) begin                                 // chord held long enough
+                      syn_strb <= 1'b1; syn_make <= 1'b1; syn_code <= 8'h12;  //   -> Caps Shift up (SS stays down)
+                      alt_st   <= 3'd5;
+                  end else alt_tmr <= alt_tmr - 18'd1;
+            3'd5: if (~alt_h) begin                                           // Alt released
+                      syn_strb <= 1'b1; syn_make <= 1'b1; syn_code <= 8'h14;  //   -> Symbol Shift up
+                      alt_st   <= 3'd0;
+                  end
+            default: alt_st <= 3'd0;
+        endcase
+    end
+
+    // Merge synthetic Alt chord + real PS/2 keyboard + the 4 buttons (synthetic wins, then PS/2).
+    wire       kb_strb = syn_strb | ps2_strb | kbd_strb;
+    wire       kb_make = syn_strb ? syn_make : (ps2_strb ? ps2_make : kbd_make);
+    wire [7:0] kb_code = syn_strb ? syn_code : (ps2_strb ? ps2_code : kbd_code);
 
     //=============================================================================================
     // Atlas ZX Spectrum core (main). CPU enables gated by halt; video enables free-running.
