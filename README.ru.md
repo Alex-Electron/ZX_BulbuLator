@@ -2,7 +2,7 @@
 
 Languages: [English](README.md) · **Русский**
 
-![BulbuLator — ZX Spectrum на Zynq-7010 (EBAZ4205)](docs/images/splash.jpg)
+![ZX BulbuLator — ZX Spectrum на Zynq-7010 (EBAZ4205)](docs/images/splash.jpg)
 
 Разработчик: Александр Лавринович<br> GitHub: https://github.com/Alex-Electron<br> Электронная почта: lavrinovich.alex@gmail.com<br> Соавтор: ИИ<br> Перевод на русский: DeepL<br> Телеграм: https://t.me/zx_bulbulator
 
