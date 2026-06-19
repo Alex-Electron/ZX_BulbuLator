@@ -1,4 +1,4 @@
-# BulbuLator
+# ZX BulbuLator
 
 Languages: [English](README.md) · **Русский**
 
