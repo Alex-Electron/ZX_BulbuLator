@@ -6,7 +6,7 @@ HERE=$(cd "$(dirname "$0")" && pwd)
 VLAB="${VIVADO_LAB:-/tools/Xilinx/Vivado_Lab/2023.1/bin/vivado_lab}"
 XSDB="${XSDB:-/tools/Xilinx/Vivado_Lab/2023.1/bin/xsdb}"
 HWS="${HW_SERVER:-$(dirname "$VLAB")/hw_server}"
-XVCD="${XVCD_PICO:-xvcd-pico}"
+XVCD="${XVCD_PICO:-$HOME/xvc-pico/daemon/xvcd-pico}"
 pkill -9 -x vivado_lab 2>/dev/null; sleep 1
 sudo -n pkill -9 -x xvcd-pico 2>/dev/null; sleep 1
 sudo -n bash -c "setsid $XVCD >/tmp/xvcd.log 2>&1 </dev/null &"; sleep 3

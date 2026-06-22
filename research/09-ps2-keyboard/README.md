@@ -160,7 +160,8 @@ Three ways to use this, depending on how much you want to do yourself.
 the cores once from the repo root (`../../get_deps.sh`), then `./build.sh` (or `./build.sh nosnow`).
 This step's only change is the top (`bulbulator_zx_ddr_top.v`) and its constraints; `sources/assemble.sh`
 pulls the Step-8 DDR chain and the Step-6 base glue, gathers it into `sources/build/`, and Vivado
-writes `bulbulator_zx_ddr.bit` there. The standalone read-test builds on its own from `standalone-tests/`.
+writes `bulbulator_zx_kbd.bit` there (the same name as the prebuilt one this step
+flashes). The standalone read-test builds on its own from `standalone-tests/`.
 
 **Flash over JTAG.** PCAP "armoured train", same as Steps 6–8: configure `bulbulator_zx_kbd.bit`
 over PCAP (it's BAD_PACKET-immune, unlike plain JTAG on this board). The 128 menu comes up on HDMI
