@@ -91,10 +91,10 @@ What each piece is for:
 - **Vitis** — bare-metal ARM. From Step 7 on, the Cortex-A9 does real work (the
   AXI control plane, the SD-card loader, the OSD), and any SD-boot image needs an
   FSBL. Vitis brings `xsct` and the `arm-none-eabi` compiler that build those.
-- **Antmicro [`mkbootimage`](https://github.com/antmicro/zynq-mkbootimage)** — to
-  assemble the `BOOT.BIN` SD-boot image (FSBL + bitstream + app). It sidesteps a
-  `bootgen` segfault seen with 2023.1 on recent glibc. Needed from Step 6's
-  SD-boot image onward; a small `make`.
+- SD-boot images (`BOOT.BIN`) need **no extra tool** — each step's
+  `flash/build_boot.sh` builds them with the `bootgen` that ships with Vivado. (It
+  feeds bootgen pre-extracted `.bin` partitions and patches the BootROM header,
+  which sidesteps a `bootgen`/glibc-2.43 segfault on bleeding-edge hosts.)
 
 One more, the first time you build from source — fetch the shared HDL the steps
 sit on, from the repo root:

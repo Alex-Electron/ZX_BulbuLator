@@ -1,4 +1,5 @@
 # Бронепоезд: заливка битстрима в DDR с верификацией + конфигурация PL через PCAP (DevC)
+set HERE [file dirname [file normalize [info script]]]
 connect -url tcp:localhost:3121
 configparams force-mem-accesses 1
 # Системный сброс: после SD-boot ядро крутит заглушку с MMU, а её код/таблицы
@@ -12,12 +13,11 @@ catch {stop}
 targets -set -filter {name =~ "*Cortex-A9*#0"}
 catch {stop}
 after 200
-cd /home/lavrinovich/hdmi720pl
-source ps7_init_fclk.tcl
+source [file join $HERE ps7_init_fclk.tcl]
 ps7_init
 puts ">>> PS7_INIT DONE (PLL+DDR подняты)"
 
-set BIN  /home/lavrinovich/zx48/zx48.bit.bin
+set BIN  [file normalize [file join $HERE .. bulbulator_zx_ddr.bit.bin]]
 if {[info exists ::env(PCAP_BIN)]} { set BIN $::env(PCAP_BIN) }
 file delete -force /tmp/rb.bin
 set ADDR 0x00100000

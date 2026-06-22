@@ -1,16 +1,17 @@
 #!/bin/bash
 set -u
-DIR=/home/lavrinovich/ddrfb
-VLAB=/tools/Xilinx/Vivado_Lab/2023.1/bin/vivado_lab
-XSDB=/tools/Xilinx/Vivado_Lab/2023.1/bin/xsdb
-HWS=/tools/Xilinx/Vivado_Lab/2023.1/bin/hw_server
-BG=/tools/Xilinx/Vivado/2023.1/bin/bootgen
-cd "$DIR"
+HERE=$(cd "$(dirname "$0")" && pwd)
+DIR="$HERE"
+VLAB="${VIVADO_LAB:-/tools/Xilinx/Vivado_Lab/2023.1/bin/vivado_lab}"
+XSDB="${XSDB:-/tools/Xilinx/Vivado_Lab/2023.1/bin/xsdb}"
+HWS="${HW_SERVER:-$(dirname "$VLAB")/hw_server}"
+BG="${BOOTGEN:-/tools/Xilinx/Vivado/2023.1/bin/bootgen}"
+XVCD="${XVCD_PICO:-xvcd-pico}"
 echo ">>> bootgen .bit.bin ..."
-"$BG" -arch zynq -image bulb_ddr_pcap.bif -w -process_bitstream bin >/tmp/bg.log 2>&1 && echo "    OK $(ls -la $DIR/bulbulator_zx_ddr.bit.bin|awk "{print \$5}") bytes" || { echo bootgen FAIL; tail /tmp/bg.log; exit 1; }
+( cd "$HERE/flash" && "$BG" -arch zynq -image bulb_ddr_pcap.bif -w -process_bitstream bin ) >/tmp/bg.log 2>&1 && echo "    OK $(ls -la $DIR/bulbulator_zx_ddr.bit.bin|awk "{print \$5}") bytes" || { echo bootgen FAIL; tail /tmp/bg.log; exit 1; }
 pkill -9 -x vivado_lab 2>/dev/null; sleep 1
 sudo -n pkill -9 -x xvcd-pico 2>/dev/null; sleep 1
-sudo -n bash -c "setsid /home/lavrinovich/xvc-pico/daemon/xvcd-pico >/tmp/xvcd.log 2>&1 </dev/null &"; sleep 3
+sudo -n bash -c "setsid $XVCD >/tmp/xvcd.log 2>&1 </dev/null &"; sleep 3
 [ "$(ss -ltn 2>/dev/null|grep -c :3121)" = 0 ] && { setsid "$HWS" >/tmp/hwsrv.log 2>&1 </dev/null & sleep 4; }
 rm -f /tmp/hold.log
 cat > /tmp/ht.tcl <<TCL
@@ -27,7 +28,7 @@ for i in $(seq 1 40); do grep -q -E "TARGET_OPEN|XVC_FAIL" /tmp/hold.log 2>/dev/
 grep -q TARGET_OPEN /tmp/hold.log || { echo XVC_FAIL; tail /tmp/hold.log; pkill -9 -x vivado_lab; exit 1; }
 echo ">>> PCAP config ..."
 export PCAP_BIN="$DIR/bulbulator_zx_ddr.bit.bin"
-"$XSDB" /home/lavrinovich/zx48/pcap_load.tcl 2>&1 | grep -E "PS7_INIT|PCFG_DONE|POST_CONFIG|FAIL|DDR"
+"$XSDB" "$HERE/flash/pcap_load.tcl" 2>&1 | grep -E "PS7_INIT|PCFG_DONE|POST_CONFIG|FAIL|DDR"
 echo ">>> read axi_ctl VERSION (expect 0xB01B0004) ..."
 cat > /tmp/rv.tcl <<TCL
 connect -url tcp:localhost:3121

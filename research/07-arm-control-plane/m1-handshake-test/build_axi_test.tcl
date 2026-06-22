@@ -1,6 +1,6 @@
 # build_axi_test.tcl  -  Milestone 1 AXI GP0 handshake bitstream, xc7z010clg400-1.
-# Run on ThinkPad from /home/lavrinovich/axi_test.
-set DIR /home/lavrinovich/axi_test
+# Sources and outputs resolve next to this script.
+set DIR [file dirname [file normalize [info script]]]
 
 read_verilog [list $DIR/axi_ctl.v $DIR/bulb_axi_test_top.v]
 read_xdc     $DIR/bulb_axi_test.xdc

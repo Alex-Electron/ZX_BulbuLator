@@ -2,11 +2,13 @@
 # ddrfb_p2a_run.sh - Phase 2a: PCAP-config the capture-path bit. A synthetic ULA (spclk) is captured
 # through the FIFO/CDC into DDR and scanned out tear-free. PASS = colour bars scroll smoothly on HDMI.
 set -u
-DIR=/home/lavrinovich/ddrfb
-VLAB=/tools/Xilinx/Vivado_Lab/2023.1/bin/vivado_lab
-XSDB=/tools/Xilinx/Vivado_Lab/2023.1/bin/xsdb
-HWS=/tools/Xilinx/Vivado_Lab/2023.1/bin/hw_server
-BG=/tools/Xilinx/Vivado/2023.1/bin/bootgen
+HERE=$(cd "$(dirname "$0")" && pwd)
+DIR="$HERE"
+VLAB="${VIVADO_LAB:-/tools/Xilinx/Vivado_Lab/2023.1/bin/vivado_lab}"
+XSDB="${XSDB:-/tools/Xilinx/Vivado_Lab/2023.1/bin/xsdb}"
+HWS="${HW_SERVER:-$(dirname "$VLAB")/hw_server}"
+BG="${BOOTGEN:-/tools/Xilinx/Vivado/2023.1/bin/bootgen}"
+XVCD="${XVCD_PICO:-xvcd-pico}"
 cd "$DIR"
 
 echo ">>> bootgen .bit.bin ..."
@@ -15,8 +17,8 @@ echo ">>> bootgen .bit.bin ..."
   || { echo ">>> bootgen FAIL"; tail -8 /tmp/bg.log; exit 1; }
 
 pkill -9 -x vivado_lab 2>/dev/null; sleep 1
-sudo -n pkill -9 -x xvcd-pico 2>/dev/null; sleep 1
-sudo -n bash -c "setsid /home/lavrinovich/xvc-pico/daemon/xvcd-pico >/tmp/xvcd.log 2>&1 </dev/null &"; sleep 3
+sudo -n pkill -9 -x "$XVCD" 2>/dev/null; sleep 1
+sudo -n bash -c "setsid $XVCD >/tmp/xvcd.log 2>&1 </dev/null &"; sleep 3
 if [ "$(ss -ltn 2>/dev/null | grep -c :3121)" = "0" ]; then
   setsid "$HWS" >/tmp/hwsrv.log 2>&1 </dev/null & sleep 4
 fi
@@ -36,7 +38,7 @@ grep -q TARGET_OPEN /tmp/hold.log || { echo ">>> XVC FAIL"; tail /tmp/hold.log; 
 
 echo ">>> PCAP config the Phase-2a bit ..."
 export PCAP_BIN="$DIR/ddrfb_p2a.bit.bin"
-"$XSDB" /home/lavrinovich/zx48/pcap_load.tcl 2>&1 | grep -E "PS7_INIT|PCFG_DONE|POST_CONFIG|FAIL|DDR"
+"$XSDB" "$HERE/../flash/pcap_load.tcl" 2>&1 | grep -E "PS7_INIT|PCFG_DONE|POST_CONFIG|FAIL|DDR"
 
 echo ">>> read GP0 status (capture+loader liveness + FIFO high-water) ..."
 cat > /tmp/ddrfb_post.tcl <<'TCL'

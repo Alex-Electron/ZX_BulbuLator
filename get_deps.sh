@@ -30,8 +30,9 @@ ZX_SHA=407b653e5f7f1fe5cd02340491ed071575754951
 # hdl-util/hdmi, our fork (the same TMDS+audio core Steps 3-5 use).
 HDMI_URL=https://github.com/Alex-Electron/hdmi.git
 HDMI_SHA=fbade3d11a58b885a6084ec75eae25339623355d
-# Digilent vivado-library - only Steps 3/4 need it (the rgb2dvi IP for their HDMI BD).
-VLIB_URL=https://github.com/Digilent/vivado-library.git
+# vivado-library - only Steps 3/4 need it (the rgb2dvi IP for their HDMI BD).
+# Our fork of Digilent/vivado-library, so every fetched dep comes from Alex-Electron.
+VLIB_URL=https://github.com/Alex-Electron/vivado-library.git
 VLIB_SHA=f4613fff005b098065fd5d619a2b88e55720a423
 VLIB_SUB=ip/rgb2dvi
 # -----------------------------------------------------------------------------

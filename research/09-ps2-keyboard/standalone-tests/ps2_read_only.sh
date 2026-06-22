@@ -2,12 +2,14 @@
 # ps2_read_only.sh - re-attach XVC and read the PS/2 status register. NO re-flash (PL stays
 # configured from the PCAP load until power-cycle). Full xsdb output for diagnosis.
 set -u
-VLAB=/tools/Xilinx/Vivado_Lab/2023.1/bin/vivado_lab
-XSDB=/tools/Xilinx/Vivado_Lab/2023.1/bin/xsdb
-HWS=/tools/Xilinx/Vivado_Lab/2023.1/bin/hw_server
+HERE=$(cd "$(dirname "$0")" && pwd)
+VLAB="${VIVADO_LAB:-/tools/Xilinx/Vivado_Lab/2023.1/bin/vivado_lab}"
+XSDB="${XSDB:-/tools/Xilinx/Vivado_Lab/2023.1/bin/xsdb}"
+HWS="${HW_SERVER:-$(dirname "$VLAB")/hw_server}"
+XVCD="${XVCD_PICO:-xvcd-pico}"
 pkill -9 -x vivado_lab 2>/dev/null; sleep 1
 sudo -n pkill -9 -x xvcd-pico 2>/dev/null; sleep 1
-sudo -n bash -c "setsid /home/lavrinovich/xvc-pico/daemon/xvcd-pico >/tmp/xvcd.log 2>&1 </dev/null &"; sleep 3
+sudo -n bash -c "setsid $XVCD >/tmp/xvcd.log 2>&1 </dev/null &"; sleep 3
 [ "$(ss -ltn 2>/dev/null|grep -c :3121)" = 0 ] && { setsid "$HWS" >/tmp/hwsrv.log 2>&1 </dev/null & sleep 4; }
 rm -f /tmp/hold3.log
 cat > /tmp/ht3.tcl <<TCL

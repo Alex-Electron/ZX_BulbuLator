@@ -3,18 +3,26 @@
 # XVC target, then xsdb pcap_load.tcl loads the .bit.bin into DDR (verified) and
 # configures the PL via PCAP - bypassing the XVC config path (BAD_PACKET-immune).
 set -u
-VLAB=/tools/Xilinx/Vivado_Lab/2023.1/bin/vivado_lab
-XSDB=/tools/Xilinx/Vivado_Lab/2023.1/bin/xsdb
-HWS=/tools/Xilinx/Vivado_Lab/2023.1/bin/hw_server
-PCAP_BIN_ARG="${1:-/home/lavrinovich/bulbulator/bulbulator_zx_z010.bit.bin}"
+HERE=$(cd "$(dirname "$0")" && pwd)
+VLAB="${VIVADO_LAB:-/tools/Xilinx/Vivado_Lab/2023.1/bin/vivado_lab}"
+XSDB="${XSDB:-/tools/Xilinx/Vivado_Lab/2023.1/bin/xsdb}"
+HWS="${HW_SERVER:-$(dirname "$VLAB")/hw_server}"
+BG="${BOOTGEN:-/tools/Xilinx/Vivado/2023.1/bin/bootgen}"
+XVCD="${XVCD_PICO:-xvcd-pico}"
+
+# PCAP image: generate <bit>.bin inline from the committed flash/bulb_pcap.bif
+# (bootgen runs with cwd = the bif's own dir; the bif points at ../<bit>, so it
+# emits the .bin one level up at the step root). Never a committed/absolute file.
+( cd "$HERE/flash" && "$BG" -arch zynq -image bulb_pcap.bif -w -process_bitstream bin )
+PCAP_BIN_ARG="${1:-$HERE/bulbulator_zx_z010.bit.bin}"
 
 # Drop stale JTAG clients (exact-name match, never -f, to avoid self-kill).
 pkill -9 -x vivado_lab 2>/dev/null; pkill -9 -x cs_server 2>/dev/null; pkill -9 -x rdi_xsdb 2>/dev/null
 sleep 1
 # Bring up the daemon (sudo -n, passwordless) + hw_server only if not already listening.
 if [ "$(ss -ltn 2>/dev/null | grep -c :2542)" = "0" ]; then
-  sudo -n pkill -9 -x xvcd-pico 2>/dev/null; sleep 1; sudo -n rm -f /tmp/xvcd.log
-  sudo -n bash -c "setsid /home/lavrinovich/xvc-pico/daemon/xvcd-pico >/tmp/xvcd.log 2>&1 </dev/null &"; sleep 3
+  sudo -n pkill -9 -x "$XVCD" 2>/dev/null; sleep 1; sudo -n rm -f /tmp/xvcd.log
+  sudo -n bash -c "setsid $XVCD >/tmp/xvcd.log 2>&1 </dev/null &"; sleep 3
 fi
 if [ "$(ss -ltn 2>/dev/null | grep -c :3121)" = "0" ]; then
   setsid "$HWS" >/tmp/hwsrv.log 2>&1 </dev/null & sleep 4
@@ -36,6 +44,6 @@ if ! grep -q TARGET_OPEN /tmp/hold.log 2>/dev/null; then echo ">>> FAIL: XVC tar
 echo ">>> XVC target open; PCAP load (DDR + verify + PCAP) ..."
 export PCAP_BIN="$PCAP_BIN_ARG"
 echo ">>> bin: $PCAP_BIN"
-"$XSDB" /home/lavrinovich/zx48/pcap_load.tcl 2>&1
+"$XSDB" "$HERE/flash/pcap_load.tcl" 2>&1
 pkill -9 -x vivado_lab 2>/dev/null
 echo ">>> PCAP-RUN END"

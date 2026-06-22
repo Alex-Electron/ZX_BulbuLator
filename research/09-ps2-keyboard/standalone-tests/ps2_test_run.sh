@@ -2,11 +2,13 @@
 # ps2_test_run.sh - PCAP-config the PS/2 read test, then poll the scancode register live.
 # Mirrors ddr_full_run.sh (armoured-train PCAP) + a read loop. Run on ThinkPad (board + Pico here).
 set -u
-DIR=/home/lavrinovich/ps2test
-VLAB=/tools/Xilinx/Vivado_Lab/2023.1/bin/vivado_lab
-XSDB=/tools/Xilinx/Vivado_Lab/2023.1/bin/xsdb
-HWS=/tools/Xilinx/Vivado_Lab/2023.1/bin/hw_server
-BG=/tools/Xilinx/Vivado/2023.1/bin/bootgen
+HERE=$(cd "$(dirname "$0")" && pwd)
+DIR="$HERE"
+VLAB="${VIVADO_LAB:-/tools/Xilinx/Vivado_Lab/2023.1/bin/vivado_lab}"
+XSDB="${XSDB:-/tools/Xilinx/Vivado_Lab/2023.1/bin/xsdb}"
+HWS="${HW_SERVER:-$(dirname "$VLAB")/hw_server}"
+BG="${BOOTGEN:-/tools/Xilinx/Vivado/2023.1/bin/bootgen}"
+XVCD="${XVCD_PICO:-xvcd-pico}"
 cd "$DIR"
 
 echo ">>> bootgen .bit.bin ..."
@@ -16,7 +18,7 @@ echo ">>> bootgen .bit.bin ..."
 
 pkill -9 -x vivado_lab 2>/dev/null; sleep 1
 sudo -n pkill -9 -x xvcd-pico 2>/dev/null; sleep 1
-sudo -n bash -c "setsid /home/lavrinovich/xvc-pico/daemon/xvcd-pico >/tmp/xvcd.log 2>&1 </dev/null &"; sleep 3
+sudo -n bash -c "setsid $XVCD >/tmp/xvcd.log 2>&1 </dev/null &"; sleep 3
 [ "$(ss -ltn 2>/dev/null|grep -c :3121)" = 0 ] && { setsid "$HWS" >/tmp/hwsrv.log 2>&1 </dev/null & sleep 4; }
 
 rm -f /tmp/hold2.log
@@ -34,8 +36,8 @@ for i in $(seq 1 40); do grep -q -E "TARGET_OPEN|XVC_FAIL" /tmp/hold2.log 2>/dev
 grep -q TARGET_OPEN /tmp/hold2.log || { echo XVC_FAIL; tail /tmp/hold2.log; pkill -9 -x vivado_lab; exit 1; }
 
 echo ">>> PCAP config ..."
-export PCAP_BIN="$DIR/ps2_test.bit.bin"
-"$XSDB" /home/lavrinovich/zx48/pcap_load.tcl 2>&1 | grep -E "PS7_INIT|PCFG_DONE|POST_CONFIG|FAIL|ВЕРИФИ"
+export PCAP_BIN="$HERE/ps2_test.bit.bin"
+"$XSDB" "$HERE/../flash/pcap_load.tcl" 2>&1 | grep -E "PS7_INIT|PCFG_DONE|POST_CONFIG|FAIL|ВЕРИФИ"
 
 echo ">>> PS/2 read loop — НАЖИМАЙ КЛАВИШИ (окно ~80 c) ..."
 cat > /tmp/ps2read.tcl <<TCL

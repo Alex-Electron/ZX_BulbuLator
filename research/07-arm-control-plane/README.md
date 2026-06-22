@@ -128,9 +128,10 @@ crossing).
 - **`bootgen` for the SD image is glibc-picky.** On a bleeding-edge host (glibc 2.43) the full
   boot-image build (`FSBL + bitstream + idle.elf → BOOT.BIN`) segfaults during ELF parsing,
   even though every bundled library is present — the 2023.1 tool predates that glibc. The
-  bitstream-only mode (`-process_bitstream bin`, used for the PCAP path) is unaffected. For now
-  `BOOT.BIN` is built where an older glibc lives; the durable fix is the open-source
-  `mkbootimage`, which has no such dependency.
+  bitstream-only mode (`-process_bitstream bin`, used for the PCAP path) is unaffected. The fix
+  is baked into each step's `flash/build_boot.sh`: hand bootgen pre-extracted `.bin` partitions
+  (no ELF parsing, so no segfault), then patch the BootROM header's length and checksum fields.
+  No extra tool — just the `bootgen` that ships with Vivado.
 
 ## Milestone 1 first — the bare-metal handshake (`m1-handshake-test/`)
 
