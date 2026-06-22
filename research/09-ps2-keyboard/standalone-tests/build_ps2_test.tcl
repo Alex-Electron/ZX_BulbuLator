@@ -1,7 +1,8 @@
 # build_ps2_test.tcl  -  standalone PS/2 keyboard read test bitstream (xc7z010clg400-1).
 # Run on ThinkPad:  vivado -mode batch -source build_ps2_test.tcl
-set ATLAS /home/lavrinovich/zxatlas/src
-set DIR   /home/lavrinovich/ps2test
+# Requires ../../../get_deps.sh to have populated <repo>/cores.
+set DIR   [file dirname [file normalize [info script]]]
+set ATLAS [file normalize [file join $DIR ../../../cores/zx/src]]
 
 read_verilog [list $ATLAS/ps2.v $DIR/ps2_axi.v $DIR/ps2_test_top.v]
 read_xdc $DIR/ps2_test.xdc

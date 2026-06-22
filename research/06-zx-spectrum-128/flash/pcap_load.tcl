@@ -12,12 +12,12 @@ catch {stop}
 targets -set -filter {name =~ "*Cortex-A9*#0"}
 catch {stop}
 after 200
-cd /home/lavrinovich/hdmi720pl
-source ps7_init_fclk.tcl
+set HERE [file dirname [file normalize [info script]]]
+source [file join $HERE ps7_init_fclk.tcl]
 ps7_init
 puts ">>> PS7_INIT DONE (PLL+DDR подняты)"
 
-set BIN  /home/lavrinovich/zx48/zx48.bit.bin
+set BIN  [file join $HERE .. bulbulator_zx_z010.bit.bin]
 if {[info exists ::env(PCAP_BIN)]} { set BIN $::env(PCAP_BIN) }
 file delete -force /tmp/rb.bin
 set ADDR 0x00100000

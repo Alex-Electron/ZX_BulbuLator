@@ -4,8 +4,9 @@
 # Model: vivado_lab opens+holds the XVC target so hw_server has the JTAG chain,
 # then xsdb runs ps7_init (FCLK0 -> GP0 clock), programs the PL, and does mrd/mwr.
 set -u
-VLAB=/tools/Xilinx/Vivado_Lab/2023.1/bin/vivado_lab
-XSDB=/tools/Xilinx/Vivado_Lab/2023.1/bin/xsdb
+HERE=$(cd "$(dirname "$0")" && pwd)
+VLAB="${VIVADO_LAB:-/tools/Xilinx/Vivado_Lab/2023.1/bin/vivado_lab}"
+XSDB="${XSDB:-/tools/Xilinx/Vivado_Lab/2023.1/bin/xsdb}"
 
 # 1) vivado_lab: open + hold the XVC target.
 rm -f /tmp/hold.log
@@ -28,17 +29,21 @@ fi
 echo ">> XVC target open, running xsdb..."
 
 # 2) xsdb: stop A9, ps7_init, program PL, GP0 register round-trip.
-cat > /tmp/axi.tcl <<'TCL'
+# Path-bearing Tcl vars from bash (HERE-relative); rest of the script is verbatim.
+cat > /tmp/axi.tcl <<EOF
+set HERE_PS7 "$HERE/../flash/ps7_init_fclk.tcl"
+set HERE_BIT "$HERE/bulb_axi_test.bit"
+EOF
+cat >> /tmp/axi.tcl <<'TCL'
 connect -url tcp:localhost:3121
 configparams force-mem-accesses 1
 targets -set -filter {name =~ "*Cortex-A9*#0"}
 stop
-cd /home/lavrinovich/vm-migrate/hdmi720pl
-source ps7_init_fclk.tcl
+source $HERE_PS7
 ps7_init
 ps7_post_config
 puts ">>> PS7_INIT DONE (FCLK0 up -> GP0 clock live)"
-if {[catch {fpga -file /home/lavrinovich/axi_test/bulb_axi_test.bit} e]} {
+if {[catch {fpga -file $HERE_BIT} e]} {
     puts ">>> fpga -file FAILED: $e  (if BAD_PACKET, fall back to PCAP)"
 } else {
     puts ">>> PL CONFIGURED"

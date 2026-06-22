@@ -14,6 +14,14 @@ rom128.hex
 combined128.rom
 *.rom
 
+# Build artifacts of the .z80 snapshot injector (zxinj): the embedded blob is
+# generated from your own snapshot, the ELF is compiled. Snapshots aren't shipped.
+zxinj/z80_blob.c
+zxinj/snapshot.z80
+zxinj/zxinj.elf
+# Generated PCAP "armoured train" input (bootgen -process_bitstream bin from the .bit).
+*.bit.bin
+
 # Vivado / Vitis build artifacts.
 # This repo commits only sources and prebuilt bitstreams; the full projects are
 # built elsewhere, so the generated project tree never needs to land here.

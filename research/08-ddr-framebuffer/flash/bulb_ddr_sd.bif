@@ -1,5 +1,0 @@
-the_ROM_image: {
-  [bootloader] /home/lavrinovich/sdboot/ws/ebaz/zynq_fsbl/fsbl.elf
-  /home/lavrinovich/ddrfb/bulbulator_zx_ddr.bit
-  /home/lavrinovich/sdboot/ws/idle/Debug/idle.elf
-}
