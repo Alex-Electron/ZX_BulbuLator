@@ -135,7 +135,7 @@ assign vmmA1 = { vmmPage, va[12:7], !rfsh && addr01 ? a[6:0] : va[6:0] }; // fai
 `endif
 ```
 
-`sources/build_bulbulator_ddr_nosnow.tcl` synthesises with `-verilog_define NO_SNOW`, and
+`./build.sh nosnow` synthesises with `-verilog_define NO_SNOW`, and
 `ddr_inject_nosnow_run.sh` injects a `.z80` onto the no-snow bitstream over JTAG. (Once a
 keyboard is wired this becomes a runtime key toggle, so one bitstream does both.)
 
