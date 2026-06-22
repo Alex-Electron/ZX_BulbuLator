@@ -81,8 +81,11 @@ memory live** (the ARM paints the screen while the CPU is frozen), the foundatio
 games from SD. [Step 8](research/08-ddr-framebuffer/) then makes the video **tear-free** by
 buffering the ZX frame in PS DDR — triple-buffered, swapped on the HDMI vblank — the first real
 use of that AXI-HP path to DDR. [Step 9](research/09-ps2-keyboard/) adds a real PS/2 keyboard with
-a normalised control-key map (reset / NMI, plus an Extended-mode key). Next is the on-screen menu and SD game loader on the
-ARM, then bigger machines.
+a normalised control-key map (reset / NMI, plus an Extended-mode key). [Step 10](research/10-osd-keyboard-gate/)
+gives the ARM an **on-screen display over the live picture** and a **keyboard gate** — press `F1` for a
+help menu while the Spectrum keeps running, `F12`/`Esc` to close. It's built machine-agnostic on purpose
+(a scancode FIFO the ARM drains, a `MACHINE_ID` register), the MiSTer split where the fabric is the
+machine and the ARM is the operator. Next is the SD game loader and a navigable OSD menu, then bigger machines.
 
 ## Learning the board
 
@@ -150,12 +153,27 @@ So far:
   (wipes RAM), `Ctrl+Alt+Del` = soft reset, `Ctrl+Alt+Ins` = NMI, plus Alt as a one-key Extended-mode shortcut.
   The lesson worth keeping: a
   reset must not reset the DDR video pipeline — an AXI-HP master reset mid-burst hangs and freezes
-  the picture. The on-screen menu and SD game loader come next.
+  the picture. The on-screen menu landed in Step 10; the SD game loader is next.
+- **[Step 10 — On-screen display + the keyboard gate](research/10-osd-keyboard-gate/).** The ARM
+  finally has a voice: it draws a 1-bpp OSD panel over the live picture — a combinational mux on the
+  pixel path, so the Z80 never stops — and takes the keyboard the moment the menu opens (`F1` for
+  help, `F12`/`Esc` to close). The clever part is what's *not* there: the fabric decodes no function
+  key. Every scancode is tapped into a clock-crossing FIFO the ARM drains, and a `MACHINE_ID`
+  register tells it which core is loaded, so the same OSD and keyboard gate are meant to sit in front
+  of a future NES or C64 core unchanged. A fabric deadman timer hands the keyboard back if the ARM
+  ever stalls. This is the MiSTer division of labour: the fabric is the machine, the ARM is the operator.
 
 More steps get added as I get them working.
 
 ## Changelog
 
+- **2026-06-22 — Step 10: on-screen display + the keyboard gate.** The ARM draws a 1-bpp OSD over
+  the live 720p picture without halting the Z80 (overlay, not halt), and a keyboard gate diverts the
+  PS/2 keys to the ARM while the menu is open — `F1` opens a help / key-map page, `F12`/`Esc` close it.
+  Built machine-agnostic on purpose: an always-tap scancode FIFO, the OSD compositor and a
+  `MACHINE_ID` register, so the same control plane fits a future NES/C64 core; a fabric deadman frees
+  the keyboard if the ARM stalls. Verified on hardware (control-plane VERSION `0xB01B0006`). Next: the
+  SD game loader and a navigable OSD menu.
 - **2026-06-18 — Step 9: a real PS/2 keyboard.** A PS/2 keyboard on two pins, muxed with the four
   buttons (the Atlas core already shipped `ps2.v` + `keyboard.v`); a normalised key map — `F11`
   hard/cold reset with a RAM wipe, `Ctrl+Alt+Del` soft, `Ctrl+Alt+Ins` NMI, plus Alt for the Spectrum's Extended mode — and an SD-bootable

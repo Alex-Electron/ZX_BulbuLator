@@ -2,6 +2,11 @@
 
 Languages: **English** · [Русский](README.ru.md)
 
+![The F1 help panel over a game loading on the live Spectrum](images/osd-step10.jpg)
+
+*The F1 help page, drawn over RetroSouls' Ringo as it loads. The panel sits in the grey field above
+the screen and barely dims it; the Spectrum keeps running underneath the whole time. Overlay, not halt.*
+
 By Step 9 the Spectrum had everything a Spectrum needs: video, sound, a real keyboard. What it
 didn't have was a way for the ARM to *say* anything. The picture belonged entirely to the Z80; the
 keyboard went straight into the key matrix. This step gives the ARM a voice and a hand on the
