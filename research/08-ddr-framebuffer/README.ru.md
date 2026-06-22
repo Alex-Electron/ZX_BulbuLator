@@ -101,15 +101,17 @@ assign vmmA1 = { vmmPage, va[12:7], !rfsh && addr01 ? a[6:0] : va[6:0] }; // fai
 
 ## Сборка из исходников
 
-В папке `sources/` есть весь набор файлов. Порядок действий (выполняй на хосте сборки, где установлен Vivado):
+Сначала загрузи исходники из корня репозитория, а потом собери:
 
 ```
-vivado -mode batch -source sources/build_bulbulator_ddr.tcl
+../../get_deps.sh        # Atlas + HDMI cores, pinned (once for the whole repo)
+./build.sh               # → sources/build/bulbulator_zx_ddr.bit  (faithful, ULA snow on)
+./build.sh nosnow        # → sources/build/bulbulator_zx_ddr_nosnow.bit
 ```
 
-В порядке: ядро hdl-util/HDMI + `hdmi_wrap.sv`; форк ядра Atlas ZX (T80 / JT49 / SAA + ядро на Verilog из `Alex-Electron/zx`); связующие модули EBAZ (`clock_zx`, `mem_zx`, `kbd_buttons`); управляющая плоскость Step-7 (`axi_ctl`, `inject_cdc`); цепочка фреймбуфера DDR (`fb_capture_rr`, `async_fifo`, `fb_wr_axi`, `fb_bufmgr3`, `fb_loader`, `fb_display`); и верхний модуль `bulbulator_zx_ddr_top.v`. Скрипт `get_rom.sh` загружает файл `rom128.hex` (ПЗУ Toastrack, см. шаг 6). Пути в верхней части файла `.tcl` указывают на макет хоста сборки — отредактируй их, чтобы они соответствовали твоему.
+На этом этапе однобуферный фреймбуфер BRAM заменяется тройным буфером DDR, поэтому в каталоге `sources/` хранится цепочка DDR (`fb_capture_rr`, `async_fifo`, `fb_wr_axi`, `fb_bufmgr3`, `fb_loader`, `fb_display`), измененные `axi_ctl`/`inject_cdc`, а также новые верхний уровень и ограничения — базовые связующие элементы (`clock_zx`, `mem_zx`, `kbd_buttons`, `hdmi_wrap`) берутся из шага 6. `sources/assemble.sh` собирает всё это в `sources/build/`, компилирует разветвлённые ядра Atlas + HDMI и получает файл `rom128.hex`; Vivado собирает проект там, используя только относительные пути (тебе не нужно ничего редактировать под свою машину).
 
-Путь к DDR-фреймбуферу сначала тестировался отдельно в папке `standalone-tests/`: фаза 1a (проверка чтения из DDR в HDMI), затем фаза 2a (полная цепочка «захват→FIFO→DDR→тройной буфер», управляемая синтетическим растром на реальном тактовом генераторе Spectrum). Тот же подход, что и в `m1-handshake-test` из шага 7.
+Путь к DDR-фреймбуферу сначала проверялся отдельно в `standalone-tests/`: фаза 1a (проверка чтения из DDR в HDMI), затем фаза 2a (полная цепочка захват→FIFO→DDR→тройной буфер, управляемая синтетическим растром на реальном тактовом сигнале Spectrum). Та же методика, что и в `m1-handshake-test` из шага 7.
 
 ## Запустить
 

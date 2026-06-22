@@ -46,14 +46,14 @@ crystal 33.333 MHz → PS (IO-PLL) → FCLK0 100 MHz
 
 ## Сборка
 
-Требуется Vivado 2023.1 и IP-блок **rgb2dvi** от Digilent (из `vivado-library`). Укажи в настройках сборки путь к твоему репозиторию, а затем запусти сборку:
+Требуется Vivado 2023.1 и IP-блок **rgb2dvi** от Digilent. Сначала загрузи все зависимости из корневого каталога репозитория, а затем запусти сборку:
 
 ```
-export VIVADO_LIBRARY=~/vivado-library
-vivado -mode batch -source build_stripes_z010.tcl
+../../get_deps.sh        # fetches rgb2dvi into deps/vivado-library, pinned (once for the whole repo)
+./build.sh               # → hdmi_stripes_z010.bit
 ```
 
-Целевой модуль `xc7z010clg400-1`, размер выходных данных ~2 083 867 байт. В комплект входит готовый файл `hdmi_stripes_z010.bit`.
+Скрипт `build.sh` указывает Vivado на загруженную папку `deps/vivado-library` и запускает сборку. Целевой чип `xc7z010clg400-1`, размер выходного файла — около 2 083 867 байт. В комплект входит готовый файл `hdmi_stripes_z010.bit`.
 
 ## Запись в ПЗУ
 

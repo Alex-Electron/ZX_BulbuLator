@@ -25,12 +25,14 @@ Languages: [English](README.md) · **Русский**
 
 Такая же схема блоков, что и в шаге 3 (здесь повторно используется `clkgen2.v`, MMCM `clk_wiz` и `rgb2dvi` от Digilent), с [`pattern_gen3.v`](pattern_gen3.v) в качестве источника шаблона и [`hdmi_btn720.xdc`](hdmi_btn720.xdc), добавляющим четыре вывода кнопок.
 
+Сначала загрузи все зависимости из корня репозитория, а потом запусти сборку:
+
 ```
-export VIVADO_LIBRARY=~/vivado-library
-vivado -mode batch -source build_720pl_z010.tcl
+../../get_deps.sh        # fetches rgb2dvi into deps/vivado-library, pinned (once for the whole repo)
+./build.sh               # → hdmi720_z010.bit
 ```
 
-Деталь `xc7z010clg400-1`, размер файла ~2 083 867 байт. В комплект входит готовый файл `hdmi720_z010.bit`.
+Компонент `xc7z010clg400-1`, размер выходных данных — ~2 083 867 байт. В комплект входит готовый файл `hdmi720_z010.bit`.
 
 ## Прошивка
 

@@ -69,14 +69,15 @@ the PL.
 
 ## Build
 
-Needs Vivado 2023.1 and Digilent's **rgb2dvi** IP (from `vivado-library`). Point
-the build at your checkout, then run it:
+Needs Vivado 2023.1 and Digilent's **rgb2dvi** IP. Fetch the dependencies once
+from the repo root, then build:
 
 ```
-export VIVADO_LIBRARY=~/vivado-library
-vivado -mode batch -source build_stripes_z010.tcl
+../../get_deps.sh        # fetches rgb2dvi into deps/vivado-library, pinned (once for the whole repo)
+./build.sh               # → hdmi_stripes_z010.bit
 ```
 
+`build.sh` points Vivado at the fetched `deps/vivado-library` and runs the build.
 Target part `xc7z010clg400-1`, output ~2,083,867 bytes. A prebuilt
 `hdmi_stripes_z010.bit` is included.
 

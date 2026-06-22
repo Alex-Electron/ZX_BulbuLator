@@ -37,9 +37,11 @@ Same block design as Step 3 (it reuses `clkgen2.v`, the `clk_wiz` MMCM, and
 Digilent's `rgb2dvi`), with [`pattern_gen3.v`](pattern_gen3.v) as the pattern
 source and [`hdmi_btn720.xdc`](hdmi_btn720.xdc) adding the four button pins.
 
+Fetch the dependencies once from the repo root, then build:
+
 ```
-export VIVADO_LIBRARY=~/vivado-library
-vivado -mode batch -source build_720pl_z010.tcl
+../../get_deps.sh        # fetches rgb2dvi into deps/vivado-library, pinned (once for the whole repo)
+./build.sh               # → hdmi720_z010.bit
 ```
 
 Part `xc7z010clg400-1`, output ~2,083,867 bytes. A prebuilt `hdmi720_z010.bit` is
