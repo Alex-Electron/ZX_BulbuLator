@@ -8,7 +8,7 @@ VLAB="${VIVADO_LAB:-/tools/Xilinx/Vivado_Lab/2023.1/bin/vivado_lab}"
 XSDB="${XSDB:-/tools/Xilinx/Vivado_Lab/2023.1/bin/xsdb}"
 HWS="${HW_SERVER:-$(dirname "$VLAB")/hw_server}"
 BG="${BOOTGEN:-/tools/Xilinx/Vivado/2023.1/bin/bootgen}"
-XVCD="${XVCD_PICO:-xvcd-pico}"
+XVCD="${XVCD_PICO:-$HOME/xvc-pico/daemon/xvcd-pico}"
 
 # PCAP image: generate <bit>.bin inline from the committed bitstream (never a stored file).
 ( cd "$HERE/flash" && "$BG" -arch zynq -image bulb_pcap.bif -w -process_bitstream bin )

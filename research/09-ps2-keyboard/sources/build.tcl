@@ -32,10 +32,10 @@ read_xdc bulbulator_ddr.xdc
 
 if {$NOSNOW} {
   synth_design -top bulbulator_zx_ddr_top -part xc7z010clg400-1 -verilog_define NO_SNOW
-  set BIT bulbulator_zx_ddr_nosnow.bit
+  set BIT bulbulator_zx_kbd_nosnow.bit
 } else {
   synth_design -top bulbulator_zx_ddr_top -part xc7z010clg400-1
-  set BIT bulbulator_zx_ddr.bit
+  set BIT bulbulator_zx_kbd.bit
 }
 puts ">>> ==== UTIL after synth (xc7z010: 17600 LUT, 35200 FF, 60 BRAM, 80 DSP) ===="
 foreach line [split [report_utilization -return_string] "\n"] {

@@ -6,7 +6,7 @@ VLAB="${VIVADO_LAB:-/tools/Xilinx/Vivado_Lab/2023.1/bin/vivado_lab}"
 XSDB="${XSDB:-/tools/Xilinx/Vivado_Lab/2023.1/bin/xsdb}"
 HWS="${HW_SERVER:-$(dirname "$VLAB")/hw_server}"
 BG="${BOOTGEN:-/tools/Xilinx/Vivado/2023.1/bin/bootgen}"
-XVCD="${XVCD_PICO:-xvcd-pico}"
+XVCD="${XVCD_PICO:-$HOME/xvc-pico/daemon/xvcd-pico}"
 echo ">>> bootgen .bit.bin ..."
 ( cd "$HERE/flash" && "$BG" -arch zynq -image bulb_ddr_pcap.bif -w -process_bitstream bin ) >/tmp/bg.log 2>&1 && echo "    OK $(ls -la $DIR/bulbulator_zx_ddr.bit.bin|awk "{print \$5}") bytes" || { echo bootgen FAIL; tail /tmp/bg.log; exit 1; }
 pkill -9 -x vivado_lab 2>/dev/null; sleep 1
