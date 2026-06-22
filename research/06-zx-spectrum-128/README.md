@@ -133,18 +133,17 @@ The honest part. None of these were in the plan.
 
 ## Build it yourself
 
-You need Vivado 2023.1 (full, for synthesis) and the part `xc7z010clg400-1`.
+You need the full Vivado 2023.1 (part `xc7z010clg400-1`). Fetch the shared cores
+once from the repo root, then build:
 
 ```bash
-cd sources/
-git clone -b ebaz4205-vivado https://github.com/Alex-Electron/zx        # the Atlas core, with the T80 fix
-git clone https://github.com/Alex-Electron/hdmi                         # the HDMI core (our fork of hdl-util/hdmi)
-bash get_rom.sh                                                         # downloads + builds rom128.hex
-vivado -mode batch -source build_bulbulator_zx.tcl                      # → bulbulator_zx_z010.bit
+../../get_deps.sh        # Atlas + HDMI cores, pinned to exact commits (once for the whole repo)
+./build.sh               # → sources/build/bulbulator_zx_z010.bit
 ```
 
-The layout the build expects (Atlas fork in `sources/zx/`, hdl-util in `sources/hdmi/`)
-is documented at the top of `build_bulbulator_zx.tcl`. A prebuilt
+`build.sh` runs `sources/assemble.sh`, which links in the fetched cores, fetches
+and converts the ROM (`get_rom.sh` → `rom128.hex`), and gathers this step's glue
+into `sources/build/`; Vivado then builds in there. A prebuilt
 **`bulbulator_zx_z010.bit`** is included if you just want to flash.
 
 ## Flash it — two ways

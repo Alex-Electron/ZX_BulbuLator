@@ -154,18 +154,19 @@ AXI path is sound and you can integrate with confidence.
 
 ## Build it yourself
 
-Vivado 2023.1 (full), part `xc7z010clg400-1`. Same shape as Step 6:
+Vivado 2023.1 (full), part `xc7z010clg400-1`. Same shape as Step 6 — fetch the
+cores once from the repo root, then build:
 
 ```bash
-cd sources/
-git clone -b ebaz4205-vivado https://github.com/Alex-Electron/zx   # Atlas core (+ the T80 fix)
-git clone https://github.com/Alex-Electron/hdmi                    # HDMI (fork of hdl-util/hdmi)
-bash get_rom.sh                                                    # rom128.hex (toastrack 128 ROM)
-vivado -mode batch -source build_bulbulator_zx.tcl                 # → bulbulator_zx_z010.bit
+../../get_deps.sh        # Atlas + HDMI cores, pinned (once for the whole repo)
+./build.sh               # → sources/build/bulbulator_zx_z010.bit
 ```
 
-The standalone Milestone-1 bitstream builds from `m1-handshake-test/build_axi_test.tcl` (no
-ROM, no Atlas core needed). Prebuilt `bulbulator_zx_z010.bit` and `flash/BOOT.BIN` are
+This step reuses Step 6's glue unchanged and adds only its delta (`axi_ctl.v`,
+`inject_cdc.v`, and the changed top + constraints); `sources/assemble.sh` pulls the
+shared files from Step 6 and gathers everything into `sources/build/`. The standalone
+Milestone-1 bitstream builds from `m1-handshake-test/build_axi_test.tcl` (no ROM, no
+Atlas core needed). Prebuilt `bulbulator_zx_z010.bit` and `flash/BOOT.BIN` are
 included if you just want to run it.
 
 ## Flash it

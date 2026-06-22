@@ -2,6 +2,18 @@
 .DS_Store
 ._*
 
+# Fetched dependencies (run ./get_deps.sh) and per-step assembled build trees.
+# These are reproducible from get_deps.sh + each step's assemble.sh, never committed.
+/cores/
+/deps/
+build/
+
+# Fetched ROM (run a step's get_rom.sh). The Spectrum ROM is redistributable for
+# emulation but we still fetch it rather than ship it in the repo.
+rom128.hex
+combined128.rom
+*.rom
+
 # Vivado / Vitis build artifacts.
 # This repo commits only sources and prebuilt bitstreams; the full projects are
 # built elsewhere, so the generated project tree never needs to land here.

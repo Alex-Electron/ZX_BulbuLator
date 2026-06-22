@@ -78,15 +78,35 @@ Boot-strap details and schematic from the
 
 ## 3. Install the software
 
-We use **Vivado / Vivado Lab Edition 2023.1**. Newer versions should work too —
-nothing here is version-specific.
+We build and flash with the **2023.1** AMD/Xilinx tools. Newer versions should
+work too — nothing here is version-specific. All of it is free with an
+AMD/Xilinx account.
 
-- To just **flash** a bitstream, the small free **Vivado Lab Edition** is enough
-  (it's only the Hardware Manager).
-- To **compile** a bitstream yourself (optional, step 6), you need the full free
-  **Vivado ML Standard**.
-- Download both from AMD/Xilinx (free account). The full install is large
-  (tens of GB); Lab Edition is much smaller.
+What each piece is for:
+
+- **Vivado Lab Edition** — the Hardware Manager on its own. This is all you need
+  to **flash** a prebuilt bitstream over JTAG. Small download.
+- **Vivado ML Standard** — the full tool, to **compile** a bitstream from source
+  (every step ships a `build.sh`). Large (tens of GB).
+- **Vitis** — bare-metal ARM. From Step 7 on, the Cortex-A9 does real work (the
+  AXI control plane, the SD-card loader, the OSD), and any SD-boot image needs an
+  FSBL. Vitis brings `xsct` and the `arm-none-eabi` compiler that build those.
+- **Antmicro [`mkbootimage`](https://github.com/antmicro/zynq-mkbootimage)** — to
+  assemble the `BOOT.BIN` SD-boot image (FSBL + bitstream + app). It sidesteps a
+  `bootgen` segfault seen with 2023.1 on recent glibc. Needed from Step 6's
+  SD-boot image onward; a small `make`.
+
+One more, the first time you build from source — fetch the shared HDL the steps
+sit on, from the repo root:
+
+```
+./get_deps.sh
+```
+
+It clones our two cores (the Atlas ZX core and the hdl-util HDMI core) and the
+Digilent `rgb2dvi` IP, each **pinned to an exact commit**, into the git-ignored
+`cores/` and `deps/`. You only run it once. (The Spectrum ROM is fetched
+separately, per step, by `get_rom.sh` — `assemble.sh` calls it for you.)
 
 ## 4. Connect the JTAG programmer
 
@@ -173,15 +193,28 @@ finds the `xc7z010`, and programs it. Override paths with the `XVCD_PICO` and
 
 ## 6. (Optional) Compile the bitstream yourself
 
-With the full Vivado (not Lab Edition):
+With the full Vivado on your `PATH`, every step builds with one command —
+`./build.sh`. The simplest steps have no external dependencies:
 
 ```
 cd ../01-board-bringup-blink
-vivado -mode batch -source build_blink_z010.tcl
+./build.sh                 # -> blink_z010.bit
 ```
 
-Target part is `xc7z010clg400-1`. You should get a `blink_z010.bit` of about
-2,083,856 bytes — that exact size is a handy check that the build hit the 7010.
+The HDMI steps (3, 4) and the ZX steps (6–9) first need the shared cores fetched
+once (Section 3):
+
+```
+./get_deps.sh              # from the repo root, one time
+cd research/06-zx-spectrum-128
+./build.sh                 # assembles sources/build/ from the cores + this step's delta, then builds
+```
+
+For the ZX steps `build.sh` runs `assemble.sh`, which gathers that step's sources
+into `sources/build/` (each step ships only what it changes and reuses the rest
+from earlier steps — its README spells out exactly what). Target part is
+`xc7z010clg400-1`. A full 7010 bitstream is about 2,083,856 bytes; the DDR steps
+(8, 9) are smaller, ~1.09 MB. That size is a handy check the build hit the 7010.
 
 ## Result
 

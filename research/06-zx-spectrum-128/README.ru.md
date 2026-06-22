@@ -121,17 +121,14 @@ flowchart LR
 
 ## Собери сам
 
-Тебе понадобится Vivado 2023.1 (полная версия, для синтеза) и микросхема `xc7z010clg400-1`.
+Тебе понадобится полная версия Vivado 2023.1 (компонент `xc7z010clg400-1`). Сначала загрузи общие ядра из корня репозитория, а затем запусти сборку:
 
 ```bash
-cd sources/
-git clone -b ebaz4205-vivado https://github.com/Alex-Electron/zx        # the Atlas core, with the T80 fix
-git clone https://github.com/Alex-Electron/hdmi                         # the HDMI core (our fork of hdl-util/hdmi)
-bash get_rom.sh                                                         # downloads + builds rom128.hex
-vivado -mode batch -source build_bulbulator_zx.tcl                      # → bulbulator_zx_z010.bit
+../../get_deps.sh        # Atlas + HDMI cores, pinned to exact commits (once for the whole repo)
+./build.sh               # → sources/build/bulbulator_zx_z010.bit
 ```
 
-Структура каталогов, которую ожидает сборка (форк Atlas в `sources/zx/`, hdl-util в `sources/hdmi/`), описана в начале файла `build_bulbulator_zx.tcl`. Если тебе просто нужно прошить устройство, в комплект входит готовый файл **`bulbulator_zx_z010.bit`**.
+Скрипт `build.sh` запускает `sources/assemble.sh`, который подключает загруженные ядра, скачивает и конвертирует ПЗУ (`get_rom.sh` → `rom128.hex`), а также собирает все компоненты этого этапа в папку `sources/build/`; затем Vivado выполняет сборку именно там. Если тебе просто нужно прошить, в комплекте есть готовый файл **`bulbulator_zx_z010.bit`**.
 
 ## Прошивка — два способа
 

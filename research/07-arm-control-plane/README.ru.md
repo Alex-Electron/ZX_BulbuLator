@@ -133,17 +133,14 @@ mrd 0x4000000C  (twice)            # COUNTER changes → the slave is clocked
 
 ## Собери сам
 
-Vivado 2023.1 (полная версия), компонент `xc7z010clg400-1`. Всё так же, как в шаге 6:
+Vivado 2023.1 (полная версия), компонент `xc7z010clg400-1`. Делай так же, как в шаге 6 — сначала загрузи ядра из корня репозитория, а потом собери:
 
 ```bash
-cd sources/
-git clone -b ebaz4205-vivado https://github.com/Alex-Electron/zx   # Atlas core (+ the T80 fix)
-git clone https://github.com/Alex-Electron/hdmi                    # HDMI (fork of hdl-util/hdmi)
-bash get_rom.sh                                                    # rom128.hex (toastrack 128 ROM)
-vivado -mode batch -source build_bulbulator_zx.tcl                 # → bulbulator_zx_z010.bit
+../../get_deps.sh        # Atlas + HDMI cores, pinned (once for the whole repo)
+./build.sh               # → sources/build/bulbulator_zx_z010.bit
 ```
 
-Автономный битстрим Milestone-1 собирается из файла `m1-handshake-test/build_axi_test.tcl` (не требуется ни ПЗУ, ни ядро Atlas). Если хочешь просто запустить программу, в комплекте уже есть готовые файлы `bulbulator_zx_z010.bit` и `flash/BOOT.BIN`.
+На этом этапе без изменений используется код из 6-го этапа, а добавляется только его дельта (`axi_ctl.v`, `inject_cdc.v` и измененные верхний уровень + ограничения); скрипт `sources/assemble.sh` извлекает общие файлы из 6-го этапа и собирает всё в папку `sources/build/`. Автономный битстрим Milestone-1 собирается из файла `m1-handshake-test/build_axi_test.tcl` (не требуется ни ПЗУ, ни ядро Atlas). Если ты просто хочешь запустить программу, в комплект входят готовые файлы `bulbulator_zx_z010.bit` и `flash/BOOT.BIN`.
 
 ## Запиши на SD-карту
 

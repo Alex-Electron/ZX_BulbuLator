@@ -141,18 +141,21 @@ keyboard is wired this becomes a runtime key toggle, so one bitstream does both.
 
 ## Build from source
 
-`sources/` has the whole set. The flow (run on the build host where Vivado lives):
+Fetch the cores once from the repo root, then build:
 
 ```
-vivado -mode batch -source sources/build_bulbulator_ddr.tcl
+../../get_deps.sh        # Atlas + HDMI cores, pinned (once for the whole repo)
+./build.sh               # → sources/build/bulbulator_zx_ddr.bit  (faithful, ULA snow on)
+./build.sh nosnow        # → sources/build/bulbulator_zx_ddr_nosnow.bit
 ```
 
-It reads, in order: the hdl-util/HDMI core + `hdmi_wrap.sv`; the forked Atlas ZX core (T80 / JT49
-/ SAA + the Verilog core, from `Alex-Electron/zx`); the EBAZ glue (`clock_zx`, `mem_zx`,
-`kbd_buttons`); the Step-7 control plane (`axi_ctl`, `inject_cdc`); the DDR-framebuffer chain
-(`fb_capture_rr`, `async_fifo`, `fb_wr_axi`, `fb_bufmgr3`, `fb_loader`, `fb_display`); and the
-top `bulbulator_zx_ddr_top.v`. `get_rom.sh` fetches `rom128.hex` (the toastrack ROM, see Step 6).
-The paths at the top of the `.tcl` point at the build host's layout — edit them to match yours.
+This step swaps the single-BRAM framebuffer for the DDR triple-buffer, so `sources/`
+holds the DDR chain (`fb_capture_rr`, `async_fifo`, `fb_wr_axi`, `fb_bufmgr3`,
+`fb_loader`, `fb_display`), the changed `axi_ctl`/`inject_cdc`, the new top and
+constraints — the base glue (`clock_zx`, `mem_zx`, `kbd_buttons`, `hdmi_wrap`) is
+pulled from Step 6. `sources/assemble.sh` gathers it all into `sources/build/`, links
+the forked Atlas + HDMI cores, and fetches `rom128.hex`; Vivado builds in there with
+relative paths only (nothing to edit for your machine).
 
 The DDR-framebuffer path was brought up in isolation first, in `standalone-tests/`: Phase 1a
 (prove DDR→HDMI read), then Phase 2a (the full capture→FIFO→DDR→triple-buffer chain driven by a
