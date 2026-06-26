@@ -45,10 +45,10 @@ The browser reads the card through ChaN's **FatFs** sitting on Xilinx's **`xsdps
 both bare-metal, no OS. That stack is worth a few words: it's the first time the project touches
 storage, and it came with sharp edges.
 
-**The stack.** `xsdps` drives the Zynq SD host controller (the EBAZ's microSD slot) and moves sectors
-with ADMA2 DMA. FatFs sits on top and turns those sectors into a FAT filesystem. The app mounts drive
-`0:` once at boot (`f_mount`) and then walks directories with `f_opendir` / `f_readdir`, and reads or
-writes the config file with `f_open` / `f_read` / `f_write` / `f_close`. Nothing fancier than that.
+`xsdps` drives the Zynq SD host controller (the EBAZ's microSD slot) and moves sectors with ADMA2 DMA;
+FatFs sits on top and turns those sectors into a FAT filesystem. The app mounts drive `0:` once at boot
+(`f_mount`), walks directories with `f_opendir` / `f_readdir`, and reads or writes the config file with
+`f_open` / `f_read` / `f_write` / `f_close`. Nothing fancier than that.
 
 **D-cache is off, on purpose — this is the nuance that cost the most.** `xsdps` reads run over ADMA2:
 the SD controller DMAs sectors straight into a RAM buffer, behind the CPU's back. With the ARM D-cache
