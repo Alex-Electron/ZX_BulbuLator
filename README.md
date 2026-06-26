@@ -41,6 +41,26 @@ of this board on the second-hand market. Everything here is built and tested
 against it. There are also boards with a custom-soldered `XC7Z020` (more logic,
 but pricier) — see [`docs/HARDWARE.md`](docs/HARDWARE.md) for details.
 
+| | EBAZ4205 |
+|---|---|
+| SoC | Xilinx Zynq-7000 `XC7Z010` (`clg400`, built for the -1 speed grade) |
+| Processor (PS) | dual-core ARM Cortex-A9, 666 MHz |
+| FPGA fabric (PL) | Artix-7 class — 28K logic cells, 17,600 LUTs, 35,200 flip-flops, 80 DSP slices |
+| Block RAM | 60 × 36 Kb = 2.1 Mb (~270 KB) on-chip |
+| DDR3 (on the PS) | 256 MB |
+| NAND flash | 128 MB |
+| Ethernet | 10/100, IP101GA PHY |
+| microSD | on-board slot — this project boots from it |
+| Clocks | 33.33 MHz PS reference, 25 MHz for the Ethernet PHY; the PL runs at a 100 MHz fabric clock here |
+| Power | 5–12 V |
+| Factory boot | NAND; we strap it to boot from SD instead |
+
+The memory layout is the interesting part on this board. The Spectrum's RAM lives
+in the on-chip Block RAM, which the current build fills (60/60), while the 256 MB
+DDR3 holds the triple-buffered framebuffer the ARM and the video path share. The
+7020 boards roughly triple the fabric (53,200 LUTs, 140 BRAM blocks, 220 DSP) —
+room for bigger machines, though the build still targets the 7010 everyone has.
+
 ## What it should do
 
 The cores: ZX Spectrum 48K, 128K, and Pentagon 128 with accurate INT timing
@@ -85,7 +105,9 @@ a normalised control-key map (reset / NMI, plus an Extended-mode key). [Step 10]
 gives the ARM an **on-screen display over the live picture** and a **keyboard gate** — press `F1` for a
 help menu while the Spectrum keeps running, `F12`/`Esc` to close. It's built machine-agnostic on purpose
 (a scancode FIFO the ARM drains, a `MACHINE_ID` register), the MiSTer split where the fabric is the
-machine and the ARM is the operator. Next is the SD game loader and a navigable OSD menu, then bigger machines.
+machine and the ARM is the operator. [Step 11](research/11-file-browser/) builds that OSD menu out into
+an SD file browser, an options menu that saves to the card, and an OSD panel you can move and fade. Next
+is the loader — actually injecting the game you pick — then bigger machines.
 
 ## Learning the board
 
@@ -163,10 +185,26 @@ So far:
   of a future NES or C64 core unchanged. A fabric deadman timer hands the keyboard back if the ARM
   ever stalls. This is the MiSTer division of labour: the fabric is the machine, the ARM is the operator.
 
+- **[Step 11 — A file browser and a settings menu](research/11-file-browser/).** The ARM gets the SD
+  card and somewhere to keep its settings. **F5** opens a file browser that reads the FAT card and walks
+  its folders (sort, a scrollbar, long names that scroll); **F9** opens an options menu whose changes
+  apply live and save to a `bulbulator.ini` on the card — the first time the project writes to the card
+  at all. The OSD panel learned to **move and fade** from that menu, and under the hood the framebuffer
+  moved off a BRAM copy to a per-line DDR reader, freeing about a dozen BRAM tiles for the colour panel
+  to come. The honest gaps: the browser navigates but doesn't yet load the file you pick (that's next),
+  and the ARM app now needs the SD stack (FatFs/xsdps), so it ships prebuilt while the clean-clone build
+  catches up.
+
 More steps get added as I get them working.
 
 ## Changelog
 
+- **2026-06-25 — Step 11: a file browser and a settings menu.** The ARM gets the SD card: **F5**
+  browses the FAT card (navigate, sort, scrollbar, long-name scroll), **F9** opens a data-driven options
+  menu that applies live and saves to `bulbulator.ini` — the project's first write to the card. The OSD
+  panel can now be moved and faded from that menu (new `OSD_POS` / `OSD_OP` registers, VERSION
+  `0xB01B0008`), and the framebuffer moved to a per-line DDR reader, freeing about a dozen BRAM tiles.
+  Verified on hardware on the Atlas `zx` core. The browser doesn't yet load the file you pick — next.
 - **2026-06-22 — Step 10: on-screen display + the keyboard gate.** The ARM draws a 1-bpp OSD over
   the live 720p picture without halting the Z80 (overlay, not halt), and a keyboard gate diverts the
   PS/2 keys to the ARM while the menu is open — `F1` opens a help / key-map page, `F12`/`Esc` close it.

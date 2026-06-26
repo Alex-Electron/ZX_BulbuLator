@@ -23,6 +23,41 @@ of `-part`.
 
 PetaLinux 2024.1 already boots on the board here.
 
+## Board resources
+
+The EBAZ4205 was a mining control board, so it is well equipped for the price:
+
+| | EBAZ4205 |
+|---|---|
+| SoC | Xilinx Zynq-7000 `XC7Z010` (`clg400`, -1 speed grade) |
+| Processor (PS) | dual-core ARM Cortex-A9, 666 MHz |
+| DDR3 (on the PS) | 256 MB |
+| NAND flash | 128 MB |
+| Ethernet | 10/100, IP101GA PHY (25 MHz crystal) |
+| microSD | on-board slot — the boot device for this project |
+| PS reference clock | 33.33 MHz; the design brings up a 100 MHz PL fabric clock (FCLK0) |
+| Power | 5–12 V |
+| Factory boot | NAND; strapped to SD here |
+| LEDs | two on-board (used for the bring-up blink) |
+
+The programmable logic is where the chip choice bites. The `XC7Z010` is a small
+part, and the dense ZX build already fills its Block RAM:
+
+| Programmable logic | `XC7Z010` (target) | `XC7Z020` (reworked board) |
+|---|---|---|
+| Logic cells | 28,000 | 85,000 |
+| LUTs | 17,600 | 53,200 |
+| Flip-flops | 35,200 | 106,400 |
+| Block RAM | 60 × 36 Kb (2.1 Mb) | 140 × 36 Kb (4.9 Mb) |
+| DSP slices | 80 | 220 |
+
+The Spectrum's RAM sits in that Block RAM (60/60 used on the current build), which
+is why moving the RAM off an external SDRAM controller and into on-chip BRAM
+matters so much here. The 256 MB DDR3 carries the triple-buffered framebuffer over
+AXI instead. The 7020 boards roughly triple every fabric number,
+which is the headroom a 16-bit machine would need — but the package and pinout are
+identical, so a 7020 build is only a change of `-part`.
+
 ## Expansion shield
 
 There is a custom HDMI / audio shield, built and working. It puts out a clean
