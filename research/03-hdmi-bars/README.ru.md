@@ -55,7 +55,7 @@ crystal 33.333 MHz → PS (IO-PLL) → FCLK0 100 MHz
 
 Скрипт `build.sh` указывает Vivado на загруженную папку `deps/vivado-library` и запускает сборку. Целевой чип `xc7z010clg400-1`, размер выходного файла — около 2 083 867 байт. В комплект входит готовый файл `hdmi_stripes_z010.bit`.
 
-## Запись в ПЗУ
+## Прошивка
 
 ```
 bash flash_stripes.sh hdmi_stripes_z010.bit
