@@ -22,7 +22,7 @@ HERE=$(cd "$(dirname "$0")" && pwd)             # research/12-snapshot-loader/so
 REPO=$(cd "$HERE/../../.." && pwd)              # repo root
 S6="$REPO/research/06-zx-spectrum-128/sources"  # base glue
 S8="$REPO/research/08-ddr-framebuffer/sources"  # async FIFO + triple-buffer manager
-S11="$REPO/research/11-file-browser/sources"    # per-line display + OSD compositor + build.tcl
+S11="$REPO/research/11-file-browser/sources"    # per-line display + OSD compositor (build.tcl is local to Step 12)
 B="$HERE/build"
 
 [ -d "$REPO/cores/zx" ] && [ -d "$REPO/cores/hdmi" ] || {

@@ -715,13 +715,13 @@ harmless.
 
 | Word | AXI off | Packing (bit fields within the 32-bit write) |
 |---|---|---|
-| DIR0 | 0x20 | `A | F<<8 | A'<<16 | F'<<24` |
-| DIR1 | 0x24 | `I | R<<8 | SP<<16` |
-| DIR2 | 0x28 | `PC | BC<<16` |
-| DIR3 | 0x2C | `DE | HL<<16` |
-| DIR4 | 0x30 | `IX | BC'<<16` |
-| DIR5 | 0x34 | `DE' | HL'<<16` |
-| DIR6 | 0x38 | `IY | IM<<16 | IFF1<<18 | IFF2<<19` (only low ~20 bits used) |
+| DIR0 | 0x20 | `A \| F<<8 \| A'<<16 \| F'<<24` |
+| DIR1 | 0x24 | `I \| R<<8 \| SP<<16` |
+| DIR2 | 0x28 | `PC \| BC<<16` |
+| DIR3 | 0x2C | `DE \| HL<<16` |
+| DIR4 | 0x30 | `IX \| BC'<<16` |
+| DIR5 | 0x34 | `DE' \| HL'<<16` |
+| DIR6 | 0x38 | `IY \| IM<<16 \| IFF1<<18 \| IFF2<<19` (only low ~20 bits used) |
 
 So the DIR6 layout is: bits 0–15 = IY, bits 16–17 = IM, bit 18 = IFF1, bit
 19 = IFF2.
