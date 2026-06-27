@@ -106,8 +106,11 @@ gives the ARM an **on-screen display over the live picture** and a **keyboard ga
 help menu while the Spectrum keeps running, `F12`/`Esc` to close. It's built machine-agnostic on purpose
 (a scancode FIFO the ARM drains, a `MACHINE_ID` register), the MiSTer split where the fabric is the
 machine and the ARM is the operator. [Step 11](research/11-file-browser/) builds that OSD menu out into
-an SD file browser, an options menu that saves to the card, and an OSD panel you can move and fade. Next
-is the loader — actually injecting the game you pick — then bigger machines.
+an SD file browser, an options menu that saves to the card, and an OSD panel you can move and fade.
+[Step 12](research/12-snapshot-loader/) closes that loop: pick a `.z80` or `.sna` and the ARM cold-resets
+the machine, streams the RAM in over the AXI back door, injects the whole Z80 register set, and lets the
+core run from the snapshot's PC — the browser is now a real loader. Next: bigger machines and a
+flag-/timing-exact 48K core for the test suites.
 
 ## Learning the board
 
@@ -175,7 +178,7 @@ So far:
   (wipes RAM), `Ctrl+Alt+Del` = soft reset, `Ctrl+Alt+Ins` = NMI, plus Alt as a one-key Extended-mode shortcut.
   The lesson worth keeping: a
   reset must not reset the DDR video pipeline — an AXI-HP master reset mid-burst hangs and freezes
-  the picture. The on-screen menu landed in Step 10; the SD game loader is next.
+  the picture. The on-screen menu landed in Step 10, the file browser in Step 11, and the SD snapshot loader in Step 12.
 - **[Step 10 — On-screen display + the keyboard gate](research/10-osd-keyboard-gate/).** The ARM
   finally has a voice: it draws a 1-bpp OSD panel over the live picture — a combinational mux on the
   pixel path, so the Z80 never stops — and takes the keyboard the moment the menu opens (`F1` for
@@ -191,31 +194,53 @@ So far:
   apply live and save to a `bulbulator.ini` on the card — the first time the project writes to the card
   at all. The OSD panel learned to **move and fade** from that menu, and under the hood the framebuffer
   moved off a BRAM copy to a per-line DDR reader, freeing about a dozen BRAM tiles for the colour panel
-  to come. The honest gaps: the browser navigates but doesn't yet load the file you pick (that's next),
+  to come. The honest gaps: the browser navigates but didn't yet load the file you pick (Step 12 closes that),
   and the ARM app now needs the SD stack (FatFs/xsdps), so it ships prebuilt while the clean-clone build
   catches up.
+
+- **[Step 12 — Loading a snapshot](research/12-snapshot-loader/).** The browser becomes a loader. Press
+  **Enter** on a `.z80` or `.sna` and the ARM parses it, cold-resets and wipes the machine, streams the
+  RAM image into the core's memory over the Step-7 AXI back door, injects the whole Z80 register file into
+  the T80 in one shot (a 212-bit DIRSet vector), and releases it to run from the snapshot's PC. Two things
+  made it more than "write the bytes and go": every load resets+wipes first — through the same FSM as the
+  F11 hard reset — so nothing leaks from the last program (no stale pages, no carried-over AY squeal), and
+  the SD path is hardened to never trust the card, since the EBAZ has no card-detect line (one strike and
+  it drops the volume, an **EJECT** in F9, trimmed `xsdps` timeouts). It handles `.z80` v1/v2/v3 and
+  `.sna`, 48K and 128K; the format and loader detail is its own document,
+  [`docs/LOADER_SPEC.md`](docs/LOADER_SPEC.md). The honest gaps: AY/TurboSound state isn't restored yet,
+  only the standard 48K/128K bank maps, and the ARM app still ships prebuilt while the SD stack gets
+  vendored. (`VERSION 0xB01B0009`.)
 
 More steps get added as I get them working.
 
 ## Changelog
 
+- **2026-06-27 — Step 12: loading a snapshot.** The file browser becomes a loader: press **Enter** on a
+  `.z80` or `.sna` and the ARM parses it, cold-resets and wipes the machine, streams the RAM in over the
+  Step-7 AXI back door, injects the whole Z80 register file into the T80 in one shot (a 212-bit DIRSet
+  vector), and runs from the snapshot's PC. Every load resets+wipes first — the same FSM as the F11 hard
+  reset, on a new `CONTROL` bit 2 / `STATUS` bit 2 — so nothing leaks from the last program, and the SD
+  path is hardened for a board with no card-detect (one-strike unmount, an **EJECT** in F9, trimmed
+  `xsdps` timeouts). Handles `.z80` v1/v2/v3 and `.sna`, 48K and 128K; format reference in
+  [`docs/LOADER_SPEC.md`](docs/LOADER_SPEC.md). Verified on hardware on the Atlas `zx` core (control-plane
+  VERSION `0xB01B0009`). Not yet: AY state restore, non-standard bank maps, cycle-exact resume.
 - **2026-06-25 — Step 11: a file browser and a settings menu.** The ARM gets the SD card: **F5**
   browses the FAT card (navigate, sort, scrollbar, long-name scroll), **F9** opens a data-driven options
   menu that applies live and saves to `bulbulator.ini` — the project's first write to the card. The OSD
   panel can now be moved and faded from that menu (new `OSD_POS` / `OSD_OP` registers, VERSION
   `0xB01B0008`), and the framebuffer moved to a per-line DDR reader, freeing about a dozen BRAM tiles.
-  Verified on hardware on the Atlas `zx` core. The browser doesn't yet load the file you pick — next.
+  Verified on hardware on the Atlas `zx` core. The browser doesn't yet load the file you pick — that's Step 12.
 - **2026-06-22 — Step 10: on-screen display + the keyboard gate.** The ARM draws a 1-bpp OSD over
   the live 720p picture without halting the Z80 (overlay, not halt), and a keyboard gate diverts the
   PS/2 keys to the ARM while the menu is open — `F1` opens a help / key-map page, `F12`/`Esc` close it.
   Built machine-agnostic on purpose: an always-tap scancode FIFO, the OSD compositor and a
   `MACHINE_ID` register, so the same control plane fits a future NES/C64 core; a fabric deadman frees
   the keyboard if the ARM stalls. Verified on hardware (control-plane VERSION `0xB01B0006`). Next: the
-  SD game loader and a navigable OSD menu.
+  navigable OSD file browser (Step 11) and the SD snapshot loader (Step 12).
 - **2026-06-18 — Step 9: a real PS/2 keyboard.** A PS/2 keyboard on two pins, muxed with the four
   buttons (the Atlas core already shipped `ps2.v` + `keyboard.v`); a normalised key map — `F11`
   hard/cold reset with a RAM wipe, `Ctrl+Alt+Del` soft, `Ctrl+Alt+Ins` NMI, plus Alt for the Spectrum's Extended mode — and an SD-bootable
-  image. The OSD menu and SD game loader are the next chapter.
+  image. The OSD menu (Step 10), file browser (Step 11) and SD snapshot loader (Step 12) are the next chapters.
 - **2026-06-17 — Step 8: tear-free DDR framebuffer.** The ZX frame is triple-buffered in PS DDR
   over AXI-HP and swapped only on the HDMI vblank — no more tear seam on border demos or
   shadow-screen flips. Verified with the `ula128` timing test and the *Mescaline* / `esh2`
