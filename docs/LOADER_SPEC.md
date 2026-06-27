@@ -1,5 +1,7 @@
 # Snapshot file formats (.z80 / .sna) and how BulbuLator loads them
 
+Languages: **English** · [Русский](LOADER_SPEC.ru.md)
+
 This document is the complete reference for the two ZX Spectrum snapshot
 formats that BulbuLator can load — `.z80` and `.sna` — and for exactly what
 the BulbuLator firmware does with them. It is written to stand on its own: you
