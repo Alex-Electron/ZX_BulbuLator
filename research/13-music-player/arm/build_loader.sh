@@ -11,23 +11,35 @@ source /tools/XilinxVitis/Vitis/2023.1/settings64.sh 2>/dev/null || true
 WS="${WS:-/home/lavrinovich/sdboot/ws}"
 BSP=$WS/ebaz/ps7_cortexa9_0/standalone_domain/bsp/ps7_cortexa9_0
 XF=$BSP/libsrc/xilffs_v5_0/src
-SRC="${SRC:-$(cd "$(dirname "$0")" && pwd)/loader_main.c}"
+ARMD="$(cd "$(dirname "$0")" && pwd)"
+SRC="${SRC:-$ARMD/loader_main.c}"
+TP="$ARMD/../../../third_party"
 APPDIR="${APPDIR:-$WS/loader}"
 
 cp -f "$SRC" "$APPDIR/src/main.c"
+cp -f "$ARMD/player.c" "$APPDIR/src/player.c"          # universal music player (Step 13.2)
+cp -f "$TP/ayumi/ayumi.c" "$TP/ayumi/ayumi.h" "$APPDIR/src/"   # AYUMI soft-AY (MIT)
+cp -f "$ARMD/lscript.ld" "$APPDIR/src/lscript.ld"      # vendored linker script: reserves the top-of-DDR
+                                                       # non-cacheable window (D-cache foundation, Step 13)
 cd "$APPDIR/Debug"
 
 echo "=== compile ==="
 arm-none-eabi-gcc -Wall -O0 -g3 -c -fmessage-length=0 \
   -mcpu=cortex-a9 -mfpu=vfpv3 -mfloat-abi=hard \
   -I"$BSP/include" -o src/main.o ../src/main.c
+arm-none-eabi-gcc -Wall -O2 -g3 -c -fmessage-length=0 \
+  -mcpu=cortex-a9 -mfpu=vfpv3 -mfloat-abi=hard \
+  -I"$BSP/include" -I../src -o src/player.o ../src/player.c
+arm-none-eabi-gcc -O2 -c -fmessage-length=0 \
+  -mcpu=cortex-a9 -mfpu=vfpv3 -mfloat-abi=hard \
+  -o src/ayumi.o ../src/ayumi.c
 
-echo "=== link (main.o + xilffs objs + libxil.a[xsdps]) ==="
+echo "=== link (main.o + player + ayumi + xilffs objs + libxil.a[xsdps]) ==="
 arm-none-eabi-gcc -mcpu=cortex-a9 -mfpu=vfpv3 -mfloat-abi=hard \
   -Wl,-build-id=none -specs=Xilinx.spec -Wl,-T -Wl,../src/lscript.ld \
   -L"$BSP/lib" -o loader.elf \
-  src/main.o "$XF/ff.o" "$XF/ffunicode.o" "$XF/ffsystem.o" "$XF/diskio.o" \
-  -Wl,--start-group,-lxil,-lgcc,-lc,--end-group
+  src/main.o src/player.o src/ayumi.o "$XF/ff.o" "$XF/ffunicode.o" "$XF/ffsystem.o" "$XF/diskio.o" \
+  -Wl,--start-group,-lxil,-lgcc,-lc,-lm,--end-group
 
 ls -la loader.elf
 echo "BUILD_OK - copy loader.elf into the repo: cp loader.elf <repo>/research/12-snapshot-loader/arm/loader.elf"

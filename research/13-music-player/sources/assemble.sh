@@ -17,7 +17,7 @@
 # Prerequisite: run ../../../get_deps.sh once (fetches cores/ and deps/).
 set -eu
 
-HERE=$(cd "$(dirname "$0")" && pwd)             # research/13-full-pause/sources
+HERE=$(cd "$(dirname "$0")" && pwd)             # research/13-music-player/sources
 REPO=$(cd "$HERE/../../.." && pwd)              # repo root
 S6="$REPO/research/06-zx-spectrum-128/sources"  # base glue
 S8="$REPO/research/08-ddr-framebuffer/sources"  # async FIFO + triple-buffer manager

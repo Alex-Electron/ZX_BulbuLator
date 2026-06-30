@@ -35,7 +35,7 @@
 // the top (async_fifo, spclk write / aclk read).
 //-------------------------------------------------------------------------------------------------
 module axi_ctl #(
-    parameter [31:0] VERSION    = 32'hB01B000A,
+    parameter [31:0] VERSION    = 32'hB01B0013,
     parameter [31:0] MACHINE_ID = 32'h00805A58   // 'ZX' (0x5A58) + variant 0x80 (128K)
 )(
     input  wire        aclk,
@@ -87,7 +87,19 @@ module axi_ctl #(
     output reg  [23:0] ctl_osd_bg,        // user-chosen OSD panel background colour (0x68)
     output reg  [7:0]  ctl_osd_op,        // OSD panel opacity alpha 0..255 (0x6C)
     output reg  [31:0] ctl_osd_pos,       // OSD panel position {Y0[26:16],X0[10:0]} (0x70)
+    // ---- independent BANNER overlay write port (aclk) ----
+    output reg         ctl_ban_enable,
+    output reg         ctl_ban_we,        // 1-aclk pulse
+    output reg  [8:0]  ctl_ban_waddr,     // banner buffer word address (512 words; 256x64/32)
+    output reg  [31:0] ctl_ban_wdata,
+    output reg  [31:0] ctl_ban_pos,       // banner position {Y0[26:16],X0[10:0]} (0x90)
     output reg  [7:0]  ctl_vol,           // HDMI volume gain 0..255 (PCM sample * vol / 256); 0x74
+    output reg         ctl_player_en,     // 0x78 bit0: ARM audio player active (mux player PCM -> HDMI)
+    output reg         ctl_audio_we,      // 1-aclk pulse: push ctl_audio_data into the audio FIFO (0x7C)
+    output reg  [31:0] ctl_audio_data,    // {R[31:16], L[15:0]} signed-16 stereo sample
+    input  wire        aud_full,          // audio FIFO status (read at 0x80)
+    input  wire        aud_empty,
+    input  wire [7:0]  aud_rdcount,
     // ---- keyboard scancode FIFO (control-plane tap; machine-agnostic) ----
     input  wire [8:0]  kbd_fifo_dout,     // {make, code[7:0]} FWFT head
     input  wire        kbd_fifo_empty,
@@ -112,11 +124,19 @@ module axi_ctl #(
                IDX_OSDBG   = 6'h1A,                                          // 0x68 (OSD bg colour RGB)
                IDX_OSDOP   = 6'h1B,                                          // 0x6C (OSD opacity alpha)
                IDX_OSDPOS  = 6'h1C,                                          // 0x70 (OSD panel X0/Y0)
-               IDX_VOL     = 6'h1D;                                          // 0x74 (HDMI volume gain 0..255)
+               IDX_VOL     = 6'h1D,                                          // 0x74 (HDMI volume gain 0..255)
+               IDX_ACTL    = 6'h1E,                                          // 0x78 AUDIO_CTRL (bit0 player_en)
+               IDX_AFIFO   = 6'h1F,                                          // 0x7C AUDIO_FIFO (W: push {R,L})
+               IDX_ASTAT   = 6'h20,                                          // 0x80 AUDIO_STAT (R: full/empty/count)
+               IDX_BANCTRL = 6'h21,                                          // 0x84 BANNER_CTRL (bit0 BANNER_ENABLE)
+               IDX_BANADDR = 6'h22,                                          // 0x88 BANNER_ADDR (9-bit word ptr, auto-inc)
+               IDX_BANDATA = 6'h23,                                          // 0x8C BANNER_DATA (W: 32 packed px)
+               IDX_BANPOS  = 6'h24;                                          // 0x90 BANNER_POS ({Y0[26:16],X0[10:0]})
 
     reg [31:0] counter;
     reg [31:0] reg_scratch;
     reg [9:0]  osd_ptr;                 // running OSD-buffer word pointer (auto-inc, 1024 words)
+    reg [8:0]  ban_ptr;                 // running banner-buffer word pointer (auto-inc, 512 words)
     always @(posedge aclk) counter <= aresetn ? counter + 32'd1 : 32'd0;
 
     //---------------------------------------------------------------------------------------------
@@ -133,6 +153,8 @@ module axi_ctl #(
         ctl_port_commit  <= 1'b0;
         ctl_reset        <= 1'b0;
         ctl_osd_we       <= 1'b0;
+        ctl_ban_we       <= 1'b0;
+        ctl_audio_we     <= 1'b0;
         kbd_deadman_kick <= 1'b0;
         if (!aresetn) begin
             wstate <= W_IDLE; s_awready <= 1'b0; s_wready <= 1'b0; s_bvalid <= 1'b0;
@@ -143,7 +165,10 @@ module axi_ctl #(
             ctl_osd_bg <= 24'h101840;   // default panel bg: dark blue (readable with cream ink)
             ctl_osd_op <= 8'd204;       // default opacity alpha ~80% (more dim/opaque)
             ctl_osd_pos <= 32'h00B00200;// default {Y0=176, X0=512}: upper-third centre
+            ctl_ban_enable <= 1'b0; ban_ptr <= 9'd0; ctl_ban_waddr <= 9'd0; ctl_ban_wdata <= 32'd0;
+            ctl_ban_pos <= 32'h02800200;// default {Y0=640, X0=512}: bottom-centre strip, clear of the OSD
             ctl_vol <= 8'd255;          // default full volume (unity gain)
+            ctl_player_en <= 1'b0; ctl_audio_data <= 32'd0;
             kbd_deadman_kick <= 1'b0;
         end else begin
             case (wstate)
@@ -183,12 +208,23 @@ module axi_ctl #(
                         IDX_OSDOP:   ctl_osd_op     <= s_wdata[7:0];
                         IDX_OSDPOS:  ctl_osd_pos    <= s_wdata;
                         IDX_VOL:     ctl_vol        <= s_wdata[7:0];
+                        IDX_ACTL:    ctl_player_en  <= s_wdata[0];
+                        IDX_AFIFO:   begin ctl_audio_data <= s_wdata; ctl_audio_we <= 1'b1; end
                         IDX_OSDADDR: osd_ptr        <= s_wdata[9:0];
                         IDX_OSDDATA: begin
                             ctl_osd_wdata <= s_wdata;
                             ctl_osd_we    <= 1'b1;
                             ctl_osd_waddr <= osd_ptr;
                             osd_ptr       <= osd_ptr + 10'd1;
+                        end
+                        IDX_BANCTRL: ctl_ban_enable <= s_wdata[0];
+                        IDX_BANPOS:  ctl_ban_pos    <= s_wdata;
+                        IDX_BANADDR: ban_ptr        <= s_wdata[8:0];
+                        IDX_BANDATA: begin
+                            ctl_ban_wdata <= s_wdata;
+                            ctl_ban_we    <= 1'b1;
+                            ctl_ban_waddr <= ban_ptr;
+                            ban_ptr       <= ban_ptr + 9'd1;
                         end
                         IDX_KBDHB: kbd_deadman_kick <= 1'b1;   // heartbeat: keep the gate open
                         default: ;
@@ -239,7 +275,11 @@ module axi_ctl #(
                     IDX_OSDBG:   s_rdata <= {8'd0, ctl_osd_bg};
                     IDX_OSDOP:   s_rdata <= {24'd0, ctl_osd_op};
                     IDX_OSDPOS:  s_rdata <= ctl_osd_pos;
+                    IDX_BANCTRL: s_rdata <= {31'd0, ctl_ban_enable};
+                    IDX_BANPOS:  s_rdata <= ctl_ban_pos;
+                    IDX_BANADDR: s_rdata <= {23'd0, ban_ptr};
                     IDX_VOL:     s_rdata <= {24'd0, ctl_vol};
+                    IDX_ASTAT:   s_rdata <= {22'd0, aud_rdcount, aud_full, aud_empty};
                     IDX_OSDADDR: s_rdata <= {22'd0, osd_ptr};
                     IDX_KBDDATA: s_rdata <= {22'd0, kbd_fifo_dout[8], kbd_fifo_empty, kbd_fifo_dout[7:0]};
                     IDX_KBDSTAT: s_rdata <= {31'd0, kbd_fifo_empty};

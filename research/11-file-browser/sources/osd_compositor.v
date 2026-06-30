@@ -80,3 +80,60 @@ module osd_compositor #(
     assign rgb_out = (osd_en && in_win) ? (pix ? INK : rgb_bg) : rgb_in;
 endmodule
 //-------------------------------------------------------------------------------------------------
+// banner_compositor.v  -  INDEPENDENT status BANNER overlay, composited OVER the OSD output. Own
+// enable (BANNER_ENABLE) + position (BANNER_POS) - visible whether or not osd_enable is set.
+// 256x64 1bpp in distributed LUTRAM (512 words). Mirrors the proven osd_compositor CDC + blend.
+// Shows: PAUSE marker / playing track / app name + full SD path. ARM fills the buffer over AXI.
+//-------------------------------------------------------------------------------------------------
+module banner_compositor #(
+    parameter [23:0] INK = 24'hFFFFFF,        // white status text
+    parameter [23:0] BG  = 24'h202020,        // dark grey strip
+    parameter [7:0]  OP  = 8'd200             // ~78% opaque
+)(
+    input  wire        clk_pixel,
+    input  wire        aclk,
+    input  wire        ban_enable_a,
+    input  wire        ban_we,
+    input  wire [8:0]  ban_waddr,
+    input  wire [31:0] ban_wdata,
+    input  wire [31:0] ban_pos_a,
+    input  wire [10:0] cx,
+    input  wire [10:0] cy,
+    input  wire [23:0] rgb_in,
+    output wire [23:0] rgb_out
+);
+    localparam [10:0] W = 11'd256, H = 11'd64;
+
+    (* ram_style = "distributed" *) reg [31:0] ban_buf [0:511];
+    always @(posedge aclk) if (ban_we) ban_buf[ban_waddr] <= ban_wdata;
+
+    reg [1:0] en_s = 2'b00;
+    always @(posedge clk_pixel) en_s <= {en_s[0], ban_enable_a};
+    wire ban_en = en_s[1];
+
+    reg [31:0] pos_s1 = 32'h02800200, pos_s2 = 32'h02800200, pos_s3 = 32'h02800200, pos_q = 32'h02800200;
+    always @(posedge clk_pixel) begin
+        pos_s1<=ban_pos_a; pos_s2<=pos_s1; pos_s3<=pos_s2;
+        if (pos_s2==pos_s3) pos_q<=pos_s2;
+    end
+    wire [10:0] x0r = pos_q[10:0], y0r = pos_q[26:16];
+    wire [10:0] x0 = (x0r > 11'd1024) ? 11'd1024 : x0r;
+    wire [10:0] y0 = (y0r > 11'd656 ) ? 11'd656  : y0r;   // 720-64
+
+    wire        in_win = (cx >= x0) && (cx < x0 + W) && (cy >= y0) && (cy < y0 + H);
+    wire [10:0] rxv = cx - x0;
+    wire [10:0] ryv = cy - y0;
+    wire [8:0]  word_idx = {ryv[5:0], rxv[7:5]};
+    wire [4:0]  bit_idx  = rxv[4:0];
+    wire        pix = ban_buf[word_idx][bit_idx];
+
+    wire [7:0]  br = BG[23:16], bgc = BG[15:8], bb = BG[7:0];
+    wire [7:0]  dr = rgb_in[23:16], dg = rgb_in[15:8], db = rgb_in[7:0];
+    wire [7:0]  ia = 8'd255 - OP;
+    wire [15:0] mr = br*OP + dr*ia;
+    wire [15:0] mg = bgc*OP + dg*ia;
+    wire [15:0] mb = bb*OP + db*ia;
+    wire [23:0] rgb_bg = { mr[15:8], mg[15:8], mb[15:8] };
+    assign rgb_out = (ban_en && in_win) ? (pix ? INK : rgb_bg) : rgb_in;
+endmodule
+//-------------------------------------------------------------------------------------------------

@@ -2,15 +2,18 @@
 # Self-contained browser.elf build for BulbuLator Step 11 (file browser + options/config).
 # Compiles browser_main.c against the standalone BSP and links the xilffs (FatFs) objects directly,
 # bypassing the broken platform-generate/FSBL (xilffs objects exist but aren't archived into libxil.a).
+# All paths overridable via env.
 set -e
 source /tools/XilinxVitis/Vitis/2023.1/settings64.sh 2>/dev/null || true
-WS=/home/lavrinovich/sdboot/ws
+WS="${WS:-/home/lavrinovich/sdboot/ws}"
 BSP=$WS/ebaz/ps7_cortexa9_0/standalone_domain/bsp/ps7_cortexa9_0
 XF=$BSP/libsrc/xilffs_v5_0/src
-SRC=/home/lavrinovich/sdboot/browser_main.c
+ARMD="$(cd "$(dirname "$0")" && pwd)"
+SRC="${SRC:-$ARMD/browser_main.c}"
+APPDIR="${APPDIR:-$WS/browser}"
 
-cp -f "$SRC" "$WS/browser/src/main.c"
-cd "$WS/browser/Debug"
+cp -f "$SRC" "$APPDIR/src/main.c"
+cd "$APPDIR/Debug"
 
 echo "=== compile ==="
 arm-none-eabi-gcc -Wall -O0 -g3 -c -fmessage-length=0 \
@@ -24,6 +27,5 @@ arm-none-eabi-gcc -mcpu=cortex-a9 -mfpu=vfpv3 -mfloat-abi=hard \
   src/main.o "$XF/ff.o" "$XF/ffunicode.o" "$XF/ffsystem.o" "$XF/diskio.o" \
   -Wl,--start-group,-lxil,-lgcc,-lc,--end-group
 
-cp -f browser.elf /home/lavrinovich/sdboot/browser.elf
-ls -la /home/lavrinovich/sdboot/browser.elf
-echo BUILD_OK
+ls -la browser.elf
+echo "BUILD_OK - copy browser.elf into the repo: cp browser.elf <repo>/research/11-file-browser/arm/browser.elf"
