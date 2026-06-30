@@ -210,10 +210,16 @@ So far:
   [`docs/LOADER_SPEC.md`](docs/LOADER_SPEC.md). The honest gaps: AY/TurboSound state isn't restored yet,
   only the standard 48K/128K bank maps, and the ARM app still ships prebuilt while the SD stack gets
   vendored. (`VERSION 0xB01B0009`.)
+- **[Step 13 — Player: Universal ARM music synthesis over HDMI](research/13-music-player/).** A machine-agnostic 
+  retro music player built into the ARM control plane. Press **Enter** on a `.psg` file in the F5 browser to play
+  it over HDMI, while the ZX Spectrum core runs in the background. Uses the AYUMI soft-synth library. Requires D-Cache 
+  (enabled via a custom `lscript.ld` for the Cortex-A9) for real-time 47996 Hz playback without audio underruns. 
+  Audio is pushed via AXI to a new hardware FIFO in the PL, replacing the fabric audio when active.
 
 More steps get added as I get them working.
 
 ## Changelog
+- **2026-06-30 — Step 13: Universal ARM music player.** A machine-agnostic music player built into the ARM control plane. Press **Enter** on a `.psg` file in the F5 browser to play it over HDMI, while the ZX Spectrum core runs in the background. Uses the AYUMI soft-synth library. Requires D-Cache (enabled via custom `lscript.ld` for the Cortex-A9) for real-time 47996 Hz playback without audio underruns. Audio is pushed via AXI to a new hardware FIFO in the PL, replacing the fabric audio when active. (control-plane VERSION `0xB01B000B`).
 
 - **2026-06-27 — Step 12: loading a snapshot.** The file browser becomes a loader: press **Enter** on a
   `.z80` or `.sna` and the ARM parses it, cold-resets and wipes the machine, streams the RAM in over the
