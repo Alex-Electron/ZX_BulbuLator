@@ -158,16 +158,33 @@ module bulbulator_zx_ddr_top
         .strb(ps2_strb), .make(ps2_make), .code(ps2_code)
     );
 
-    // Held state of the hotkey keys (make=0 => pressed, mirror of keyboard.v's convention).
+    // Pause key = E1 14 77 (make) / E1 F0 14 F0 77 (break) is ARM-owned (intercepted from the always-
+    // tap FIFO). Suppress its whole byte run from the Z80 matrix AND the hotkey latches, so a resume
+    // can never leak Symbol-Shift (0x14) into the core or stick a reset-combo flag. Anchor on 0xE1
+    // (no other set-2 key emits it); eat up to 4 following bytes (covers make 14 77 + break F0 14 F0 77).
+    reg [2:0] pse = 3'd0;
+    always @(posedge spclk) if (pe3M5 && ps2_strb) begin
+        if (ps2_code == 8'hE1) pse <= 3'd4;
+        else if (pse != 3'd0)  pse <= pse - 3'd1;
+    end
+    wire pause_byte = (ps2_code == 8'hE1) | (pse != 3'd0);
+
+    // Held state of the hotkey keys (make=0 => pressed). Qualified by ~pause_byte (Pause never touches
+    // a combo flag); belt-and-suspenders: ANY 0xF0 break frame clears ALL latches, so no key can leave
+    // ctrl_h/alt_h/del_h permanently stuck and silently arm Ctrl+Alt+Del. Normal press/release still
+    // works: a held key sets its latch on make; F0+code clears it (and the per-key make=1 agrees).
     reg ctrl_h = 1'b0, alt_h = 1'b0, del_h = 1'b0, ins_h = 1'b0, f11_h = 1'b0;
-    always @(posedge spclk) if (pe3M5 && ps2_strb) case (ps2_code)
-        8'h14: ctrl_h <= ~ps2_make;   // Ctrl  (also Symbol Shift in the matrix)
-        8'h11: alt_h  <= ~ps2_make;   // Alt
-        8'h71: del_h  <= ~ps2_make;   // Delete
-        8'h70: ins_h  <= ~ps2_make;   // Insert
-        8'h78: f11_h  <= ~ps2_make;   // F11
-        default: ;
-    endcase
+    always @(posedge spclk) if (pe3M5 && ps2_strb && ~pause_byte) begin
+        if (ps2_code == 8'hF0) begin ctrl_h<=1'b0; alt_h<=1'b0; del_h<=1'b0; ins_h<=1'b0; f11_h<=1'b0; end
+        else case (ps2_code)
+            8'h14: ctrl_h <= ~ps2_make;   // Ctrl (also Symbol Shift in the matrix)
+            8'h11: alt_h  <= ~ps2_make;   // Alt
+            8'h71: del_h  <= ~ps2_make;   // Delete
+            8'h70: ins_h  <= ~ps2_make;   // Insert
+            8'h78: f11_h  <= ~ps2_make;   // F11
+            default: ;
+        endcase
+    end
     wire soft_combo = ctrl_h & alt_h & del_h;        // Ctrl+Alt+Del -> soft reset
     wire nmi_combo  = ctrl_h & alt_h & ins_h;        // Ctrl+Alt+Ins -> NMI (Magic / freezer)
     wire hard_combo = f11_h;                          // F11          -> hard / cold reset (RAM wipe)
@@ -277,7 +294,16 @@ module bulbulator_zx_ddr_top
     wire [23:0]  ctl_osd_bg;
     wire [7:0]   ctl_osd_op;
     wire [31:0]  ctl_osd_pos;
+    wire         ctl_ban_enable, ctl_ban_we;     // independent banner overlay control (aclk)
+    wire [8:0]   ctl_ban_waddr;
+    wire [31:0]  ctl_ban_wdata;
+    wire [31:0]  ctl_ban_pos;
     wire [7:0]   ctl_vol;
+    wire         ctl_player_en, ctl_audio_we;   // machine-agnostic ARM audio player (mux + FIFO push)
+    wire [31:0]  ctl_audio_data;
+    wire         aud_full, aud_empty;
+    wire [7:0]   aud_rdcount;
+    wire [31:0]  aud_dout;
     wire [31:0]  ctl_osd_wdata;
     wire [8:0]   kbd_fifo_dout;                  // keyboard scancode FIFO head {make,code} (aclk read)
     wire         kbd_fifo_empty, kbd_fifo_rd, kbd_deadman_kick;
@@ -285,7 +311,7 @@ module bulbulator_zx_ddr_top
     wire [31:0] cap_geom_sp;
     reg [31:0] cap_geom_s1=32'd0, cap_geom_f=32'd0;
     always @(posedge fclk100) begin cap_geom_s1<=cap_geom_sp; cap_geom_f<=cap_geom_s1; end
-    axi_ctl #(.VERSION(32'hB01B000A)) ctl (
+    axi_ctl #(.VERSION(32'hB01B0013)) ctl (
         .aclk(fclk100), .aresetn(aresetn),
         .s_awid(gp0_awid), .s_awaddr(gp0_awaddr), .s_awlen(gp0_awlen),
         .s_awvalid(gp0_awvalid), .s_awready(gp0_awready),
@@ -302,6 +328,10 @@ module bulbulator_zx_ddr_top
         .ctl_dir_commit(ctl_dir_commit), .ctl_port_commit(ctl_port_commit),
         .ctl_osd_enable(ctl_osd_enable), .ctl_osd_we(ctl_osd_we),
         .ctl_osd_waddr(ctl_osd_waddr), .ctl_osd_wdata(ctl_osd_wdata), .ctl_osd_bg(ctl_osd_bg), .ctl_osd_op(ctl_osd_op), .ctl_osd_pos(ctl_osd_pos), .ctl_vol(ctl_vol),
+        .ctl_ban_enable(ctl_ban_enable), .ctl_ban_we(ctl_ban_we),
+        .ctl_ban_waddr(ctl_ban_waddr), .ctl_ban_wdata(ctl_ban_wdata), .ctl_ban_pos(ctl_ban_pos),
+        .ctl_player_en(ctl_player_en), .ctl_audio_we(ctl_audio_we), .ctl_audio_data(ctl_audio_data),
+        .aud_full(aud_full), .aud_empty(aud_empty), .aud_rdcount(aud_rdcount),
         .kbd_fifo_dout(kbd_fifo_dout), .kbd_fifo_empty(kbd_fifo_empty),
         .kbd_fifo_rd(kbd_fifo_rd), .kbd_deadman_kick(kbd_deadman_kick),
         .halt_ack(halt_ack), .ram_busy(ram_busy), .reset_busy(reset_busy_aclk),
@@ -440,7 +470,7 @@ module bulbulator_zx_ddr_top
     // Merge synthetic Alt chord + real PS/2 keyboard + the 4 buttons (synthetic wins, then PS/2).
     // ZX matrix adapter for the gate: while the OSD is open (gate_on) the real PS/2 is suppressed
     // here so the ARM owns the keys; the Alt chord (syn_*) and the 4 buttons stay live.
-    wire       ps2_to_core = ps2_strb & ~gate_on;
+    wire       ps2_to_core = ps2_strb & ~gate_on & ~pause_byte;   // ARM-owned Pause never reaches the matrix
     wire       kb_strb = syn_strb | ps2_to_core | kbd_strb;
     wire       kb_make = syn_strb ? syn_make : (ps2_to_core ? ps2_make : kbd_make);
     wire [7:0] kb_code = syn_strb ? syn_code : (ps2_to_core ? ps2_code : kbd_code);
@@ -617,6 +647,16 @@ module bulbulator_zx_ddr_top
         .cx(cx), .cy(cy), .rgb_in(rgb24), .rgb_out(rgb24_osd)
     );
 
+    // Independent status BANNER, composited OVER the OSD output (visible regardless of osd_enable).
+    // Chain: rgb24 -> osd_i -> rgb24_osd -> banner_i -> rgb24_ovl -> hdmi. (banner_compositor in osd_compositor.v)
+    wire [23:0] rgb24_ovl;
+    banner_compositor banner_i (
+        .clk_pixel(clk_pixel), .aclk(fclk100),
+        .ban_enable_a(ctl_ban_enable), .ban_we(ctl_ban_we),
+        .ban_waddr(ctl_ban_waddr), .ban_wdata(ctl_ban_wdata), .ban_pos_a(ctl_ban_pos),
+        .cx(cx), .cy(cy), .rgb_in(rgb24_osd), .rgb_out(rgb24_ovl)
+    );
+
     //=============================================================================================
     // Audio: 11-bit UNSIGNED PCM -> signed 16-bit, then resync into clk_audio.
     //=============================================================================================
@@ -626,10 +666,20 @@ module bulbulator_zx_ddr_top
     // ~MSB offset->two's-complement conversion below) so a paused machine is genuinely quiet. On
     // resume (HALT deasserted) the frozen AY continues bit-exact - registers, envelope phase and the
     // noise LFSR all survive the freeze, so there is no save/restore and no resume click.
-    wire [10:0] laudio_m = cpu_halt_sp ? 11'h400 : laudio;
-    wire [10:0] raudio_m = cpu_halt_sp ? 11'h400 : raudio;
-    wire [15:0] left16_sp  = { ~laudio_m[10], laudio_m[9:0], 5'b0 };
-    wire [15:0] right16_sp = { ~raudio_m[10], raudio_m[9:0], 5'b0 };
+    wire [15:0] left16_raw  = { ~laudio[10], laudio[9:0], 5'b0 };   // signed PCM (NO hard mute)
+    wire [15:0] right16_raw = { ~raudio[10], raudio[9:0], 5'b0 };
+    // Pause FADE (anti-click): slew a gain 256<->0 over ~1.3 ms on HALT/resume instead of an instant
+    // step to silence. Multiplying the SIGNED waveform toward zero ramps the real audio down to true
+    // silence and back - no DC step, no click. The Z80/AY still freeze the instant HALT asserts
+    // (pe3M5_core gating unchanged); only the audible envelope is smoothed, so resume is bit-exact.
+    reg  [8:0] mgain = 9'd256;
+    wire [8:0] mtgt  = cpu_halt_sp ? 9'd0 : 9'd256;
+    always @(posedge clk_audio_r)
+        if (mgain < mtgt) mgain <= mgain + 9'd4; else if (mgain > mtgt) mgain <= mgain - 9'd4;
+    wire signed [24:0] lfp = $signed(left16_raw)  * $signed({1'b0, mgain});
+    wire signed [24:0] rfp = $signed(right16_raw) * $signed({1'b0, mgain});
+    wire [15:0] left16_sp  = lfp >>> 8;
+    wire [15:0] right16_sp = rfp >>> 8;
 
     reg [15:0] left16_a0, left16_a1;
     reg [15:0] right16_a0, right16_a1;
@@ -638,17 +688,43 @@ module bulbulator_zx_ddr_top
         right16_a0 <= right16_sp;  right16_a1 <= right16_a0;
     end
 
+    //=============================================================================================
+    // Machine-agnostic ARM -> HDMI audio: the ARM player pushes signed-16 {R[31:16],L[15:0]} samples
+    // into this async FIFO (fclk100 write side), drained one per clk_audio_r tick. When the player is
+    // active the HDMI audio mux selects player PCM over the fabric core's audio - so it plays under
+    // ANY fabric machine or none. Fabric leg (fade + volume) is untouched when the player is off.
+    //=============================================================================================
+    wire player_live = ctl_player_en & ~aud_empty;
+    async_fifo #(.DW(32), .AW(8)) audio_fifo (
+        .wr_clk(fclk100),    .wr_rst_n(aresetn), .wr_en(ctl_audio_we), .din(ctl_audio_data), .full(aud_full),
+        .rd_clk(clk_audio_r), .rd_rst_n(aresetn), .rd_en(player_live),
+        .dout(aud_dout), .empty(aud_empty), .rd_count(aud_rdcount)
+    );
+
+    // Select the audio source BEFORE applying the volume scaling, so that the player
+    // obeys the OSD F9 volume level (ctl_vol) just like the fabric machine's audio.
+    wire [15:0] src_left  = player_live ? aud_dout[15:0]  : left16_a1;
+    wire [15:0] src_right = player_live ? aud_dout[31:16] : right16_a1;
+
     // HDMI volume (Step 13, F9 menu): scale the signed-16 PCM by ctl_vol (0..255 gain, /256; 255 ~=
     // unity) in the slow clk_audio domain, so the multiply has ample slack and one DSP per channel.
     // ctl_vol is set by the ARM from the options menu; 2-FF sync it in. Composes with the pause mute
-    // (while halted left16_a1 is already silence, and silence*gain stays silent).
+    // (while halted src_left/src_right is already silenced, and silence*gain stays silent).
     reg  [7:0] vol_c0 = 8'd255, vol_c1 = 8'd255;
     always @(posedge clk_audio_r) begin vol_c0 <= ctl_vol; vol_c1 <= vol_c0; end
+    // FULL-WIDTH product first (a bare (a*b)>>>8 assigned to a 16-bit reg makes Verilog size the
+    // multiply to the 16-bit assignment context -> the product overflows + truncates -> garbage/no
+    // sound). Compute the signed product in a 25-bit wire, THEN arithmetic-shift /256 (vol 255 ~= 1x).
+    wire signed [24:0] lprod = $signed(src_left)  * $signed({1'b0, vol_c1});
+    wire signed [24:0] rprod = $signed(src_right) * $signed({1'b0, vol_c1});
     reg signed [15:0] left16_v, right16_v;
     always @(posedge clk_audio_r) begin
-        left16_v  <= ($signed(left16_a1)  * $signed({1'b0, vol_c1})) >>> 8;
-        right16_v <= ($signed(right16_a1) * $signed({1'b0, vol_c1})) >>> 8;
+        left16_v  <= lprod >>> 8;
+        right16_v <= rprod >>> 8;
     end
+
+    wire [15:0] audio_left_f  = left16_v;
+    wire [15:0] audio_right_f = right16_v;
 
     //=============================================================================================
     // HDMI 1.4 (720p50) with stereo audio + OBUFDS to the TMDS pins.
@@ -660,9 +736,9 @@ module bulbulator_zx_ddr_top
         .clk_pixel   (clk_pixel),
         .clk_audio   (clk_audio_r),
         .reset       (hdmi_reset),
-        .rgb         (rgb24_osd),
-        .audio_left  (left16_v),
-        .audio_right (right16_v),
+        .rgb         (rgb24_ovl),
+        .audio_left  (audio_left_f),
+        .audio_right (audio_right_f),
         .tmds        (tmds),
         .tmds_clock  (tmds_clock),
         .cx          (cx),
