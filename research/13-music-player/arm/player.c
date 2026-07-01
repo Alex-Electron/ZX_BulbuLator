@@ -109,7 +109,7 @@ int player_play_psg(const char* path){
        body starts at offset 4 (some emulators wrote a short header then a 0xFF frame); else at 16. */
     { uint8_t hdr[16] __attribute__((aligned(32))); UINT hr = 0;
       if (f_read(&g_pf, hdr, sizeof(hdr), &hr) != FR_OK || hr < 16) { f_close(&g_pf); return 0; }
-      if (hdr[4] == 0xFF) f_lseek(&g_pf, 4);
+      if (hdr[4] == 0xFF && f_lseek(&g_pf, 4) != FR_OK) { f_close(&g_pf); return 0; }
       g_blen = g_bpos = 0; }                /* read the body fresh from the chosen offset */
     for (int i = 0; i < 16; i++) ay_regs[i] = 0;
     ayumi_configure(&g_ay, 0 /*AY, not YM*/, AY_CLOCK, PLAYER_SR);

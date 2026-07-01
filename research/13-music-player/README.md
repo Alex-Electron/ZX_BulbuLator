@@ -35,16 +35,29 @@ The player pipeline consists of several key components:
 - **Auto-advance**: The player automatically advances to the next track when reaching the end of the file.
 - **Indicator**: A small Play/Pause icon appears in the OSD title bar next to the firmware version.
 
+## Non-blocking pause and the status banner
+
+**Pause** (the PS/2 **Pause** key, or **F10** as a fallback) freezes the Spectrum without taking over the screen. The Z80 and the sound chips stop mid-sample and the audio fades to silence, but the OSD, the browser, and any playing music stay usable. Resume continues bit-exact: the AY registers, envelope phase, and noise LFSR all survive the freeze, so there is no save/restore and no click. The Pause scancode is owned by the ARM and never leaks into the Spectrum's key matrix.
+
+A separate **status banner** (its own overlay layer, composited over the OSD output whether or not a menu is open) shows what is running: the currently-playing track, the loaded application with its full SD path, and a PAUSE marker when the machine is frozen. It has its own enable and position registers (`0x84`–`0x90`), so it is independent of the OSD panel.
+
+**F2** cycles the music play mode: **FOLDER** (play through the folder, then stop), **REPEAT-1** (loop the current track), and **REPEAT-ALL** (loop the folder). The mode persists in `bulbulator.ini`.
+
 ## The control-plane registers
 
-The AXI control plane adds three new registers for the audio path, and the version bumps to `0xB01B000B`:
+The AXI control plane gains registers for the audio path, the F9 volume control, and the status banner; the version bumps to `0xB01B0013`:
 
 | Addr | Name | R/W | Meaning |
 |---|---|---|---|
-| `0x00` | `VERSION` | R | `0xB01B000B` |
+| `0x00` | `VERSION` | R | `0xB01B0013` |
+| `0x74` | `VOL` | W | HDMI output volume gain 0..255 (PCM * vol / 256; 255 ≈ unity) |
 | `0x78` | `AUDIO_CTRL` | W | bit 0 = Player Active (mux player PCM to HDMI, mute fabric audio) |
 | `0x7C` | `AUDIO_FIFO` | W | Push `{R[15:0], L[15:0]}` signed-16 PCM sample |
 | `0x80` | `AUDIO_STAT` | R | bit 0 = empty, bit 1 = full |
+| `0x84` | `BANNER_CTRL` | W | bit 0 = banner overlay enable (independent of the OSD) |
+| `0x88` | `BANNER_ADDR` | W | banner LUTRAM word pointer (auto-increments on each DATA write) |
+| `0x8C` | `BANNER_DATA` | W | 32 packed 1-bpp banner pixels -> buffer[ptr], ptr++ |
+| `0x90` | `BANNER_POS` | W | banner window position `{Y0[26:16], X0[10:0]}` |
 
 When the player is active (`AUDIO_CTRL = 1`), the bitstream's audio multiplexer selects the ARM's PCM stream over the fabric core's audio.
 

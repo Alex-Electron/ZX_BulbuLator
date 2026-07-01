@@ -7,7 +7,7 @@
 // inject Z80 registers (T80 DIR vector) and machine ports (7FFD / border) -> load .sna/.z80.
 //
 // Register map (base = M_AXI_GP0 0x4000_0000), AXI3, 32-bit, single-beat:
-//   0x00 VERSION   R   0xB01B000A
+//   0x00 VERSION   R   0xB01B0013
 //   0x04 CONTROL   RW  bit0 HALT (1 = freeze the Z80; ARM owns the memory bus)
 //   0x08 STATUS    R   bit0 HALT_ACK, bit1 RAM_BUSY
 //   0x0C COUNTER   R   free-running aclk counter (liveness)
@@ -29,6 +29,18 @@
 //   0x5C KBD_HB    W   any write = deadman heartbeat (keeps the keyboard gate open while ARM lives)
 //   0x60 MACHINE_ID R  loaded-core identity for the ARM (here ZX 128K); lets one ARM image serve
 //                      many machines: [15:0] machine code, [23:16] variant.
+//   0x64 VGEOM     R   captured video geometry probe {frame_lines, vis_last, vis_first} (diagnostic)
+//   0x68 OSD_BG    RW  OSD panel background colour (24-bit RGB)
+//   0x6C OSD_OP    RW  OSD panel opacity alpha 0..255
+//   0x70 OSD_POS   RW  OSD panel position {Y0[26:16], X0[10:0]}
+//   0x74 VOL       W   HDMI output volume gain 0..255 (PCM * vol / 256; 255 ~= unity)
+//   0x78 AUDIO_CTRL W  bit0 = player active (mux ARM PCM -> HDMI, mute the fabric audio)
+//   0x7C AUDIO_FIFO W  push one signed-16 stereo sample {R[31:16], L[15:0]} into the audio FIFO
+//   0x80 AUDIO_STAT R  bit0 = FIFO empty, bit1 = FIFO full
+//   0x84 BANNER_CTRL W bit0 = independent status-banner overlay enable
+//   0x88 BANNER_ADDR W banner LUTRAM word pointer; auto-increments after each BANNER_DATA write
+//   0x8C BANNER_DATA W 32 packed 1-bpp banner pixels -> ban_buf[ptr], ptr++
+//   0x90 BANNER_POS W  banner window position {Y0[26:16], X0[10:0]}
 //
 // Purely aclk (FCLK0). The crossing into the Spectrum clock (HALT level, RAM write strobe, the
 // DIRSet pulse, the port-force pulses) lives in inject_cdc.v. The scancode FIFO crossing lives in

@@ -1,5 +1,5 @@
 #!/bin/sh
-# Step 12 - assemble the sources and build the snapshot-loader bitstream.
+# Step 13 - assemble the sources and build the music-player bitstream.
 # Prerequisite: run ../../get_deps.sh once (cores). Vivado 2023.1 assumed installed.
 #   ./build.sh            # faithful (ULA snow on) -> sources/build/bulbulator_zx_loader.bit
 #   ./build.sh nosnow     # no-snow variant        -> sources/build/bulbulator_zx_loader_nosnow.bit

@@ -1,6 +1,7 @@
 #!/bin/bash
-# loader.elf build for BulbuLator Step 12 (snapshot loader + F5 file browser + options/config).
-# Compiles loader_main.c against the standalone BSP and links the xilffs (FatFs) objects directly,
+# loader.elf build for BulbuLator Step 13 (snapshot loader + F5 file browser + options + the universal
+# music player: loader_main.c + player.c + third_party/ayumi, linked with -lm).
+# Compiles against the standalone BSP and links the xilffs (FatFs) objects directly,
 # bypassing the broken platform-generate/FSBL (xilffs objects exist but aren't archived into libxil.a).
 # NOTE: this still needs the Vitis 2023.1 BSP workspace ($WS) - the ARM app is not yet clean-clone
 # buildable (xsdps + FatFs aren't vendored into the repo); see the README's honest note. The xsdps /

@@ -12,7 +12,8 @@ void player_stop(void);
 void player_pause_toggle(void);   /* Space: pause/resume transport */
 int  player_paused(void);         /* 1 = paused */
 int  player_take_ended(void);     /* consume-once: 1 if the track just reached EOF (auto-advance) */
-// loader_main.c - BulbuLator OSD app: snapshot loader (.z80/.sna) + F5 SD file browser + options (Step 12).
+// loader_main.c - BulbuLator OSD app (Step 13): snapshot loader (.z80/.sna) + F5 SD file browser +
+// options + the universal music player (player.c) with a non-blocking pause and an independent status banner.
 // Vitis standalone app: the BSP gives xsdps + FatFs; the OSD/keyboard code is the same GP0 MMIO as
 // osd.c. F12 = title overlay, F1 = help, F5 = SD browser, Up/Down scroll, Enter enters a folder
 // (".." goes up), Esc closes.
@@ -247,7 +248,7 @@ static void browser_status(const char* s){   /* repaint the title bar, then show
    (0x4000_0000) is shown live too, so the splash states exactly which firmware + bitstream run. */
 #define BULB_FW "v0.13"
 static char hexnib(uint32_t v){ return (v<10) ? ('0'+v) : ('A'+v-10); }
-/* Single source of truth for the version line ("v0.12 core 0xB01B0009"): the ARM firmware tag
+/* Single source of truth for the version line ("v0.13 core 0xB01B0013"): the ARM firmware tag
    BULB_FW + the live PL core VERSION read from register 0x00. Used by BOTH the F12 splash
    (show_header) and the F1 help page (show_help), so the two can never drift apart. */
 static void version_str(char* out){
@@ -268,7 +269,7 @@ static void show_header(void){
 /* F1 help page: inverse title bar + grouped key map (GLOBAL / FILE BROWSER / ZX KEYS). */
 static void show_help(void){
     osd_clear();
-    char v[40]; version_str(v);                              /* "v0.12 core 0xB01B0009" */
+    char v[40]; version_str(v);                              /* "v0.13 core 0xB01B0013" */
     titlebar(); g_inv=1;                                     /* inverse title bar: HELP (left) + version/build (right), like the other OSD views */
     draw_text(2, 0, 1, "HELP");
     draw_text(OSD_W - slen(v)*8, 0, 1, v);
@@ -318,8 +319,8 @@ static char  play_dir[80]    = "";       /* folder (curpath) where the current p
 static int   opt_pausemusic  = 0;        /* 0=NO (game runs in background, audio muted by FIFO mux) 1=YES (HALT when music plays over a game) */
 static const char* const CH_NOYES[] = {"NO","YES"};
 /* ---- pause/now-playing BANNER state (independent overlay) ---- */
-static char  g_app_path[100] = "";       /* full SD path of the last-loaded snapshot (game/demo) */
-static char  g_music_path[100] = ""; /* full path of the currently-playing track */
+static char  g_app_path[180] = "";       /* full SD path of the last-loaded snapshot (game/demo) */
+static char  g_music_path[180] = ""; /* full path of the currently-playing track */
 static void  update_banner(void);        /* fwd (defined after the pause section) */
 static void  apply_music_halt(void);     /* fwd (HALT coordination) */
 static void  apply_halt(void);           /* fwd (single owner of IJ_CTRL HALT bit) */
@@ -375,6 +376,20 @@ static void sort_entries(void){                        /* insertion sort; keep "
     for(int i=base+1; i<fcount; i++)
         for(int j=i; j>base && ent_less(j, j-1); j--) swap_ent(j, j-1);
 }
+/* Filename part of a full path (after the last '/'). */
+static const char* base_name(const char* path){
+    const char* b = path; for(const char* p=path; *p; p++) if(*p=='/') b = p+1; return b;
+}
+/* sort_entries()/sd_scan physically reorder flist[], so the raw playing_idx no longer points at the
+   playing track. Re-find it by name in the current folder. Only meaningful while the playing folder
+   is the one on screen (curpath==play_dir); otherwise the autoadvance folder-scope guard handles it. */
+static void remap_playing_idx(void){
+    if(playing_idx < 0 || !player_active()) return;
+    if(cicmp(curpath, play_dir) != 0) return;          /* not the playing folder: index is unused (guarded) */
+    const char* nm = base_name(g_music_path);
+    for(int i=0;i<fcount;i++) if(!fisdir[i] && cicmp(flist[i], nm)==0){ playing_idx = i; return; }
+    playing_idx = -1;                                  /* the playing file vanished from this listing */
+}
 
 static void sd_scan(void){               /* mount once + read curpath into flist[] */
     fcount = 0;   /* keep bcursor/btop: only a directory change resets the cursor, so a re-open (F5) lands where you were */
@@ -406,6 +421,7 @@ static void sd_scan(void){               /* mount once + read curpath into flist
     f_closedir(&dir);
     if(rr != FR_OK){ sd_unmount(); return; }   /* error mid-enumeration -> card gone, don't show a partial list */
     sort_entries();
+    remap_playing_idx();                                   /* keep playing_idx on the playing track after the re-sort */
     if(bcursor>=fcount) bcursor = fcount ? fcount-1 : 0;   /* keep the remembered cursor in range if the dir shrank */
     if(btop>bcursor) btop=bcursor;
     if(bcursor>=btop+BROWS) btop=bcursor-(BROWS-1);
@@ -531,9 +547,12 @@ static void machine_reset(void){
     IJ_CTRL = 1;                                                /* HALT - take the memory bus */
     while(!(IJ_STAT & 1u)){}                                    /* wait HALT_ACK */
 }
-/* .z80 RLE: 'ED ED cnt val'; clen==0xFFFF -> 16384 raw bytes. */
-static void z80_unrle(const uint8_t* src,int clen,uint8_t* dst){
-    if(clen==0xFFFF){ for(int i=0;i<16384;i++) dst[i]=src[i]; return; }
+/* .z80 RLE: 'ED ED cnt val'; clen==0xFFFF -> 16384 raw bytes. `avail` = source bytes remaining in the
+   file from src, so a truncated/malformed page can never read past end-of-file (clamps raw + RLE). */
+static void z80_unrle(const uint8_t* src,int clen,int avail,uint8_t* dst){
+    if(avail<0) avail=0;
+    if(clen==0xFFFF){ int n=(avail<16384)?avail:16384,i=0; for(;i<n;i++) dst[i]=src[i]; for(;i<16384;i++) dst[i]=0; return; }
+    if(clen>avail) clen=avail;                       /* never read past the bytes actually in the file */
     int o=0,i=0;
     while(o<16384 && i<clen){
         if(src[i]==0xED && i+3<clen && src[i+1]==0xED){ int c=src[i+2]; uint8_t v=src[i+3]; i+=4; while(c-->0 && o<16384) dst[o++]=v; }
@@ -584,7 +603,7 @@ static void load_z80(const uint8_t* d,int len){
         while(off+3<=len){
             int clen=d[off]|(d[off+1]<<8); int pg=d[off+2]; const uint8_t* src=d+off+3;
             int fb=(clen==0xFFFF)?16384:clen;
-            z80_unrle(src,clen,pagebuf);
+            z80_unrle(src,clen,len-(off+3),pagebuf);
             int bank=-1;
             if(is128){ if(pg>=3&&pg<=10) bank=pg-3; }
             else { if(pg==5)bank=5; else if(pg==4)bank=2; else if(pg==8)bank=0; }
@@ -619,10 +638,10 @@ static void load_sna(const uint8_t* d,int len){
     inject_finish(&z);
 }
 static void load_snapshot(void){
-    char path[100]; int p=0;
-    for(int i=0;curpath[i] && p<90;i++) path[p++]=curpath[i];
+    char path[180]; int p=0;                                 /* curpath(<=79) + '/' + NAMELEN(96) + NUL */
+    for(int i=0;curpath[i] && p<160;i++) path[p++]=curpath[i];
     if(p && path[p-1]!='/') path[p++]='/';
-    for(int i=0;flist[bcursor][i] && p<99;i++) path[p++]=flist[bcursor][i];
+    for(int i=0;flist[bcursor][i] && p<179;i++) path[p++]=flist[bcursor][i];
     path[p]=0;
     if(!sd_mounted) return;
     FIL f; UINT br=0;
@@ -632,7 +651,7 @@ static void load_snapshot(void){
     if(br<30) return;
     player_stop(); playing_idx=-1; g_music_path[0]=0;           /* loading a game: drop the music + return the audio mux to the fabric (else the demo is silent) */
     OSD_CTRL=0; osd_on=0; browser_on=0; osd_view=0;              /* hand the screen to the game */
-    { int i=0; for(; path[i] && i<99; i++) g_app_path[i]=path[i]; g_app_path[i]=0; }  /* banner: loaded app full path */
+    { int i=0; for(; path[i] && i<179; i++) g_app_path[i]=path[i]; g_app_path[i]=0; }  /* banner: loaded app full path */
     apply_music_halt();                                         /* music just stopped -> drop the music-HALT bit */
     update_banner();
     if(cicmp(fext(flist[bcursor]),"sna")==0) load_sna(snapbuf,(int)br);
@@ -647,15 +666,15 @@ static int is_music_ext(int idx){
 }
 static void play_index(int idx){                  /* play flist[idx], move the cursor onto it, remember the folder */
     if(idx<0 || idx>=fcount || fisdir[idx]) return;
-    char path[100]; int p=0;
-    for(int i=0;curpath[i] && p<90;i++) path[p++]=curpath[i];
+    char path[180]; int p=0;                                 /* curpath(<=79) + '/' + NAMELEN(96) + NUL */
+    for(int i=0;curpath[i] && p<160;i++) path[p++]=curpath[i];
     if(p && path[p-1]!='/') path[p++]='/';
-    for(int i=0;flist[idx][i] && p<99;i++) path[p++]=flist[idx][i];
+    for(int i=0;flist[idx][i] && p<179;i++) path[p++]=flist[idx][i];
     path[p]=0;
     if(player_play_psg(path)){
         playing_idx = idx;
         int j=0; for(; curpath[j] && j<79; j++) play_dir[j]=curpath[j]; play_dir[j]=0;
-        { int i=0; for(; path[i] && i<99; i++) g_music_path[i]=path[i]; g_music_path[i]=0; }  /* banner: track path */
+        { int i=0; for(; path[i] && i<179; i++) g_music_path[i]=path[i]; g_music_path[i]=0; }  /* banner: track path */
         apply_music_halt();                                    /* music started: if PAUSE-MUS=YES + game loaded, assert HALT */
         bcursor = idx; sel_scroll=0; last_scroll=0;            /* cursor follows the playing track */
         if(bcursor < btop) btop=bcursor;
@@ -1100,7 +1119,7 @@ void main(void){
             case SC_PGUP:  if(!release && browser_on) browser_move(-BROWS); break;   /* fast page scroll */
             case SC_PGDN:  if(!release && browser_on) browser_move(+BROWS); break;
             case SC_ENTER: if(!release){ if(opt_on) menu_activate(&opt_menu,+1); else if(browser_on) browser_enter(); } break;
-            case SC_F3:    if(!release && browser_on){ sortmode=(sortmode+1)&3; sort_entries();
+            case SC_F3:    if(!release && browser_on){ sortmode=(sortmode+1)&3; sort_entries(); remap_playing_idx();
                               bcursor=0; btop=0; sel_scroll=0; last_scroll=0; render_browser(); } break;
             case SC_F2:    if(!release && browser_on){ opt_playmode=(opt_playmode+1)%3;   /* cycle play mode; reflect in the status line */
                               if(player_active()) render_browser(); else browser_status(CH_PLAY[opt_playmode]); } break;

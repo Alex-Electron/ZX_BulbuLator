@@ -309,8 +309,13 @@ module bulbulator_zx_ddr_top
     wire         kbd_fifo_empty, kbd_fifo_rd, kbd_deadman_kick;
 
     wire [31:0] cap_geom_sp;
-    reg [31:0] cap_geom_s1=32'd0, cap_geom_f=32'd0;
-    always @(posedge fclk100) begin cap_geom_s1<=cap_geom_sp; cap_geom_f<=cap_geom_s1; end
+    // cap_geom is a multi-bit bus crossing spclk->fclk100; a plain 2-FF can bit-skew on the once-per-
+    // frame update. 3-FF it and latch only a settled value (two equal samples), like the OSD position.
+    reg [31:0] cap_geom_s1=32'd0, cap_geom_s2=32'd0, cap_geom_s3=32'd0, cap_geom_f=32'd0;
+    always @(posedge fclk100) begin
+        cap_geom_s1<=cap_geom_sp; cap_geom_s2<=cap_geom_s1; cap_geom_s3<=cap_geom_s2;
+        if (cap_geom_s2==cap_geom_s3) cap_geom_f<=cap_geom_s2;
+    end
     axi_ctl #(.VERSION(32'hB01B0013)) ctl (
         .aclk(fclk100), .aresetn(aresetn),
         .s_awid(gp0_awid), .s_awaddr(gp0_awaddr), .s_awlen(gp0_awlen),
@@ -673,7 +678,11 @@ module bulbulator_zx_ddr_top
     // silence and back - no DC step, no click. The Z80/AY still freeze the instant HALT asserts
     // (pe3M5_core gating unchanged); only the audible envelope is smoothed, so resume is bit-exact.
     reg  [8:0] mgain = 9'd256;
-    wire [8:0] mtgt  = cpu_halt_sp ? 9'd0 : 9'd256;
+    // cpu_halt_sp is spclk-domain; 2-FF sync it into clk_audio_r before it steers the fade target
+    // (mirrors the vol_c0/osd_en_s discipline in this file - no unsynced control into the audio domain).
+    (* ASYNC_REG = "TRUE" *) reg [1:0] halt_aud_s = 2'b00;
+    always @(posedge clk_audio_r) halt_aud_s <= {halt_aud_s[0], cpu_halt_sp};
+    wire [8:0] mtgt  = halt_aud_s[1] ? 9'd0 : 9'd256;
     always @(posedge clk_audio_r)
         if (mgain < mtgt) mgain <= mgain + 9'd4; else if (mgain > mtgt) mgain <= mgain - 9'd4;
     wire signed [24:0] lfp = $signed(left16_raw)  * $signed({1'b0, mgain});
@@ -694,7 +703,13 @@ module bulbulator_zx_ddr_top
     // active the HDMI audio mux selects player PCM over the fabric core's audio - so it plays under
     // ANY fabric machine or none. Fabric leg (fade + volume) is untouched when the player is off.
     //=============================================================================================
-    wire player_live = ctl_player_en & ~aud_empty;
+    // ctl_player_en is fclk100(aclk)-domain; 2-FF sync it into clk_audio_r before it gates the audio
+    // FIFO read enable AND the source mux. An unsynchronised enable into the FIFO read-pointer counter
+    // is a real CDC hazard (metastable rd_en can corrupt the gray/binary pointer pair). aud_empty is
+    // already a clk_audio_r (read-side) signal, so it needs no extra sync.
+    (* ASYNC_REG = "TRUE" *) reg [1:0] pen_s = 2'b00;
+    always @(posedge clk_audio_r) pen_s <= {pen_s[0], ctl_player_en};
+    wire player_live = pen_s[1] & ~aud_empty;
     async_fifo #(.DW(32), .AW(8)) audio_fifo (
         .wr_clk(fclk100),    .wr_rst_n(aresetn), .wr_en(ctl_audio_we), .din(ctl_audio_data), .full(aud_full),
         .rd_clk(clk_audio_r), .rd_rst_n(aresetn), .rd_en(player_live),

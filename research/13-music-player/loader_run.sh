@@ -1,5 +1,5 @@
 #!/bin/bash
-# loader_run.sh - flash the Step 12 bitstream over JTAG (PCAP "armoured train"), then load + run the
+# loader_run.sh - flash the Step 13 bitstream over JTAG (PCAP "armoured train"), then load + run the
 # loader ARM app (arm/loader.elf) on Cortex-A9 #0. The Spectrum comes up on HDMI and the OSD is live:
 # F5 lists the SD card, F9 opens the options menu, F1 = help, F12/Esc close. (For SD boot with no host,
 # flash/BOOT.BIN does all of this on its own - see README.)
@@ -49,7 +49,7 @@ echo ">>> PCAP config ..."
 export PCAP_BIN="$HERE/bulbulator_zx_loader.bit.bin"
 "$XSDB" "$HERE/flash/pcap_load.tcl" 2>&1 | grep -E "PS7_INIT|PCFG_DONE|POST_CONFIG|FAIL|DDR"
 
-# 4. load + run the loader ARM app, read back VERSION (expect 0xB01B0009)
+# 4. load + run the loader ARM app, read back VERSION (expect 0xB01B0013)
 echo ">>> load arm/loader.elf ..."
 cat > /tmp/runloader.tcl <<TCL
 connect -url tcp:localhost:3121

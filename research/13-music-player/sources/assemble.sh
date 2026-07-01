@@ -1,14 +1,16 @@
 #!/bin/sh
-# assemble.sh - gather everything Step 13.1's bitstream needs into ./build/.
+# assemble.sh - gather everything Step 13's bitstream needs into ./build/.
 #
-# Step 13.1 = "full pause": a Pause-key toggle that HALTs the Z80 (the existing Step-7 control
-# plane) and mutes the audio while frozen. Because HALT already gates the sound-chip clock-enables
-# (pe3M5_core = pe3M5 & ~cpu_halt_sp), the AY/TurboSound freeze mid-sample - registers, envelope
-# phase and noise LFSR all survive - so resume is bit-exact with no save/restore. The whole pause
-# mechanism is ARM-side (arm/loader_main.c, Pause-key matcher + HALT toggle). The FPGA-side delta vs
-# Step 12 is tiny:
-#   - bulbulator_zx_ddr_top.v  forces the PCM to silence (0x400) while cpu_halt_sp is high
-#   - axi_ctl.v                VERSION bumped 0xB01B0009 -> 0xB01B000A
+# Step 13 = "Player": a machine-agnostic ARM->HDMI audio path plus a full-pause + independent status
+# banner. The FPGA-side delta vs Step 12 (VERSION 0xB01B0009 -> 0xB01B0013):
+#   - axi_ctl.v                + audio FIFO push/status regs (0x74 VOL, 0x78 AUDIO_CTRL, 0x7C
+#                                AUDIO_FIFO, 0x80 AUDIO_STAT) + independent banner regs (0x84 CTRL /
+#                                0x88 ADDR / 0x8C DATA / 0x90 POS); VERSION 0xB01B0013.
+#   - bulbulator_zx_ddr_top.v  + an async audio FIFO (ARM PCM -> clk_audio) muxed onto HDMI when the
+#                                player is active; the pause fade-to-silence (anti-click); the
+#                                banner_compositor instance; CDC syncs on the new audio-domain controls.
+#   - osd_compositor.v         step-local (adds banner_compositor + an osd_bg/op settle-latch CDC
+#                                fix); copied from $HERE so Step 11's own copy stays exactly as published.
 # Everything else is taken in unchanged from the earlier steps - nothing re-shipped here:
 #   inject_cdc.v + bulbulator_ddr.xdc + build.tcl come from Step 12 verbatim.
 #   ./assemble.sh && (cd build && vivado -mode batch -source build.tcl)
@@ -39,15 +41,16 @@ cp "$S6/clock_zx.v" "$S6/mem_zx.v" "$S6/kbd_buttons.v" "$S6/hdmi_wrap.sv" \
 # --- async FIFO + triple-buffer manager, unchanged since Step 8 ---
 cp "$S8/async_fifo.v" "$S8/fb_bufmgr3.v" "$B/"
 
-# --- per-line display chain + OSD compositor, unchanged since Step 11 ---
-cp "$S11/fb_line_disp.v" "$S11/fb_capture_rr.v" "$S11/fb_wr_axi.v" \
-   "$S11/osd_compositor.v" "$B/"
+# --- per-line display chain, unchanged since Step 11 (osd_compositor is now step-local, below) ---
+cp "$S11/fb_line_disp.v" "$S11/fb_capture_rr.v" "$S11/fb_wr_axi.v" "$B/"
 
 # --- AXI-RESET CDC + constraints + the loader-named build.tcl, unchanged since Step 12 ---
 cp "$S12/inject_cdc.v" "$S12/bulbulator_ddr.xdc" "$S12/build.tcl" "$B/"
 
-# --- this step's delta: the pause mute (top) + the VERSION bump (axi_ctl) ---
-cp "$HERE/axi_ctl.v" "$HERE/bulbulator_zx_ddr_top.v" "$B/"
+# --- this step's delta (from $HERE): audio FIFO + HDMI PCM mux + independent status banner in
+#     bulbulator_zx_ddr_top.v; the audio/banner AXI regs + VERSION 0xB01B0013 in axi_ctl.v; and a
+#     step-local osd_compositor.v (banner_compositor + the osd_bg/op settle-latch CDC fix). ---
+cp "$HERE/axi_ctl.v" "$HERE/bulbulator_zx_ddr_top.v" "$HERE/osd_compositor.v" "$B/"
 
 ( cd "$B" && sh get_rom.sh >/dev/null )
 echo "Assembled into $B"
