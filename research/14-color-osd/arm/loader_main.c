@@ -127,6 +127,8 @@ unsigned player_progress(void);   /* 0..100 playback progress */
 #define SC_F11   0x78u   /* hard reset (fabric-decoded); ARM taps it to mark the loaded app STOPPED */
 #define SC_KPPLUS  0x79u /* numpad + : volume up   (conflict-free; ZX has no numpad) */
 #define SC_KPMINUS 0x7Bu /* numpad - : volume down */
+#define SC_HOME    0x6Cu /* Home (E0 6C, prefix stripped) */
+#define SC_END     0x69u /* End (E0 69, prefix stripped) */
 
 /* ZX Spectrum 8x8 system font, chars 32..127, extracted from rom128.hex @ 0x7D00 */
 static const uint8_t zxfont[96][8] = {
@@ -520,7 +522,7 @@ static void browser_status(const char* s){   /* transient feedback (MOUNT/READ/F
 /* Title screen (shown when the OSD opens with F12): just the name, centred, scale 2. */
 /* Firmware build tag shown on the F12 splash (bump per milestone). The PL core VERSION
    (0x4000_0000) is shown live too, so the splash states exactly which firmware + bitstream run. */
-#define BULB_FW "v0.14.52"
+#define BULB_FW "v0.14.53"
 static char hexnib(uint32_t v){ return (v<10) ? ('0'+v) : ('A'+v-10); }
 /* Single source of truth for the version line ("v0.13 core 0xB01B0013"): the ARM firmware tag
    BULB_FW + the live PL core VERSION read from register 0x00. Used by BOTH the F12 splash
@@ -1990,7 +1992,8 @@ static menu_item opt_items[] = {
 
 enum {
     K_NONE=0, K_BACK=8, K_TAB=9, K_ENTER=13, K_ESC=27, K_SPACE=32,
-    K_UP=0x100, K_DOWN, K_LEFT, K_RIGHT, K_PGUP, K_PGDN, K_F1, K_F2, K_F3, K_F9
+    K_UP=0x100, K_DOWN, K_LEFT, K_RIGHT, K_PGUP, K_PGDN, K_F1, K_F2, K_F3, K_F9,
+    K_HOME, K_END
 };
 
 typedef struct Menu Menu;
@@ -2185,6 +2188,8 @@ static int get_keysym_blocking(void) {
             case SC_RIGHT: return K_RIGHT;
             case SC_PGUP:  return K_PGUP;
             case SC_PGDN:  return K_PGDN;
+            case SC_HOME:  return K_HOME;
+            case SC_END:   return K_END;
             case SC_F3:    return K_F3;
             case SC_F2:    return K_F2;
             case SC_SPACE: return K_SPACE;
@@ -2415,6 +2420,8 @@ static int dn_input_dialog(const char* title,const char* prompt,char* buf,int ma
         if(focus==0){                                          /* editing the field */
             if(k==K_LEFT){ if(cur>0) cur--; continue; }
             if(k==K_RIGHT){ if(cur<len) cur++; continue; }
+            if(k==K_HOME){ cur=0; continue; }
+            if(k==K_END){ cur=len; continue; }
             if(k==K_DOWN){ focus=1; continue; }
             if(k==K_BACK){ if(cur>0){ for(int i=cur-1;i<len;i++) buf[i]=buf[i+1]; len--; cur--; } continue; }
             if(k>=0x20 && k<0x7F && len<maxlen-1){             /* printable: insert at cursor */
