@@ -522,7 +522,7 @@ static void browser_status(const char* s){   /* transient feedback (MOUNT/READ/F
 /* Title screen (shown when the OSD opens with F12): just the name, centred, scale 2. */
 /* Firmware build tag shown on the F12 splash (bump per milestone). The PL core VERSION
    (0x4000_0000) is shown live too, so the splash states exactly which firmware + bitstream run. */
-#define BULB_FW "v0.14.54"
+#define BULB_FW "v0.14.56"
 static char hexnib(uint32_t v){ return (v<10) ? ('0'+v) : ('A'+v-10); }
 /* Single source of truth for the version line ("v0.13 core 0xB01B0013"): the ARM firmware tag
    BULB_FW + the live PL core VERSION read from register 0x00. Used by BOTH the F12 splash
@@ -2958,7 +2958,7 @@ static void do_player_pause(void){
 static void choose_play_mode(void){
     int W=46, H=11, left=(DN_COLS-W)/2, top=(DN_ROWS-H)/2, brow=top+8;
     int choice=opt_playmode;        /* choice: the currently focused row (where the cursor bar is) */
-    int temp_mode=opt_playmode;     /* temp_mode: the currently checked radio button (where the (o) is) */
+    int temp_mode=opt_playmode;     /* temp_mode: the currently checked radio button (where the (*) is) */
     int focus=0, result=-1;         /* focus: 0=RadioGroup, 1=OK, 2=Cancel */
     box_backup(&g_bs[0], left, top, W+2, H+1);
     dn_win_draw(left,top,W,H,"Play Mode");
@@ -2972,18 +2972,16 @@ static void choose_play_mode(void){
     };
     int old_choice = -1, old_temp = -1, old_focus = -1;
     while(result<0){
-        /* RadioButtons canon: temp_mode always follows cursor (choice) when RadioGroup is focused */
-        if(focus == 0) temp_mode = choice;
-
         if(choice != old_choice || temp_mode != old_temp || focus != old_focus){
             old_choice = choice; old_temp = temp_mode; old_focus = focus;
             for(int i=0;i<5;i++){
                 int ry = top+2+i;
                 int is_cur = (focus == 0 && i == choice);
-                uint32_t fg = is_cur ? DNK_CUR_FG : DNK_DLG_FG;
-                uint32_t bg = is_cur ? DNK_CUR_BG : DNK_DLG_BG;
+                uint32_t fg = is_cur ? FG(0) : DNK_DLG_FG;
+                /* Dialog cursor must be 100% opaque -> use FG(3) (solid Cyan) instead of BG(3) */
+                uint32_t bg = is_cur ? FG(3) : DNK_DLG_BG;
                 dn_fill(left+1, ry, W-2, 1, bg);
-                const char* radio = (i == temp_mode) ? "(o)" : "( )";
+                const char* radio = (i == temp_mode) ? "(*)" : "( )";
                 dn_puts(left+3, ry, radio, fg, bg);
                 dn_puts(left+8, ry, modes[i][0], fg, bg);
                 dn_puts(left+21, ry, modes[i][1], is_cur ? fg : FG(8), bg);
@@ -3013,7 +3011,7 @@ static void choose_play_mode(void){
         if(code==SC_SPACE){
             if(rising){
                 if(focus == 0){
-                    opt_playmode = temp_mode; result = 1;
+                    temp_mode = choice;
                 } else if(focus == 1) {
                     opt_playmode = temp_mode; result = 1;
                 } else if(focus == 2) {
