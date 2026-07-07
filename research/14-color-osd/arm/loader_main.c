@@ -2956,11 +2956,11 @@ static void do_player_pause(void){
     }
 }
 static void choose_play_mode(void){
-    int W=40, H=10, left=(DN_COLS-W)/2, top=(DN_ROWS-H)/2;
-    int focus=opt_playmode, result=-1;
+    int W=46, H=11, left=(DN_COLS-W)/2, top=(DN_ROWS-H)/2, brow=top+8;
+    int choice=opt_playmode, focus=0, result=-1;   /* focus: 0=RadioGroup, 1=OK, 2=Cancel */
     box_backup(&g_bs[0], left, top, W+2, H+1);
     dn_win_draw(left,top,W,H,"Play Mode");
-    { static const char* const kb[2][2]={{"Enter","Select"},{"Esc","Cancel"}}; dn_keybar(kb,2); }
+    { static const char* const kb[3][2]={{"Enter","OK"},{"Tab","Next"},{"Esc","Cancel"}}; dn_keybar(kb,3); }
     static const char* const modes[5][2] = {
         {"FOLDER",      "Play folder once"},
         {"FILE",        "Play track once"},
@@ -2968,21 +2968,26 @@ static void choose_play_mode(void){
         {"FILE LOOP",   "Repeat track"},
         {"RANDOM",      "Random shuffle"}
     };
-    int drawn = -1;
+    int drawn = -1, old_focus = -1;
     while(result<0){
-        if(focus != drawn){
-            drawn = focus;
+        if(choice != drawn || focus != old_focus){
+            drawn = choice; old_focus = focus;
             for(int i=0;i<5;i++){
                 int ry = top+2+i;
-                int is_sel = (i == focus);
-                uint32_t fg = is_sel ? DNK_CUR_FG : DNK_DLG_FG;
-                uint32_t bg = is_sel ? DNK_CUR_BG : DNK_DLG_BG;
+                int is_cur = (focus == 0 && i == choice);
+                uint32_t fg = is_cur ? DNK_CUR_FG : DNK_DLG_FG;
+                uint32_t bg = is_cur ? DNK_CUR_BG : DNK_DLG_BG;
                 dn_fill(left+1, ry, W-2, 1, bg);
-                const char* marker = (i == opt_playmode) ? "►" : " ";
-                dn_puts(left+2, ry, marker, fg, bg);
-                dn_puts(left+4, ry, modes[i][0], fg, bg);
-                dn_puts(left+17, ry, modes[i][1], is_sel ? fg : FG(8), bg);
+                const char* radio = (i == choice) ? "(o)" : "( )";
+                dn_puts(left+3, ry, radio, fg, bg);
+                dn_puts(left+8, ry, modes[i][0], fg, bg);
+                dn_puts(left+21, ry, modes[i][1], is_cur ? fg : FG(8), bg);
             }
+            dn_fill(left+1, brow, W-2, 2, DNK_DLG_BG);
+            int bw = 10, gap = 4, total = (bw+1) + gap + (bw+1);
+            int bx = left + (W - total)/2;
+            dn_button(bx,              brow, "OK",     focus!=2, bw);
+            dn_button(bx + bw+1 + gap, brow, "Cancel", focus==2, bw);
         }
         KBD_HB=1; player_pump(); pump_autoadvance();
         uint32_t d=KBD_DATA;
@@ -2993,9 +2998,52 @@ static void choose_play_mode(void){
         uint32_t code=d&0xFFu; int rel=(d&0x200u)!=0; int rising=kbd_note(code,rel);
         if(code==0xF0u||code==0xE0u || rel) continue;
         if(code==SC_ESC){ if(rising) result=0; continue; }
-        if(code==SC_ENTER||code==SC_SPACE){ if(rising){ opt_playmode=focus; result=1; } continue; }
-        if(code==SC_UP){   if(rising){ focus--; if(focus<0) focus=4; } continue; }
-        if(code==SC_DOWN){ if(rising){ focus++; if(focus>4) focus=0; } continue; }
+        if(code==SC_ENTER){
+            if(rising){
+                if(focus == 2) result=0;
+                else { opt_playmode=choice; result=1; }
+            }
+            continue;
+        }
+        if(code==SC_SPACE){
+            if(rising){
+                if(focus == 1 || focus == 0) { opt_playmode=choice; result=1; }
+                else if(focus == 2) { result=0; }
+            }
+            continue;
+        }
+        if(code==0x0Du){   /* Tab key: move focus */
+            if(rising) focus = (focus+1)%3;
+            continue;
+        }
+        if(code==SC_UP){
+            if(rising){
+                if(focus == 0){ choice--; if(choice<0) choice=4; }
+                else { focus=0; }
+            }
+            continue;
+        }
+        if(code==SC_DOWN){
+            if(rising){
+                if(focus == 0){ choice++; if(choice>4) choice=0; }
+                else { focus=0; }
+            }
+            continue;
+        }
+        if(code==SC_LEFT){
+            if(rising){
+                if(focus == 2) focus=1;
+                else if(focus == 1) focus=2;
+            }
+            continue;
+        }
+        if(code==SC_RIGHT){
+            if(rising){
+                if(focus == 1) focus=2;
+                else if(focus == 2) focus=1;
+            }
+            continue;
+        }
     }
     box_restore(&g_bs[0]);
     dn_keybar_browser();
