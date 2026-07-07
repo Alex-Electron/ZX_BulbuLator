@@ -2962,7 +2962,7 @@ static void choose_play_mode(void){
     int focus=0, result=-1;         /* focus: 0=RadioGroup, 1=OK, 2=Cancel */
     box_backup(&g_bs[0], left, top, W+2, H+1);
     dn_win_draw(left,top,W,H,"Play Mode");
-    { static const char* const kb[3][2]={{"Enter","OK"},{"Tab","Next"},{"Space","Select"}}; dn_keybar(kb,3); }
+    { static const char* const kb[3][2]={{"Enter","OK"},{"Tab","Next"},{"Esc","Cancel"}}; dn_keybar(kb,3); }
     static const char* const modes[5][2] = {
         {"FOLDER",      "Play folder once"},
         {"FILE",        "Play track once"},
@@ -2972,6 +2972,9 @@ static void choose_play_mode(void){
     };
     int old_choice = -1, old_temp = -1, old_focus = -1;
     while(result<0){
+        /* RadioButtons canon: temp_mode always follows cursor (choice) when RadioGroup is focused */
+        if(focus == 0) temp_mode = choice;
+
         if(choice != old_choice || temp_mode != old_temp || focus != old_focus){
             old_choice = choice; old_temp = temp_mode; old_focus = focus;
             for(int i=0;i<5;i++){
@@ -3010,7 +3013,7 @@ static void choose_play_mode(void){
         if(code==SC_SPACE){
             if(rising){
                 if(focus == 0){
-                    temp_mode = choice;
+                    opt_playmode = temp_mode; result = 1;
                 } else if(focus == 1) {
                     opt_playmode = temp_mode; result = 1;
                 } else if(focus == 2) {
