@@ -522,7 +522,7 @@ static void browser_status(const char* s){   /* transient feedback (MOUNT/READ/F
 /* Title screen (shown when the OSD opens with F12): just the name, centred, scale 2. */
 /* Firmware build tag shown on the F12 splash (bump per milestone). The PL core VERSION
    (0x4000_0000) is shown live too, so the splash states exactly which firmware + bitstream run. */
-#define BULB_FW "v0.14.53"
+#define BULB_FW "v0.14.54"
 static char hexnib(uint32_t v){ return (v<10) ? ('0'+v) : ('A'+v-10); }
 /* Single source of truth for the version line ("v0.13 core 0xB01B0013"): the ARM firmware tag
    BULB_FW + the live PL core VERSION read from register 0x00. Used by BOTH the F12 splash
@@ -2011,7 +2011,7 @@ typedef struct { const char* title; Menu* menu; } BarItem; /* title carries ~hot
 
 enum { /* app commands (loader) */
   cmFileLoad = 100, cmFileUp, cmFileRename, cmFileMkdir, cmFileDelete, cmFileCopy, cmFileSort, cmFileRev,
-  cmPlayStart, cmPlayStop, cmPlayPause,
+  cmPlayStart, cmPlayStop, cmPlayPause, cmPlayMode,
   cmTapePlay, cmTapeStop,
   cmOptSettings, cmOptSave, cmOptEject,
   cmHelpAbout, cmHelpKeys
@@ -2036,7 +2036,7 @@ static const MenuItem mi_play[] = {
   {"S~t~op",    cmPlayStop,  0, "BkSp"},
   {"~P~ause",   cmPlayPause, 0, "Space"},
   {NULL},
-  {"~M~ode",    0, 0, "F2", NULL, &opt_items[4]},               /* value-item: PLAY MODE (index 4) */
+  {"~M~ode",    cmPlayMode,  0, "F2"},
 };
 static Menu m_play = { mi_play, 5, 0 };
 
@@ -2955,6 +2955,55 @@ static void do_player_pause(void){
         }
     }
 }
+static void choose_play_mode(void){
+    int W=40, H=10, left=(DN_COLS-W)/2, top=(DN_ROWS-H)/2;
+    int focus=opt_playmode, result=-1;
+    box_backup(&g_bs[0], left, top, W+2, H+1);
+    dn_win_draw(left,top,W,H,"Play Mode");
+    { static const char* const kb[2][2]={{"Enter","Select"},{"Esc","Cancel"}}; dn_keybar(kb,2); }
+    static const char* const modes[5][2] = {
+        {"FOLDER",      "Play folder once"},
+        {"FILE",        "Play track once"},
+        {"FOLDER LOOP", "Repeat folder"},
+        {"FILE LOOP",   "Repeat track"},
+        {"RANDOM",      "Random shuffle"}
+    };
+    int drawn = -1;
+    while(result<0){
+        if(focus != drawn){
+            drawn = focus;
+            for(int i=0;i<5;i++){
+                int ry = top+2+i;
+                int is_sel = (i == focus);
+                uint32_t fg = is_sel ? DNK_CUR_FG : DNK_DLG_FG;
+                uint32_t bg = is_sel ? DNK_CUR_BG : DNK_DLG_BG;
+                dn_fill(left+1, ry, W-2, 1, bg);
+                const char* marker = (i == opt_playmode) ? "►" : " ";
+                dn_puts(left+2, ry, marker, fg, bg);
+                dn_puts(left+4, ry, modes[i][0], fg, bg);
+                dn_puts(left+17, ry, modes[i][1], is_sel ? fg : FG(8), bg);
+            }
+        }
+        KBD_HB=1; player_pump(); pump_autoadvance();
+        uint32_t d=KBD_DATA;
+        if(d&0x100u){
+            bg_pump();
+            continue;
+        }
+        uint32_t code=d&0xFFu; int rel=(d&0x200u)!=0; int rising=kbd_note(code,rel);
+        if(code==0xF0u||code==0xE0u || rel) continue;
+        if(code==SC_ESC){ if(rising) result=0; continue; }
+        if(code==SC_ENTER||code==SC_SPACE){ if(rising){ opt_playmode=focus; result=1; } continue; }
+        if(code==SC_UP){   if(rising){ focus--; if(focus<0) focus=4; } continue; }
+        if(code==SC_DOWN){ if(rising){ focus++; if(focus>4) focus=0; } continue; }
+    }
+    box_restore(&g_bs[0]);
+    dn_keybar_browser();
+    if(result==1){
+        g_music_last_pct=0xFFFFFFFFu; g_music_last_sec=0xFFFFFFFFu;
+        dn_status_msg(CH_PLAY[opt_playmode]);
+    }
+}
 static void app_dispatch(int cmd){
     switch(cmd){
         case cmFileLoad:
@@ -2995,6 +3044,9 @@ static void app_dispatch(int cmd){
             break;
         case cmPlayPause:
             do_player_pause();
+            break;
+        case cmPlayMode:
+            choose_play_mode();
             break;
         case cmTapeStop:
             tape_stop();
@@ -3476,6 +3528,8 @@ void main(void){
             case SC_DOWN:  if(browser_on) browser_move(+1); break;
             case SC_PGUP:  if(browser_on) browser_move(-BROWS); break;       /* fast page scroll */
             case SC_PGDN:  if(browser_on) browser_move(+BROWS); break;
+            case SC_HOME:  if(browser_on) browser_move(-fcount); break;      /* Home: jump to first item */
+            case SC_END:   if(browser_on) browser_move(fcount); break;       /* End: jump to last item */
             case SC_ENTER: if(rising && browser_on) browser_enter(); break;  /* single-shot: load/enter */
             case SC_F3:    if(rising && browser_on){
                               if(kb_alt) g_sort_desc = !g_sort_desc;                /* Alt+F3: reverse direction */
