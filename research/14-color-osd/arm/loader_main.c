@@ -3003,8 +3003,16 @@ static void choose_play_mode(void){
         if(code==SC_ESC){ if(rising) result=0; continue; }
         if(code==SC_ENTER){
             if(rising){
-                if(focus == 2) result=0;
-                else { opt_playmode=temp_mode; result=1; }
+                if(focus == 2) {
+                    result=0;
+                } else if(focus == 0) {
+                    temp_mode = choice;
+                    opt_playmode = temp_mode;
+                    result = 1;
+                } else {
+                    opt_playmode = temp_mode;
+                    result = 1;
+                }
             }
             continue;
         }
