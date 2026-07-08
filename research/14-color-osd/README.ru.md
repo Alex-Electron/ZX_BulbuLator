@@ -136,7 +136,7 @@ Languages: [English](README.md) · **Русский**
 
 ## Сборка, прошивка, запуск
 
-**Собери битстрим.** `./build.sh` → `sources/build/bulbulator_zx_loader.bit`. На этом этапе в структуру добавляются считыватель цветного OSD для DDR (`osd_ddr_rd`), изменения композитора и кассетный проигрыватель (`tape_player.v`).
+**Собери битстрим.** `./build.sh` → `sources/build/bulbulator_zx_loader.bit`. На этом шаге в фабрику добавляются DDR-считыватель цветного OSD (`osd_ddr_rd`), правки композитора и кассетная станция (`tape_player.v`). А ещё `assemble.sh` накладывает наш патч watchdog-ресинка PS/2 (`third_party/atlas-zx-ps2-watchdog/ps2.v`) поверх скачанного ядра Atlas — так чистый клон пересобирает ровно тот битстрим, что стоит на плате.
 
 **Скомпилируй приложение для ARM.** `cd arm && ./build_loader.sh` → `loader.elf`. Оно компилируется с использованием рабочей области Vitis BSP, подключает FatFs (xilffs), драйвер SD (`xsdps`), AYUMI, minimp3 и ресемплер speexdsp, а также использует настраиваемый файл `lscript.ld`, который включает D-кеш и резервирует некешируемое окно DDR для холста.
 

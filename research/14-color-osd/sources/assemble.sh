@@ -34,6 +34,12 @@ rm -rf "$B"; mkdir -p "$B"
 ln -sfn "$REPO/cores/zx"   "$B/zx"
 ln -sfn "$REPO/cores/hdmi" "$B/hdmi"
 
+# --- PS/2 watchdog-resync patch: overlay our patched ps2.v onto the fetched Atlas core so a clean
+#     clone reproduces the on-hardware "no fuzzy keys" fix. get_deps fetches the core UNpatched, so
+#     we vendor just this one file (third_party/atlas-zx-ps2-watchdog/) and copy it in here. Idempotent:
+#     re-running get_deps reverts the core, and the next assemble re-applies this. ---
+cp "$REPO/third_party/atlas-zx-ps2-watchdog/ps2.v" "$REPO/cores/zx/src/ps2.v"
+
 # --- base glue, unchanged since Step 6 ---
 cp "$S6/clock_zx.v" "$S6/mem_zx.v" "$S6/kbd_buttons.v" "$S6/hdmi_wrap.sv" \
    "$S6/get_rom.sh" "$B/"

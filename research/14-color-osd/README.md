@@ -136,7 +136,7 @@ The AXI control plane grows the true-colour OSD and tape-station registers; the 
 
 ## Build, flash, run
 
-**Build the bitstream.** `./build.sh` → `sources/build/bulbulator_zx_loader.bit`. This step adds the DDR colour-OSD reader (`osd_ddr_rd`), the compositor changes, and the tape station (`tape_player.v`) to the fabric.
+**Build the bitstream.** `./build.sh` → `sources/build/bulbulator_zx_loader.bit`. This step adds the DDR colour-OSD reader (`osd_ddr_rd`), the compositor changes, and the tape station (`tape_player.v`) to the fabric. `assemble.sh` also overlays our PS/2 watchdog-resync patch (`third_party/atlas-zx-ps2-watchdog/ps2.v`) onto the fetched Atlas core, so a clean clone rebuilds the exact bitstream that runs on the board.
 
 **Build the ARM app.** `cd arm && ./build_loader.sh` → `loader.elf`. It builds against a Vitis BSP workspace, links FatFs (xilffs), the SD driver (`xsdps`), AYUMI, minimp3, and the speexdsp resampler, and uses the custom `lscript.ld` that enables D-cache and reserves the non-cacheable DDR window for the canvas.
 
