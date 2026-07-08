@@ -6,6 +6,10 @@ Languages: [English](README.md) · **Русский**
 
 Разработчик: Александр Лавринович<br> GitHub: https://github.com/Alex-Electron<br> Электронная почта: lavrinovich.alex@gmail.com<br> Соавтор: ИИ<br> Русский перевод: DeepL<br> Telegram: https://t.me/zx_bulbulator
 
+Если проект вам понравился, будет очень приятно, если вы угостите меня чашечкой кофе:
+
+[![ko-fi](https://ko-fi.com/img/githubbutton_sm.svg)](https://ko-fi.com/G2F222TXLI)
+
 Аппаратный эмулятор ZX Spectrum на SoC Xilinx Zynq: запусти открытое ядро ZX Spectrum на недорогой и легко доступной плате EBAZ4205, при этом адаптировав его под архитектуру Xilinx. Опубликованная сборка работает на открытом ядре **Atlas `zx`**; ядра MiST / MiSTer остаются в качестве запасного варианта для машин, которые не поддерживает Atlas.
 
 ![Плата EBAZ4205, подключённая к расширению с HDMI/аудио и кнопками](docs/images/board.jpg)
