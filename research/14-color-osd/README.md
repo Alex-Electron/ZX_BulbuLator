@@ -1,87 +1,170 @@
-# Step 13 — Player: Universal ARM music synthesis over HDMI
+# Step 14 — Colour OSD: the ZX-BulboNavigator
 
 Languages: **English** · [Русский](README.ru.md)
 
-![The OSD file browser playing a .psg file, indicated by the play icon in the title bar](images/player-step13.jpg)
+![The ZX-BulboNavigator: a true-colour, DOS Navigator-style file manager running on the ARM control plane over the live Spectrum screen](images/navigator-step14.jpg)
 
-*A `.psg` track selected in the F5 browser. The ARM processor parses the file, soft-synthesises the AY-3-8910 chip, and streams PCM audio directly to the HDMI FIFO, while the ZX Spectrum core runs (or sits idle) in the background.*
+*The ZX-BulboNavigator over a running ZX Spectrum 128K core. A true-colour 80×25 text OSD, drawn entirely by the idle ARM core, hosts a DOS Navigator-style file manager, a universal tape station, and a music player. The Spectrum's own 128 menu is visible behind the overlay — the core keeps running; the OSD does not halt it.*
 
-Step 12 gave us a snapshot loader. But retro computers have an amazing music scene, and enjoying that music shouldn't require loading a specific player application inside the Spectrum itself. This step introduces a universal, machine-agnostic retro music player built directly into the ARM control plane. 
+Steps 10–13 grew a control plane on the ARM side: a 1-bpp "toast" overlay, a file browser, a snapshot loader, and a universal music player. They all shared one limitation — a monochrome 256×128 strip of distributed RAM. Step 14 retires that strip and gives the control plane a real screen: a **true-colour, 80×25 text OSD** backed by DDR, and on top of it a complete **DOS Navigator-style operating environment** — the **ZX-BulboNavigator**.
 
-For the MVP, we start with `.psg` files (raw AY-3-8910 register dumps). Press **Enter** on a `.psg` file in the browser, and it plays over the HDMI output.
+It all runs on the otherwise-idle Cortex-A9. The Spectrum core keeps executing underneath; the OSD is an overlay, not a halt. And, as with every step, the design is machine-agnostic: the browser, the tape station, and the player know nothing about the ZX. They talk to a stable AXI contract, so the same environment will sit over a future NES or C64 core unchanged.
 
-## Why software synthesis?
+## The true-colour OSD canvas
 
-Initially, the plan was to inject AY register states from the file directly into the FPGA's real AY chip over the AXI bus (similar to how RAM is injected in Step 12). However, an architectural decision was made to take a different route: **the ARM software-emulates the sound chips and outputs raw PCM to the HDMI interface.**
+The old 1-bpp panel is replaced by an **ARGB8888 canvas, 640×400 pixels, arranged as 80×25 character cells** with an 8×16 VGA font. The font is CP866 (Terminus, OFL): ASCII, the full DOS box-drawing set, and Cyrillic, so the navigator can draw authentic double-line frames and Russian text.
 
-Why this architecture?
-- **No injection artifacts:** The core's real AY chip is left alone. We avoid state conflicts and squeals caused by fighting the Z80 for register access.
-- **Machine agnostic:** The audio plays over HDMI regardless of what core is loaded. It will work even if you switch the FPGA to an NES or C64 core later.
-- **Scalability:** It easily extends to formats the ZX core hardware lacks. Tracker modules (`.pt3`, `.mod`) and even General Sound (which would otherwise require its own Z80 and RAM in the FPGA) can be fully emulated on the idle ARM core.
+- The canvas lives in a **1 MB-aligned, non-cacheable DDR window** at `0x0F800000` (inside the `NC_BASE` region reserved by `lscript.ld`). Because the window is marked non-cacheable at boot, ARM writes are coherent with the fabric with no per-frame cache flush.
+- A new fabric reader, **`osd_ddr_rd`**, streams the canvas over **AXI-HP1** and hands pixels to **`osd_compositor`**, which alpha-blends them over the live HDMI scanout per pixel. Window shadows are translucent (`0x80` alpha), dialog bodies are opaque, and the whole layer's dim/opacity and position are adjustable from the Options menu.
+- **`OSD_CTRL` bit 1** enables the colour layer; **F8** toggles it and **F12** shows/hides the navigator.
+- The golden rule of the whole OSD: **incremental redraw only.** A full-screen repaint flickers, so only the rows that change are redrawn (`dn_draw_file_row`); a full render happens only when a modal dialog closes.
 
-## How it works: AYUMI + D-Cache + AXI FIFO
+## The BulboNavigator file browser
 
-The player pipeline consists of several key components:
+The browser follows DOS Navigator closely. Columns are **Name / Ext / Size / Date**; the header highlights the active sort field and shows an up/down direction arrow. A Turbo Vision-style scrollbar (arrows + proportional thumb) rides the right frame column. Folders can be styled with brackets, an icon, or a trailing slash, and the cursor row marquees any name too long to fit.
 
-1. **AYUMI Soft-Synth:** We use the MIT-licensed AYUMI library, a highly accurate AY/YM software synthesizer. The ARM parses the `.psg` frames and feeds the 14 AY registers into AYUMI's state machine.
-2. **D-Cache Foundation:** To make software synthesis run in real-time on the 666 MHz Cortex-A9, Data Cache (D-cache) is enabled. A custom linker script (`lscript.ld`) reserves a non-cacheable window at the top of DDR for the framebuffer and DMA, allowing the player application to run ~10x faster from cache without causing visual tearing or memory corruption.
-3. **Tempo Lock:** The `player_pump()` function is called cooperatively in the main OSD loop. To prevent the song from sprinting ahead or dragging behind, the tempo is strictly locked to the real-time wall-clock (`XTime`) at the HDMI audio rate (47996 Hz), not to how fast the CPU can render.
-4. **AXI Audio FIFO:** The ARM pushes 32-bit signed stereo samples `{R[15:0], L[15:0]}` to a new hardware FIFO in the PL.
+- **Sort** (DOS Navigator hotkeys): `Ctrl+F3` name, `Ctrl+F4` extension, `Ctrl+F5` size, `Ctrl+F6` date. Pressing the same field again reverses the order. A `Files → Sort` dialog offers the same field + a Descending checkbox.
+- **Navigation**: arrows, `PgUp`/`PgDn`, `Home`/`End` (jump to the first/last entry), the `..` row goes up. `Enter` opens a folder or launches a file, dispatched by extension — a `.z80`/`.sna` snapshot (the Step 12 loader), a `.tap`/`.tzx`/`.wav`/`.mp3` tape, or a `.psg`/`.mp3`/`.wav` tune.
+- **Group tagging**: `Insert` tags an entry (yellow) and steps the cursor down. `Space` is reserved for player pause, so it no longer tags.
+- **Group selection by mask** (DOS Navigator's Gray `+`/`-`/`*`, here on `Shift`+numpad so the bare numpad keys stay free for volume): `Shift+KP +` tags every match of a mask, `Shift+KP -` untags, `Shift+KP *` inverts the selection. The mask engine is a practical DN subset — `*` and `?`, case-insensitive, comma/semicolon lists (`*.tap,*.tzx`), a leading `-` to negate (`*.* -*.tmp`), and `*.*` also matches extensionless names.
+
+Keys are dependable now: the main loop and every dialog read through one shared key-state table, and the PS/2 line has a watchdog that resyncs on a mid-byte timeout. The old "fuzzy keys, a hotkey needs three tries" behaviour is gone.
+
+## File operations and the Copy/Move dialog
+
+The panel does real work on the SD card (FatFs, long file names up to 255 characters, D-cache on):
+
+- **`F5` Copy**, **`F6` Rename/Move** (Total Commander style — the field is pre-filled with the selected entry's full path; edit the name to rename, edit the folder to move), **`F7` MkDir** (creates a whole chain of directories), **`F8` / `Delete`** (recursive, with a double confirmation for a non-empty folder).
+- The full DOS Navigator **Copy/Move dialog** (78×15) replaces the old one-line prompt: a target-path field, a conflict-resolution radio group with six modes (**Overwrite / Append / Resume / Skip / Refresh / Ask**), and option checkboxes (check free space, remove source = turn Copy into Move, verify writes). One linear Tab ring, `Space` sets a radio or toggles a checkbox, `Enter` = OK, `Esc` = Cancel. `Ask` opens a per-file sub-dialog.
+- Both `F5` and `F6` feed a shared `cp`-style path resolver: `0:/dir/file` is absolute, `/dir` is relative to the drive root, a bare name lands in the current folder; a trailing `/`, an existing directory, or a multi-file group means "directory, keep the source names", otherwise the last component is a new name.
+
+Every dialog obeys the DOS Navigator look 1:1 — grey body, white double frame, black input fields, green buttons, red hotkey letters, and a fully opaque cursor (no game screen bleeding through a modal, and nothing from the panel underneath — like a scrolling long name — leaks through either). Input fields use a standard US keyboard layout, so you can type paths, names, and masks straight in (`Shift`+`8` gives `*`, and so on).
+
+## The menu bar and the options system
+
+Pressing `F9` (or clicking the green title) drops the DOS Navigator **menu bar**: **Files · Play · Tape · Options · Help**. Left/Right move between the top menus; `Enter`/Right opens a dropdown; Options has a nested **Settings** submenu. Live "value items" (a setting with its value shown inline) sit right in the menus, and the interaction is deliberate:
+
+- **Left/Right adjust a numeric (range) parameter in place** — volume, OSD dim, window position, MP3 sensitivity — with a fine step, and never leave the menu.
+- **A choice (NO/YES, play mode, …) is cycled only by `Space` or `Enter`**; Left/Right on a choice move between the top menus instead, so you can always navigate away.
+- **MP3 sens** is a wide range (0–4096), so instead of clicking through it, `Space`/`Enter` opens a dedicated **numeric-entry dialog with an inline explanation** of what the parameter does.
+
+All settings persist to **`0:/bulbulator.ini`**, written on `Options → Save`. Among them: scroll speed/delay, folder style, show-hidden, play mode, pause-on-music, on-launch behaviour, boot-navigator, volume, OSD dim, and window X/Y.
+
+## The tape station — a machine-agnostic PULSE loader
+
+Step 14 adds a real cassette station. It loads **`.tap` / `.tzx`** (standard ROM blocks and turbo/custom loaders), and also **digitised cassette recordings as `.wav` and `.mp3`** — the part that took the most work to get right.
+
+The design is the machine-agnostic **PULSE class** of the loader contract. The ARM owns all format knowledge and pushes a stream of `{level, duration-in-T-states}` pulses into an async FIFO; the fabric module **`tape_player.v`** replays them, clocked by the CPU's own T-state enable (`pe3M5_core`). Tape and CPU therefore advance in **exact lock-step** — a pause (HALT) freezes both, so a ROM, turbo, or custom loader's timing loops measure the pulses exactly as they would from a real tape. The fabric just times edges; it has no idea what a "pilot" is.
+
+- **The reader is a faithful model of the physical tape head**, not an equaliser: an AC-coupling capacitor (a gentle high-pass that strips any DC bias but keeps every fast edge), a Schmitt comparator with hysteresis, and sub-sample zero-cross interpolation for turbo timing. This is what lets a phone's MP3 of a cassette load at all.
+- **Pilot auto-detect** decides cassette-vs-music by scanning the start for a pilot tone. **`MP3/WAV as tape`** forces the tape path for turbo or clipped-pilot dumps the detector would miss.
+- On an MP3 load the station first **primes out the decoder's warm-up frame and settles the reader's DC** before the first pulse, so the pilot starts clean (no start-of-pilot click).
+- **`Tape Sound`** toggles the loading-tone monitor. **`Mute machine on load`** is a separate option that silences the *machine's own* audio during a load (the ZX ULA reproduces the ear signal on its beeper; authentic behaviour, but you can now switch it off) by routing the audio mux to the player. **`MP3 sens`** tunes the edge-detector hysteresis.
+- A **`T`** marker appears in the status row (where the music play-mode glyph sits) as soon as the audio is recognised as a cassette.
+- A quick stop (`Backspace`) **drains the pulse FIFO**, so an immediate restart always begins at the start of the file, never on a leftover pulse.
+
+## The music player
+
+The player from Step 13 is folded in and extended. It plays **`.psg`** (AYUMI soft-synthesised AY-3-8910), **`.mp3`** (minimp3), and **`.wav`** (PCM), resampling to the 47996 Hz HDMI audio rate (speexdsp), and streams PCM to the audio FIFO through the player mux (`AUDIO_CTRL`).
+
+- A **non-blocking ring buffer** keeps music playing straight through long file copies and deletes.
+- **Play modes** (`F2`, or `Play → Mode`): FOLDER, FILE, FOLDER LOOP, FILE LOOP, RANDOM.
+- **Non-blocking pause/resume** is bit-exact (AY registers, envelope, and noise LFSR survive the freeze — no click). A **launch-suspend** releases the mux back to the machine while keeping the track position.
+- **MP3 preload** (in the Play menu) loads the whole file into DDR so playback survives SD card garbage-collection stalls.
+- **Volume** is live on the numpad `+`/`-` (and in the Options menu): a 0..255 gain on the HDMI output, shown as `Vol:NN%` in the top bar.
+- A **status line** (row 22) shows the playing track with a play/pause glyph and the current play-mode; the top bar always carries the machine type and a green/red run/pause indicator.
+
+## Machine control and audio coordination
+
+- **Pause** (`F10` / PS/2 Pause) freezes the Spectrum without taking over the screen. A halt bitmask (manual pause / music-halt / SD-op freeze) owns the machine's clock and is cleared only manually.
+- **Pause on music** halts the machine while music plays; **On launch (music)** chooses MACHINE (suspend the music, machine is audible) or MUSIC (keep the music, machine muted) when a program is launched over playing music; **Boot nav** chooses whether the navigator appears at power-on or the machine boots straight through (with `F12` to enter later).
+- A large, transparent **PAUSE** sign (a bar symbol and the word at the same height, top-right, on a transparent background with no rectangle behind it) shows whenever the machine is frozen, on its own banner overlay.
+- **`F11`** is a hard reset of the machine; the video path is decoupled from the core reset.
 
 ## In the OSD
 
-- **Play/Pause**: Press **Enter** or **Space** on a `.psg` file in the F5 browser to start. **Space** toggles pause/resume.
-- **Stop**: Press **Backspace** to stop the player and hand audio control back to the FPGA core. **Esc** closes the OSD menu but lets the music keep playing in the background.
-- **Auto-advance**: The player automatically advances to the next track when reaching the end of the file.
-- **Indicator**: A small Play/Pause icon appears in the OSD title bar next to the firmware version.
+![The built-in F1 help: the full ZX-BulboNavigator hotkey list, scrollable, drawn over the browser](images/navigator-keys-step14.jpg)
 
-## Non-blocking pause and the status banner
+*Press F1 for the built-in hotkey reference.*
 
-**Pause** (the PS/2 **Pause** key, or **F10** as a fallback) freezes the Spectrum without taking over the screen. The Z80 and the sound chips stop mid-sample and the audio fades to silence, but the OSD, the browser, and any playing music stay usable. Resume continues bit-exact: the AY registers, envelope phase, and noise LFSR all survive the freeze, so there is no save/restore and no click. The Pause scancode is owned by the ARM and never leaks into the Spectrum's key matrix.
-
-A separate **status banner** (its own overlay layer, composited over the OSD output whether or not a menu is open) shows what is running: the currently-playing track, the loaded application with its full SD path, and a PAUSE marker when the machine is frozen. It has its own enable and position registers (`0x84`–`0x90`), so it is independent of the OSD panel.
-
-**F2** cycles the music play mode: **FOLDER** (play through the folder, then stop), **REPEAT-1** (loop the current track), and **REPEAT-ALL** (loop the folder). The mode persists in `bulbulator.ini`.
+| Key | Action |
+|---|---|
+| `↑ ↓ ← →`, `PgUp`/`PgDn` | Move in the list / adjust a numeric setting in a menu |
+| `Home` / `End` | Jump to the first / last entry |
+| `Enter` | Open a folder, run a file, or confirm a dialog |
+| `Space` | Pause/resume the player (freeze/thaw a tape load); cycle a value in a menu |
+| `Insert` | Tag an entry (and step down) |
+| `Shift`+numpad `+` / `-` / `*` | Select / unselect by mask / invert selection |
+| `Backspace` | Stop the player / tape |
+| `F1` | Help (scrollable hotkey list) |
+| `F2` | Play-mode dialog |
+| `Ctrl`+`F3…F6` | Sort by name / ext / size / date (repeat reverses) |
+| `F5` | Copy |
+| `F6` | Rename / Move |
+| `F7` | Make directory |
+| `F8` / `Delete` | Delete (recursive) |
+| `F9` | Menu bar |
+| `F10` / Pause | Pause the machine |
+| `F11` | Hard reset the machine |
+| `F12` | Show / hide the navigator |
+| `Esc` | Back / close a dialog |
+| numpad `+` / `-` | Volume |
 
 ## The control-plane registers
 
-The AXI control plane gains registers for the audio path, the F9 volume control, and the status banner; the version bumps to `0xB01B0013`:
+The AXI control plane grows the true-colour OSD and tape-station registers; the fabric version bumps to **`0xB01B0017`**:
 
 | Addr | Name | R/W | Meaning |
 |---|---|---|---|
-| `0x00` | `VERSION` | R | `0xB01B0013` |
-| `0x74` | `VOL` | W | HDMI output volume gain 0..255 (PCM * vol / 256; 255 ≈ unity) |
-| `0x78` | `AUDIO_CTRL` | W | bit 0 = Player Active (mux player PCM to HDMI, mute fabric audio) |
-| `0x7C` | `AUDIO_FIFO` | W | Push `{R[15:0], L[15:0]}` signed-16 PCM sample |
-| `0x80` | `AUDIO_STAT` | R | bit 0 = empty, bit 1 = full |
-| `0x84` | `BANNER_CTRL` | W | bit 0 = banner overlay enable (independent of the OSD) |
-| `0x88` | `BANNER_ADDR` | W | banner LUTRAM word pointer (auto-increments on each DATA write) |
-| `0x8C` | `BANNER_DATA` | W | 32 packed 1-bpp banner pixels -> buffer[ptr], ptr++ |
-| `0x90` | `BANNER_POS` | W | banner window position `{Y0[26:16], X0[10:0]}` |
-
-When the player is active (`AUDIO_CTRL = 1`), the bitstream's audio multiplexer selects the ARM's PCM stream over the fabric core's audio.
+| `0x00` | `VERSION` | R | `0xB01B0017` |
+| `0x04` | `IJ_CTRL` | W | bit 0 = HALT (freeze the machine's clock) |
+| `0x08` | `IJ_STAT` | R | bit 0 = HALT_ACK, bit 1 = RAM_BUSY |
+| `0x48` | `OSD_CTRL` | W | bit 0 = 1-bpp OSD enable, bit 1 = colour DDR OSD enable |
+| `0x54` | `KBD_DATA` | R | `{break[9], empty[8], code[7:0]}`; read pops the PS/2 FIFO |
+| `0x5C` | `KBD_HB` | W | deadman heartbeat (any write); the gate re-routes keys to the Z80 if the ARM stops kicking |
+| `0x60` | `MACHINE_ID` | R | loaded-core identity |
+| `0x6C` / `0x70` | `OSD_OP` / `OSD_POS` | W | 1-bpp OSD opacity / position |
+| `0x74` | `VOL` | W | HDMI output volume gain 0..255 |
+| `0x78` | `AUDIO_CTRL` | W | bit 0 = 1 mux the ARM player PCM to HDMI, 0 = fabric/machine audio |
+| `0x7C` / `0x80` | `AUDIO_FIFO` / `AUDIO_STAT` | W/R | push a `{R,L}` PCM sample / empty+full flags |
+| `0x84`–`0x90` | `BANNER_*` | W | independent status/PAUSE banner overlay (enable / addr / data / pos) |
+| `0x94` | `OSD_DDR_BASE` | W | DDR byte address of the ARGB8888 colour canvas |
+| `0x98` | `DDR_OSD_POS` | W | colour-OSD canvas position (independent of `OSD_POS`) |
+| `0x9C` | `TAPE_CTRL` | W | bit 0 run, bit 1 ear_mux, bit 2 mute |
+| `0xA0` | `TAPE_FIFO` | W | push `{level[31], duration[23:0] in T-states}` |
+| `0xA4` | `TAPE_STATUS` | R | bit 0 = FIFO full, bit 1 = playing |
 
 ## Build, flash, run
 
-**Build the bitstream.** `./build.sh` → `bulbulator_zx_loader.bit`. This step adds the audio FIFO and multiplexer logic to `sources/axi_ctl.v` and the top module.
+**Build the bitstream.** `./build.sh` → `sources/build/bulbulator_zx_loader.bit`. This step adds the DDR colour-OSD reader (`osd_ddr_rd`), the compositor changes, and the tape station (`tape_player.v`) to the fabric.
 
-**Build the ARM loader app.** `cd arm && ./build_loader.sh` → `loader.elf`. As in the earlier steps, this still builds against a Vitis BSP workspace, bringing in the D-Cache configurations and linking the FatFs (xilffs) and SD driver (`xsdps`) objects directly.
+**Build the ARM app.** `cd arm && ./build_loader.sh` → `loader.elf`. It builds against a Vitis BSP workspace, links FatFs (xilffs), the SD driver (`xsdps`), AYUMI, minimp3, and the speexdsp resampler, and uses the custom `lscript.ld` that enables D-cache and reserves the non-cacheable DDR window for the canvas.
 
-**Flash over JTAG and run.** `./loader_run.sh` PCAP-configures the bitstream onto the board (converting it to a `.bit.bin` via `bootgen` to avoid plain JTAG configuration errors, as in Steps 6–12), then stops, loads, and runs the compiled `arm/loader.elf` on Cortex-A9 #0.
+**Flash over JTAG and run.** The flash script PCAP-configures the bitstream (converting it to a `.bit.bin` via `bootgen`, as in Steps 6–13), then loads and runs `arm/loader.elf` on Cortex-A9 #0. The fabric version at register `0x00` should read `0xB01B0017`.
 
-**Boot from SD (no host, no JTAG).** Copy `flash/BOOT.BIN` onto the card's FAT `boot` partition, strap the board for SD boot, and power on. To rebuild `BOOT.BIN` yourself, run `flash/build_boot.sh` (which packages the FSBL, the new bitstream, and the loader app together, including the glibc bootgen segfault workaround).
+**Boot from SD (no host, no JTAG).** Package the FSBL, the bitstream, and the loader app into `BOOT.BIN` with `flash/build_boot.sh`, copy it to the card's FAT boot partition, strap for SD boot, and power on.
 
 ## Files
 
 ```
-sources/axi_ctl.v                  control plane + AUDIO registers (VERSION 0xB01B0013)
-sources/bulbulator_zx_ddr_top.v    full top: the Step 11/12 design + audio FIFO instantiation and HDMI mux
-arm/player.c                       the universal music player (machine-agnostic ARM soft-synth)
-arm/loader_main.c                  updated OSD app: F5 browser invokes player on .psg, draws icons
-arm/lscript.ld                     custom linker script enabling D-Cache
-arm/loader.elf                     prebuilt ARM app (firmware tag v0.13)
+sources/osd_ddr_rd.v               DDR->HDMI true-colour OSD reader (AXI-HP1)
+sources/osd_compositor.v           per-pixel alpha compositor + independent banner (transparent PAUSE)
+sources/tape_player.v              machine-agnostic PULSE tape replay (T-state lock-step, FIFO drain-on-stop)
+sources/bulbulator_zx_ddr_top.v    top level: colour OSD + tape station wired in (VERSION 0xB01B0017)
+sources/axi_ctl.v                  control plane: DDR-OSD + tape registers
+arm/loader_main.c                  the ZX-BulboNavigator (browser, dialogs, menus, tape station, options)
+arm/player.c                       universal music player (AY/PCM, mux, non-blocking ring)
+arm/mp3dec.c                       shared MP3 source (music + tape), with whole-file RAM preload
+arm/vga866.h                       CP866 VGA 8x16 font (ASCII + box-drawing + Cyrillic)
+arm/lscript.ld                     linker script: D-cache + non-cacheable DDR canvas window
+arm/loader.elf                     prebuilt ARM app (firmware tag v0.14.92)
+bulbulator_zx_loader.bit           prebuilt bitstream (0xB01B0017)
 flash/BOOT.BIN                     ready SD image (FSBL + bitstream + loader app)
-bulbulator_zx_loader.bit           prebuilt bitstream
 ```
 
-*(Note: The AYUMI library source (`ayumi.c`, `ayumi.h`) is integrated into the `third_party/ayumi/` directory. It is a highly accurate emulation of the AY-3-8910 / YM2149 sound chips written by **Peter Sovietov** ([true-grue/ayumi](https://github.com/true-grue/ayumi), MIT License).)*
+## Credits
+
+- **AYUMI** — accurate AY-3-8910 / YM2149 emulation by **Peter Sovietov** ([true-grue/ayumi](https://github.com/true-grue/ayumi), MIT).
+- **minimp3** — public-domain MP3 decoder by **lieff** ([lieff/minimp3](https://github.com/lieff/minimp3), CC0).
+- **speexdsp** resampler — Xiph.Org / Jean-Marc Valin (BSD).
+- The OSD's look, dialogs, and keyboard follow **DOS Navigator** (RIT Research Labs) as the visual reference; the CP866 cell font is **Terminus** (OFL).

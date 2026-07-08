@@ -26,6 +26,9 @@ int  player_active(void);
 void player_stop(void);
 void player_pause_toggle(void);   /* Space: pause/resume transport */
 int  player_paused(void);         /* 1 = paused */
+void player_suspend(void);          /* launch-suspend: pause + release the mux to the machine (position kept) */
+void player_resume_suspended(void); /* re-engage the mux + fade back in from the held position */
+int  player_suspended(void);        /* 1 = launch-suspended */
 int  player_take_ended(void);     /* consume-once: 1 if the track just reached EOF (auto-advance) */
 unsigned player_elapsed_s(void);  /* seconds played so far */
 unsigned player_total_s(void);    /* total track duration (pre-scanned, ZXTune method) */
@@ -68,6 +71,7 @@ unsigned player_progress(void);   /* 0..100 playback progress */
 #define TAPE_CTRL   (*(volatile uint32_t*)(GP0+0x9C))  /* bit0 run, bit1 ear_mux, bit2 mute */
 #define TAPE_FIFO   (*(volatile uint32_t*)(GP0+0xA0))  /* push {level[31], duration[23:0] in T-states} */
 #define TAPE_STATUS (*(volatile uint32_t*)(GP0+0xA4))  /* bit0 = FIFO full, bit1 = playing */
+#define AUDIO_CTRL  (*(volatile uint32_t*)(GP0+0x78))  /* bit0: 1=player mux->HDMI, 0=fabric/machine. Also owned by player.c; we drive it only while a tape loads (player is stopped then) */
 #define TAPE_HZ 3546900u   /* ZX128 T-state rate -> tape time in seconds = T_states / TAPE_HZ */
 #define VZ_X 24         /* visualiser field (spectrum); reused for the load % (no spectrum during a load) */
 #define VZ_Y 43
@@ -113,6 +117,7 @@ unsigned player_progress(void);   /* 0..100 playback progress */
 #define SC_SPACE 0x29u   /* PS/2 set-2 Space: player pause/resume (while OSD open) */
 #define SC_F2    0x06u   /* PS/2 set-2 F2: cycle the music play mode (FOLDER / REPEAT-1 / REPEAT-ALL) */
 #define SC_F3    0x04u   /* PS/2 set-2 F3: cycle the browser sort mode (only while browsing) */
+#define SC_F4    0x0Cu   /* Ctrl+F4 = sort by extension (DN sort hotkey) */
 #define SC_F9    0x01u   /* PS/2 set-2 F9: open/close the options (settings) menu */
 #define SC_LEFT  0x6Bu   /* cursor left  (E0 prefix stripped by ARM) / numpad 4 */
 #define SC_RIGHT 0x74u   /* cursor right (E0 prefix stripped by ARM) / numpad 6 */
@@ -127,6 +132,7 @@ unsigned player_progress(void);   /* 0..100 playback progress */
 #define SC_F11   0x78u   /* hard reset (fabric-decoded); ARM taps it to mark the loaded app STOPPED */
 #define SC_KPPLUS  0x79u /* numpad + : volume up   (conflict-free; ZX has no numpad) */
 #define SC_KPMINUS 0x7Bu /* numpad - : volume down */
+#define SC_KPMUL   0x7Cu /* numpad * : Shift = invert selection */
 #define SC_HOME    0x6Cu /* Home (E0 6C, prefix stripped) */
 #define SC_END     0x69u /* End (E0 69, prefix stripped) */
 
@@ -431,12 +437,12 @@ static int dn_button(int cx,int cy,const char* lab,int def,int minface){
 }
 /* TCluster-style widgets: radio "( )/(•)" and checkbox "[ ]/[X]". foc = highlighted (cursor), dis = greyed. */
 static void dn_radio(int cx,int cy,const char* lab,int sel,int foc,int dis){
-    uint32_t fg=dis?FG(8):(foc?DNK_CUR_FG:DNK_DLG_FG), bg=foc?DNK_CUR_BG:DNK_DLG_BG;
-    dn_putc(cx,cy,'(',fg,bg); dn_putc(cx+1,cy, sel?0x07:' ', fg, bg); dn_putc(cx+2,cy,')',fg,bg); dn_putc(cx+3,cy,' ',fg,bg);
+    uint32_t fg=dis?FG(8):(foc?DNK_CUR_FG:DNK_DLG_FG), bg=foc?FG(3):DNK_DLG_BG;   /* modal cursor = opaque cyan (FG3, not translucent BG3) */
+    dn_putc(cx,cy,'(',fg,bg); dn_putc(cx+1,cy, sel?'*':' ', fg, bg); dn_putc(cx+2,cy,')',fg,bg); dn_putc(cx+3,cy,' ',fg,bg);
     dn_puts(cx+4,cy,lab,fg,bg);
 }
 static void dn_check(int cx,int cy,const char* lab,int on,int foc,int dis){
-    uint32_t fg=dis?FG(8):(foc?DNK_CUR_FG:DNK_DLG_FG), bg=foc?DNK_CUR_BG:DNK_DLG_BG;
+    uint32_t fg=dis?FG(8):(foc?DNK_CUR_FG:DNK_DLG_FG), bg=foc?FG(3):DNK_DLG_BG;   /* modal cursor = opaque cyan (FG3, not translucent BG3) */
     dn_putc(cx,cy,'[',fg,bg); dn_putc(cx+1,cy, on?'X':' ', fg, bg); dn_putc(cx+2,cy,']',fg,bg); dn_putc(cx+3,cy,' ',fg,bg);
     dn_puts(cx+4,cy,lab,fg,bg);
 }
@@ -522,7 +528,7 @@ static void browser_status(const char* s){   /* transient feedback (MOUNT/READ/F
 /* Title screen (shown when the OSD opens with F12): just the name, centred, scale 2. */
 /* Firmware build tag shown on the F12 splash (bump per milestone). The PL core VERSION
    (0x4000_0000) is shown live too, so the splash states exactly which firmware + bitstream run. */
-#define BULB_FW "v0.14.56"
+#define BULB_FW "v0.14.92"
 static char hexnib(uint32_t v){ return (v<10) ? ('0'+v) : ('A'+v-10); }
 /* Single source of truth for the version line ("v0.13 core 0xB01B0013"): the ARM firmware tag
    BULB_FW + the live PL core VERSION read from register 0x00. Used by BOTH the F12 splash
@@ -584,6 +590,14 @@ static uint64_t count_tree(char* path);      /* total bytes under a folder (prog
 static int copy_move_run(char* src, char* dst, int isdir, uint64_t total, int removesrc, const char* title);
 static int  selcount(void);                  /* # of tagged (Space) entries, excl ".." */
 static void group_copy_move(int removesrc, const char* title);   /* group copy/move to a folder */
+static int  copy_move_dialog(char* dst, int dstsz, int* removesrc, int* checkfree, const char* deftitle);  /* shared DN Copy/Move dialog */
+
+/* Copy/Move conflict-resolution mode + options (issue #19): set by the shared dialog, read by copy_file_pg. */
+enum { CPM_OVERWRITE=0, CPM_APPEND, CPM_RESUME, CPM_SKIP, CPM_REFRESH, CPM_ASK };
+static int g_copy_mode   = CPM_OVERWRITE;   /* radio: how to resolve an existing target */
+static int g_copy_verify = 0;               /* checkbox: byte-for-byte read-back after a full copy */
+static int g_copy_askall = -1;              /* Ask mode: latched "for all" action (-1 = ask each conflict) */
+static int g_copy_defmode = CPM_ASK;        /* dialog's remembered default radio (starts on Ask) */
 static void open_help(void);
 static void run_menu_system(void);
 static uint32_t fsz[MAXFILES];          /* file size in bytes (0 for dirs / "..") */
@@ -612,11 +626,15 @@ static const char* const CH_PLAY[] = {"FOLDER","FILE","FOLDER LOOP","FILE LOOP",
 static int   playing_idx     = -1;       /* flist index of the currently-playing track (-1 = none) */
 static char  play_dir[80]    = "";       /* folder (curpath) where the current playback started (auto-advance scope) */
 static int   opt_pausemusic  = 0;        /* 0=NO (game runs in background, audio muted by FIFO mux) 1=YES (HALT when music plays over a game) */
+static int   opt_launchsnd   = 0;        /* launch a program while music plays: 0=MACHINE (suspend music, machine audible, resume via menu/cursor) 1=MUSIC (keep music, machine muted) */
+static int   opt_bootnav     = 1;        /* show the navigator at boot: 1=YES (default) 0=NO (boot to the machine; F12 opens the navigator) */
+static int   halt_src = 0;               /* HALT bitmask: bit0=manual Pause, bit1=auto music-halt, bit2=SD-op freeze; machine halted while nonzero */
 static int   opt_tapesound   = 1;        /* Step 14.2: 1=YES hear the tape loading sound, 0=NO real-time load but muted */
+static int   opt_tapemute    = 0;        /* 1=mute the MACHINE audio (the ZX ULA reproduces EAR on its own beeper) while a tape loads; independent of Tape Sound */
+static void  apply_tapemute(void);       /* fwd: the tape-start path calls this before its definition */
 static int   opt_showhidden  = 0;        /* 0=hide hidden/system + dotfiles (macOS .DS_Store/._* junk), 1=show all */
 static int   opt_timemode    = 0;        /* upper-window time: 0=remaining (-M:SS), 1=elapsed (M:SS) */
 static int   opt_mp3tape     = 0;        /* 1=always treat .mp3 as tape (for turbo digitised collections; bypasses fragile pilot detect), 0=auto-detect */
-static int   opt_longleader  = 1;        /* 1=prepend a long clean pilot leader before the file so the ZX always locks; off for rare exact-pilot-count loaders */
 int          opt_preload     = 0;        /* 0=NO (stream from SD, instant start) 1=YES (preload whole file to DDR, prevents SD-stalls) */
 /* MP3/WAV tape reader: only the comparator hysteresis is user-tunable (exposed as "MP3 SENS" in F9).
    Interpolation is always on (required for turbo). The POWADCR F6 tuner + its 13 dead params were
@@ -625,6 +643,7 @@ static int tune_hys_mp3 = 1024;      /* Schmitt hysteresis for MP3 tape (lower =
 static void update_banner(void);     /* fwd */
 static void render_browser(void);    /* fwd */
 static const char* const CH_NOYES[] = {"NO","YES"};
+static const char* const CH_LAUNCH[]= {"MACHINE","MUSIC"};
 static const char* const CH_012[] = {"0","1","2"};
 /* ---- pause/now-playing BANNER state (independent overlay) ---- */
 static char  g_app_path[180] = "";       /* full SD path of the last-loaded snapshot (game/demo) */
@@ -632,6 +651,7 @@ static int   g_app_stopped   = 0;        /* 1 = the loaded app was hard-reset (F
 static char  g_music_path[180] = ""; /* full path of the currently-playing track */
 static void  update_banner(void);        /* fwd (defined after the pause section) */
 static void  apply_music_halt(void);     /* fwd (HALT coordination) */
+static void  resume_music(void);         /* fwd: resume a paused/suspended track (menu / cursor) */
 static void  apply_halt(void);           /* fwd (single owner of IJ_CTRL HALT bit) */
 static void  sdop_freeze_begin(void);    /* fwd: freeze the machine (tape in lock-step) around a blocking SD op */
 static void  sdop_freeze_end(void);
@@ -915,7 +935,7 @@ static void dn_draw_status(void){
     dn_fill(1,22,DN_COLS-2,1,DNK_PANEL_BG);
     if(player_active()){
         dn_put_glyph(2,22, player_paused()?GLYPH_PAUSE:GLYPH_PLAY, DNK_MUSIC, DNK_PANEL_BG);
-        { const char* mp=g_music_path; int ml=slen(mp), W=40, so=(ml>W)?g_status_scroll:0;
+        { const char* mp=g_music_path; int ml=slen(mp), W=39, so=(ml>W)?g_status_scroll:0;  /* leave col 43 blank -> 1-char gap before the play-mode glyph at 44 */
           if(so>ml-W) so=ml-W; if(so<0) so=0;
           dn_putsn(4,22, mp+so, W, DNK_DIR, DNK_PANEL_BG); }             /* FULL path incl filename; marquee via g_status_scroll if long */
         dn_draw_playmode(44,22, DNK_MUSIC, DNK_PANEL_BG);               /* play-mode glyphs: after the name, before the time */
@@ -934,7 +954,7 @@ static void dn_draw_status(void){
 }
 static void status_scroll_tick(void){            /* marquee the full track path in the status bar when it doesn't fit */
     if(!player_active()){ if(g_status_scroll){ g_status_scroll=0; g_status_started=0; g_status_last=0; } return; }
-    int len=slen(g_music_path); if(len<=40){ if(g_status_scroll){ g_status_scroll=0; dn_draw_status(); } return; }
+    int len=slen(g_music_path); if(len<=39){ if(g_status_scroll){ g_status_scroll=0; dn_draw_status(); } return; }
     XTime now; XTime_GetTime(&now);
     if(!g_status_started){ static const int dly[4]={0,300,500,1000};
         if(g_status_last==0){ g_status_last=now; return; }
@@ -995,9 +1015,15 @@ static void dn_keybar(const char* const items[][2], int n){
         x += iw[i];
     }
 }
+static int g_kbar_mod = 0;   /* which F-key hint bar is shown now: 0=normal, 1=Ctrl, 2=Alt */
 static void dn_keybar_browser(void){
-    static const char* const it[9][2]={{"F1","Help"},{"F3","Sort"},{"F5","Copy"},{"F6","Ren"},{"F7","Dir"},{"F8","Del"},{"F9","Menu"},{"F12","Hide"},{"Esc","Back"}};
-    dn_keybar(it,9);
+    static const char* const it[8][2]={{"F1","Help"},{"F5","Copy"},{"F6","Ren"},{"F7","Dir"},{"F8","Del"},{"F9","Menu"},{"F12","Hide"},{"Esc","Back"}};
+    dn_keybar(it,8); g_kbar_mod=0;
+}
+/* DN dynamic F-key bar: while Ctrl / Alt is held, show the modified commands (sort fields / reverse). */
+static void dn_keybar_browser_mode(int mod){
+    if(mod==1){ static const char* const it[4][2]={{"Ctrl+F3","Sort Name"},{"Ctrl+F4","Sort Ext"},{"Ctrl+F5","Sort Size"},{"Ctrl+F6","Sort Date"}}; dn_keybar(it,4); }
+    else dn_keybar_browser();
 }
 static void render_browser_dn(void){
     /* No full clear: the menu row, panel and key bar below cover the whole 640x400 canvas (no transparent flash). */
@@ -1183,11 +1209,14 @@ static void load_snapshot(void){
     if(f_read(&f,snapbuf,sizeof(snapbuf),&br)!=FR_OK){ f_close(&f); sd_unmount(); return; }
     f_close(&f);
     if(br<30) return;
-    player_stop(); playing_idx=-1; g_music_path[0]=0;           /* loading a game: drop the music + return the audio mux to the fabric (else the demo is silent) */
+    if(player_active()){                                       /* launching a program while music plays (opt_launchsnd): */
+        if(opt_launchsnd==0) player_suspend();                 /*   MACHINE: suspend the music (keep the track+position), release the mux -> the machine is audible; resume from the menu/cursor */
+        /* else MUSIC: keep the player -> the audio mux stays on music, the machine runs muted */
+    }
     OSD_CTRL&=~3u; osd_on=0; browser_on=0; osd_view=0;              /* hand the screen to the game (hide BOTH OSD layers, incl. the DN browser on bit1) */
     { int i=0; for(; path[i] && i<179; i++) g_app_path[i]=path[i]; g_app_path[i]=0; }  /* banner: loaded app full path */
     g_app_stopped=0;                                            /* freshly loaded snapshot -> running */
-    apply_music_halt();                                         /* music just stopped -> drop the music-HALT bit */
+    halt_src &= ~2u; apply_music_halt();                        /* fresh app load: run the machine (drop the music-HALT; MUSIC mode + PAUSE-MUS re-asserts it) */
     update_banner();
     if(cicmp(fext(flist[bcursor]),"sna")==0) load_sna(snapbuf,(int)br);
     else load_z80(snapbuf,(int)br);
@@ -1347,7 +1376,8 @@ static void dn_draw_tape_status(void){
     if(el>5999u) el=5999u; if(tot>5999u) tot=5999u;
     dn_fill(1,22,DN_COLS-2,1,DNK_PANEL_BG);
     dn_put_glyph(2,22, GLYPH_PLAY, DNK_TAPE, DNK_PANEL_BG);
-    dn_putsn(4,22, g_tape_name, 42, DNK_TAPE, DNK_PANEL_BG);
+    dn_putsn(4,22, g_tape_name, 39, DNK_TAPE, DNK_PANEL_BG);      /* name col 4..42, col 43 gap -> 'T' at 44 (same slot as music's play-mode glyph) */
+    dn_putc(44,22, 'T', DNK_TAPE, DNK_PANEL_BG);                 /* T = audio recognised as a CASSETTE (tape "mode" marker) */
     { char t1[8],t2[8],tb[18]; fmt_mmss(el,t1); fmt_mmss(tot,t2);
       int p=0; for(int i=0;t1[i];i++)tb[p++]=t1[i]; tb[p++]='/'; for(int i=0;t2[i];i++)tb[p++]=t2[i]; tb[p]=0;
       dn_puts(47,22,tb,DNK_HEADER,DNK_PANEL_BG); }
@@ -1368,7 +1398,7 @@ void tape_isr_feed(void){                         /* called from the 1 ms timer 
 }
 static void tape_stop(void){
     Xil_ExceptionDisable(); g_tape_feed = 0; pr_r = pr_w; Xil_ExceptionEnable();   /* gate the ISR off + flush atomically */
-    g_tape_on = 0; g_tape_drain = 0; g_phase = 0; TAPE_CTRL &= ~3u; tape_close_src(); }   /* hard stop (abort): release ear */
+    g_tape_on = 0; g_tape_drain = 0; g_phase = 0; TAPE_CTRL &= ~3u; AUDIO_CTRL = 0; tape_close_src(); }   /* hard stop (abort): release ear + machine audio back */
 static void tape_done(void){ g_phase = 0; g_tape_drain = 1; }   /* end of tape: stop producing; drain ring+FIFO then release */
 static void tape_push_pulse(uint32_t dur){
     pr_buf[pr_w & PR_MASK] = ((uint32_t)g_ear_lvl<<31) | (dur & 0xFFFFFFu);
@@ -1380,11 +1410,6 @@ static void tape_push_pulse(uint32_t dur){
    delivery is JTAG-proven starvation-free, so the only remaining load misses were the ZX not yet listening
    when a short file-pilot played out; a ~1.8s synthetic leader guarantees it is. Counted into
    g_tape_total_T so the progress bar stays honest. */
-static void tape_preroll_pilot(void){
-    if(!opt_longleader) return;
-    for(uint32_t k=0;k<3000u;k++) tape_push_pulse(2168u);
-    g_tape_total_T += 3000ull*2168ull;
-}
 /* Set up the NEXT segment's params (pilot/sync/data/pause) + starting g_phase. TAP = one standard block;
    TZX = one block dispatched by ID (metadata blocks skipped, loops handled). tape_done() when finished. */
 static void tape_load_seg(void){
@@ -1498,7 +1523,7 @@ static void tape_start(void){
     if(f_read(&f,g_tapbuf,sizeof(g_tapbuf),&br)!=FR_OK){ f_close(&f); sd_unmount(); return; }
     f_close(&f);
     if(br < 2) return;
-    player_stop(); playing_idx=-1; g_music_path[0]=0; apply_music_halt();   /* loading a program -> stop any background music (no phantom playback after load) */
+    player_stop(); playing_idx=-1; g_music_path[0]=0; halt_src &= ~2u; apply_music_halt();   /* loading a tape: run the machine (drop the music-HALT) */
     g_tape_fmt = TAPE_FMT_TAP;                         /* detect .tzx by its "ZXTape!" magic (robust to a wrong extension) */
     if(br>=10 && g_tapbuf[0]=='Z'&&g_tapbuf[1]=='X'&&g_tapbuf[2]=='T'&&g_tapbuf[3]=='a'&&g_tapbuf[4]=='p'&&g_tapbuf[5]=='e'&&g_tapbuf[6]=='!') g_tape_fmt = TAPE_FMT_TZX;
     g_tap_len=br; g_blk_ptr=(g_tape_fmt==TAPE_FMT_TZX)?10u:0u;   /* TZX: skip the 10-byte "ZXTape!" + version header */
@@ -1644,10 +1669,10 @@ static void wav_start(void){
           int nl = lvl ? (ac < -WT_HYS ? 0:1) : (ac > WT_HYS ? 1:0);
           if(nl!=lvl){ if(since>=lo && since<=hi){ if(++run>maxrun) maxrun=run; } else run=0; lvl=nl; since=0; }
       }
-      is_tape = (maxrun >= 200);
+      is_tape = opt_mp3tape ? 1 : (maxrun >= 200);   /* "MP3/WAV as tape" forces the tape path (dcd above is still computed for a clean DC seed) */
     }
     if(is_tape){                          /* --- WAV cassette: stream through the PULSE tract --- */
-        player_stop(); playing_idx=-1; g_music_path[0]=0; apply_music_halt();
+        player_stop(); playing_idx=-1; g_music_path[0]=0; halt_src &= ~2u; apply_music_halt();
         /* WARM START: the pilot-detect already read the first chunk into g_tapbuf -> reuse it as a FULL
            ring (~3 s of slack); g_wtf is positioned right after it, so wt_refill just continues from there.
            This (plus fill-FIFO-before-SD-refill) is the fix for the occasional mid-load underrun. */
@@ -1661,9 +1686,9 @@ static void wav_start(void){
         g_app_path[0]=0; g_app_stopped=0;
         pr_r = pr_w; g_tape_primed = 0;                                  /* fresh pulse ring */
         tape_reader_reset(dcd);                /* seed DC from the pilot-detect -> pilot clean from sample 0 (no 43ms settle) */
-        tape_preroll_pilot();                  /* long clean leader queued before the file -> the ZX is always listening */
         g_tape_feed = 1;                       /* arm the ISR feeder (pre-roll already in the ring) */
         TAPE_CTRL = opt_tapesound ? 0x3u : 0x7u;
+        apply_tapemute();                      /* Mute machine on load: silence the ZX beeper for this load (independent of Tape Sound) */
         update_banner();
     } else {                              /* --- music: PCM stream via the player (dispatched by extension) --- */
         f_close(&g_wtf); g_wt_open=0;
@@ -1700,7 +1725,7 @@ static void mp3_start(void){
         if(!opt_mp3tape){
             mp3_close(); if(!mp3_open(path)){ sd_unmount(); return; }   /* only re-open if we consumed samples during auto-detect */
         }
-        playing_idx=-1; g_music_path[0]=0; apply_music_halt();
+        playing_idx=-1; g_music_path[0]=0; halt_src &= ~2u; apply_music_halt();
         g_wt_sr=mp3_sr(); g_wt_level=0; g_wt_run=0;
         g_tape_fmt=TAPE_FMT_MP3; g_ear_lvl=0; g_tape_on=1; g_tape_drain=0; g_phase=0;
         /* reader state is reset inside mp3_tape_pump statics on next call */
@@ -1710,10 +1735,18 @@ static void mp3_start(void){
         { int i=0; for(; flist[bcursor][i]&&i<NAMELEN; i++) g_tape_name[i]=flist[bcursor][i]; g_tape_name[i]=0; }
         g_app_path[0]=0; g_app_stopped=0;
         pr_r = pr_w; g_tape_primed = 0;                                  /* fresh pulse ring */
-        tape_reader_reset(0);                  /* MP3 is centered -> no DC seed needed */
-        tape_preroll_pilot();                  /* long clean leader queued before the file -> the ZX is always listening */
-        g_tape_feed = 1;                       /* arm the ISR feeder (pre-roll already in the ring) */
+        {   /* PRIME (kills the start-of-pilot click): the MP3 decoder's first frame is a warm-up
+               transient (empty IMDCT history), and the reader's AC-couple needs ~46 ms to settle.
+               WAV gets both free from its pre-scanned chunk + DC seed; MP3 must decode a moment. So
+               swallow ~4096 samples (~90 ms - invisible against a multi-second pilot) while tracking
+               the DC, then seed the reader with the SETTLED DC -> the very first fed pulse is clean. */
+            int32_t dc=0; int16_t pl, prr;
+            for(int i=0;i<4096;i++){ if(!mp3_read(&pl,&prr)) break; dc += (int)pl - (dc>>11); }
+            tape_reader_reset(dc);
+        }
+        g_tape_feed = 1;                       /* arm the ISR feeder */
         TAPE_CTRL = opt_tapesound ? 0x3u : 0x7u;
+        apply_tapemute();                      /* Mute machine on load: silence the ZX beeper for this load (independent of Tape Sound) */
         update_banner();
         /* the browser stays LIVE (drawing load is already gated by g_tape_on in the main loop);
            silently dropping browser_on here left a dead on-screen browser needing F5 twice */
@@ -1728,7 +1761,7 @@ static void tape_pump(void){
     if(g_tape_drain){                                  /* end of tape: hold run/earmux until ring+FIFO fully replay */
         if((pr_w == pr_r) && !(TAPE_STATUS & 2u)){     /* ring empty + playing clear -> every queued pulse delivered */
             g_tape_feed = 0;
-            TAPE_CTRL &= ~3u; g_tape_on = 0; g_tape_drain = 0;
+            TAPE_CTRL &= ~3u; g_tape_on = 0; g_tape_drain = 0; AUDIO_CTRL = 0;   /* release ear + hand machine audio back (undo Mute-machine-on-load) */
             tape_close_src();                              /* close the streaming source (WAV file / MP3 decoder) */
             close_osd();                                   /* tape fully loaded -> hide BOTH OSD layers */
         }
@@ -1825,6 +1858,7 @@ static char cfgbuf[512] __attribute__((aligned(32)));   /* DMA target of f_read 
 static void cfg_set(const char* k, const char* v){
     if(!cicmp(k,"sort"))
         sortmode = !cicmp(v,"date")?1 : !cicmp(v,"size")?2 : !cicmp(v,"ext")?3 : 0;
+    else if(!cicmp(k,"sortrev")){ g_sort_desc = (v[0]=='1') ? 1 : 0; }   /* sort direction (ascending/descending) */
     else if(!cicmp(k,"scroll_speed"))
         opt_scroll = !cicmp(v,"slow")?0 : !cicmp(v,"fast")?2 : 1;
     else if(!cicmp(k,"folder_mark"))
@@ -1838,10 +1872,10 @@ static void cfg_set(const char* k, const char* v){
     else if(!cicmp(k,"player_x")){ int d=0; for(const char*p=v;*p>='0'&&*p<='9';p++) d=d*10+(*p-'0'); if(d<0)d=0; if(d>1024)d=1024; opt_pl_x=(d/8)*8; }
     else if(!cicmp(k,"player_y")){ int d=0; for(const char*p=v;*p>='0'&&*p<='9';p++) d=d*10+(*p-'0'); if(d<0)d=0; if(d>592)d=592; opt_pl_y=(d/8)*8; }
     else if(!cicmp(k,"tape_snd")){ opt_tapesound = (v[0]=='1') ? 1 : 0; }
+    else if(!cicmp(k,"tapemute")){ opt_tapemute = (v[0]=='1') ? 1 : 0; }
     else if(!cicmp(k,"timemode")){ opt_timemode = (v[0]=='1') ? 1 : 0; }
     else if(!cicmp(k,"showhidden")){ opt_showhidden = (v[0]=='1') ? 1 : 0; }
     else if(!cicmp(k,"mp3_tape")){ opt_mp3tape = (v[0]=='1') ? 1 : 0; }
-    else if(!cicmp(k,"longlead")){ opt_longleader = (v[0]=='1') ? 1 : 0; }
     else if(!cicmp(k,"preload")){ opt_preload = (v[0]=='1') ? 1 : 0; }
     else if(!cicmp(k,"mp3_hys")){ int v2=0; for(const char*p=v;*p>='0'&&*p<='9';p++) v2=v2*10+(*p-'0'); if(v2<0)v2=0; if(v2>4096)v2=4096; tune_hys_mp3=v2; }
     else if(!cicmp(k,"playmode"))   /* new names + legacy aliases (repeat1 -> FILE LOOP, repeatall -> FOLDER LOOP) */
@@ -1850,6 +1884,8 @@ static void cfg_set(const char* k, const char* v){
                      : (!cicmp(v,"fileloop")   || !cicmp(v,"repeat1"))?3
                      : !cicmp(v,"random")?4 : 0;
     else if(!cicmp(k,"pause_on_music")) opt_pausemusic = !cicmp(v,"yes")?1:0;
+    else if(!cicmp(k,"launch_snd")) opt_launchsnd = !cicmp(v,"music")?1:0;
+    else if(!cicmp(k,"boot_nav")) opt_bootnav = !cicmp(v,"no")?0:1;
 }
 static void config_load(void){
     if(!sd_mounted){ if(f_mount(&g_fs,"0:/",1)!=FR_OK) return; sd_mounted=1; }
@@ -1877,9 +1913,10 @@ static int config_save(void){                  /* 1 = written OK, 0 = failed (ca
     const char* cv = opt_scroll==0?"slow":opt_scroll==2?"fast":"med";
     const char* fv = opt_foldermark==1?"icon":opt_foldermark==2?"slash":"brackets";
     const char* dv = opt_scrdelay==0?"0":opt_scrdelay==2?"500":opt_scrdelay==3?"1000":"300";
-    char o[256] __attribute__((aligned(32))); int p=0;   /* DMA source of f_write (cache-line aligned) */
+    char o[512] __attribute__((aligned(32))); int p=0;   /* DMA source of f_write (cache-line aligned); >= total ini size (~380 B) */
     p=appstr(o,p,"# BulbuLator config\r\n[browser]\r\n");
     p=appstr(o,p,"sort=");         p=appstr(o,p,sv); o[p++]='\r'; o[p++]='\n';
+    p=appstr(o,p,"sortrev=");      o[p++]=g_sort_desc?'1':'0'; o[p++]='\r'; o[p++]='\n';
     p=appstr(o,p,"scroll_speed="); p=appstr(o,p,cv); o[p++]='\r'; o[p++]='\n';
     p=appstr(o,p,"folder_mark=");  p=appstr(o,p,fv); o[p++]='\r'; o[p++]='\n';
     p=appstr(o,p,"scroll_delay="); p=appstr(o,p,dv); o[p++]='\r'; o[p++]='\n';
@@ -1896,15 +1933,17 @@ static int config_save(void){                  /* 1 = written OK, 0 = failed (ca
     char plyb[8]; itoa_u(opt_pl_y, plyb);
     p=appstr(o,p,"player_y=");     p=appstr(o,p,plyb); o[p++]='\r'; o[p++]='\n';
     p=appstr(o,p,"tape_snd=");     o[p++]=opt_tapesound?'1':'0'; o[p++]='\r'; o[p++]='\n';
+    p=appstr(o,p,"tapemute=");     o[p++]=opt_tapemute?'1':'0'; o[p++]='\r'; o[p++]='\n';
     p=appstr(o,p,"timemode=");     o[p++]=opt_timemode?'1':'0'; o[p++]='\r'; o[p++]='\n';
     p=appstr(o,p,"showhidden=");   o[p++]=opt_showhidden?'1':'0'; o[p++]='\r'; o[p++]='\n';
     p=appstr(o,p,"mp3_tape=");     o[p++]=opt_mp3tape?'1':'0'; o[p++]='\r'; o[p++]='\n';
-    p=appstr(o,p,"longlead=");     o[p++]=opt_longleader?'1':'0'; o[p++]='\r'; o[p++]='\n';
     p=appstr(o,p,"preload=");      o[p++]=opt_preload?'1':'0'; o[p++]='\r'; o[p++]='\n';
     { char tb[8]; itoa_u(tune_hys_mp3, tb); p=appstr(o,p,"mp3_hys="); p=appstr(o,p,tb); o[p++]='\r'; o[p++]='\n'; }
     const char* pv = opt_playmode==1?"file":opt_playmode==2?"folderloop":opt_playmode==3?"fileloop":opt_playmode==4?"random":"folder";
     p=appstr(o,p,"playmode=");     p=appstr(o,p,pv); o[p++]='\r'; o[p++]='\n';
     p=appstr(o,p,"pause_on_music="); p=appstr(o,p, opt_pausemusic?"yes":"no"); o[p++]='\r'; o[p++]='\n';
+    p=appstr(o,p,"launch_snd=");     p=appstr(o,p, opt_launchsnd?"music":"machine"); o[p++]='\r'; o[p++]='\n';
+    p=appstr(o,p,"boot_nav=");       p=appstr(o,p, opt_bootnav?"yes":"no"); o[p++]='\r'; o[p++]='\n';
     UINT bw=0;
     if(f_open(&g_cfg,"0:/bulbulator.ini",FA_CREATE_ALWAYS|FA_WRITE)!=FR_OK){ sd_unmount(); return 0; }
     FRESULT wr = f_write(&g_cfg,o,p,&bw);
@@ -1957,6 +1996,7 @@ static void apply_vol(void){ VOL_REG = ((unsigned)opt_vol*255u)/100u;   /* %% ->
     if(browser_on && !g_menu_open) draw_topstatus(); }   /* live Vol:NN% in the top-right */
 static void apply_pos(void){ DDR_OSD_POS = ((unsigned)opt_y<<16) | (unsigned)opt_x; }  /* Window X/Y -> navigator (DN canvas) position, live */
 static void apply_tape_snd(void){ if(g_tape_on){ if(opt_tapesound) TAPE_CTRL &= ~4u; else TAPE_CTRL |= 4u; } }  /* live tape-sound mute */
+static void apply_tapemute(void){ if(g_tape_on) AUDIO_CTRL = opt_tapemute ? 1u : 0u; }  /* live: mute/unmute the machine beeper during a load */
 static void hidden_changed(void){    /* Show-hidden toggled: re-read the directory with the new filter */
     if(!sd_mounted) return;
     bcursor=0; btop=0; sel_scroll=0; last_scroll=0; scroll_started=0;
@@ -1968,6 +2008,7 @@ static const char* const CH_SORT[]   = {"NAME","DATE","SIZE","EXT"};
 static const char* const CH_SCROLL[] = {"SLOW","MED","FAST"};
 static const char* const CH_FOLDER[] = {"BRACKETS","ICON","SLASH"};
 static const char* const CH_DELAY[]  = {"0S","300MS","500MS","1S"};
+static void mp3_sens_dialog(void);   /* fwd: dedicated numeric editor for MP3 sens (defined after the dialog primitives) */
 static menu_item opt_items[] = {
     {"SORT",     ITEM_CHOICE, &sortmode,       CH_SORT,   4, 0, sort_changed},   /* live re-sort (menu value-item parity with F3) */
     {"SCROLL",   ITEM_CHOICE, &opt_scroll,     CH_SCROLL, 3, 0},
@@ -1980,13 +2021,15 @@ static menu_item opt_items[] = {
     {"WINDOW X", ITEM_RANGE,  &opt_x,          0, 8, 0, apply_pos, 640, ""},   /* navigator X (0..1280-640) */
     {"WINDOW Y", ITEM_RANGE,  &opt_y,          0, 8, 0, apply_pos, 320, ""},   /* navigator Y (0..720-400)  */
     {"TAPE SOUND",ITEM_CHOICE,&opt_tapesound,  CH_NOYES,  2, 0, apply_tape_snd},
-    {"MP3 TAPE", ITEM_CHOICE, &opt_mp3tape,    CH_NOYES,  2, 0},   /* force .mp3 -> tape path for turbo digitised files */
-    {"LONG LEADER",ITEM_CHOICE,&opt_longleader, CH_NOYES,  2, 0},   /* prepend a long clean pilot so the machine always locks (recommended ON) */
-    {"MP3 PRELOAD",ITEM_CHOICE,&opt_preload,    CH_NOYES,  2, 0},   /* preload whole MP3 file to RAM (avoids card-GC stalls, adds startup delay) */
-    {"MP3 HYS",  ITEM_RANGE,  &tune_hys_mp3,   0, 128, 0, 0, 4096, ""},  /* MP3 tape comparator hysteresis (lower = more sensitive; rarely needs changing) */
-    {"EJECT SD", ITEM_ACTION, 0, 0, 0, act_eject},
-    {"SAVE",     ITEM_ACTION, 0, 0, 0, act_save},
-    {"SHOW HIDDEN",ITEM_CHOICE,&opt_showhidden,CH_NOYES, 2, 0, hidden_changed},   /* [20] re-scan on toggle; appended so earlier indices stay put */
+    {"MP3/WAV TAPE", ITEM_CHOICE, &opt_mp3tape, CH_NOYES,  2, 0},   /* [11] force .mp3/.wav -> tape path (turbo/clipped-pilot dumps) */
+    {"MP3 PRELOAD",ITEM_CHOICE,&opt_preload,    CH_NOYES,  2, 0},   /* [12] preload whole MP3 file to RAM (avoids card-GC stalls, adds startup delay) */
+    {"MP3 HYS",  ITEM_RANGE,  &tune_hys_mp3,   0, 128, mp3_sens_dialog, 0, 4096, ""},  /* [13] MP3 pilot-detect hysteresis; Enter/Space opens the numeric editor, arrows nudge */
+    {"EJECT SD", ITEM_ACTION, 0, 0, 0, act_eject},                /* [14] */
+    {"SAVE",     ITEM_ACTION, 0, 0, 0, act_save},                 /* [15] */
+    {"SHOW HIDDEN",ITEM_CHOICE,&opt_showhidden,CH_NOYES, 2, 0, hidden_changed},   /* [16] re-scan on toggle */
+    {"ON LAUNCH", ITEM_CHOICE, &opt_launchsnd, CH_LAUNCH, 2, 0},   /* [17] program launched while music plays: MACHINE=suspend music (machine sound) / MUSIC=keep music (machine muted) */
+    {"BOOT NAV",  ITEM_CHOICE, &opt_bootnav,   CH_NOYES,  2, 0},   /* [18] show the navigator at boot (NO = boot to the machine, F12 opens it) */
+    {"TAPE MUTE", ITEM_CHOICE, &opt_tapemute,  CH_NOYES,  2, 0, apply_tapemute},   /* [19] mute the machine beeper while a tape loads */
 };
 /* (no opt_menu instance any more: opt_items[] feed the Options > Settings nested dropdown directly) */
 
@@ -2026,51 +2069,49 @@ static const MenuItem mi_files[] = {
   {"~D~elete...",  cmFileDelete,0, "F8"},             /* delete (recursive w/ double confirm for non-empty folders) */
   {"~M~ake dir...",cmFileMkdir, 0, "F7"},              /* create directory (chain) */
   {NULL},
-  {"~S~ort mode",  0,           0, "F3", NULL, &opt_items[0]},  /* value-item: SORT (index 0) */
-  {"Re~v~erse",    cmFileRev,   0, "Alt+F3"},
+  {"~S~ort...",    cmFileSort,  0, NULL},              /* opens the Sort dialog (field + direction) */
 };
-static Menu m_files = { mi_files, 10, 0 };
+static Menu m_files = { mi_files, 9, 0 };
 
 static const MenuItem mi_play[] = {
   {"~S~tart",   cmPlayStart, 0, "Space"},
   {"S~t~op",    cmPlayStop,  0, "BkSp"},
-  {"~P~ause",   cmPlayPause, 0, "Space"},
+  {"~P~ause / Resume", cmPlayPause, 0, "Space"},
   {NULL},
   {"~M~ode",    cmPlayMode,  0, "F2"},
+  {"MP3 pre~l~oad",0,0,NULL,NULL,&opt_items[12]},   /* value-item: preload whole MP3 to DDR (no SD-GC stalls during playback; also helps MP3-as-tape) */
 };
-static Menu m_play = { mi_play, 5, 0 };
+static Menu m_play = { mi_play, 6, 0 };
 
-static const MenuItem mi_tape[] = {
+static const MenuItem mi_tape[] = {                        /* all tape / MP3 params live here (not duplicated in Options) */
   {"~P~lay tape", cmTapePlay, 0, NULL},
   {"S~t~op tape", cmTapeStop, 0, "BkSp"},
   {NULL},
-  {"~S~ound",     0,0,NULL,NULL,&opt_items[10]},            /* value-item: TAPE SOUND (index 10) */
-  {"~M~P3 as tape",0,0,NULL,NULL,&opt_items[11]},            /* value-item: MP3 TAPE (index 11) */
-  {"~L~ong leader",0,0,NULL,NULL,&opt_items[12]},            /* value-item: LONG LEADER (index 12) */
+  {"Tape ~S~ound", 0,0,NULL,NULL,&opt_items[10]},           /* value-item: TAPE SOUND */
+  {"~M~P3/WAV as tape",0,0,NULL,NULL,&opt_items[11]},       /* value-item: MP3/WAV TAPE (force tape path) */
+  {"MP3 se~n~s",   0,0,NULL,NULL,&opt_items[13]},           /* value-item: MP3 sens (pilot hysteresis) */
+  {"M~u~te machine on load",0,0,NULL,NULL,&opt_items[19]},  /* value-item: mute the ZX beeper while loading (independent of Tape Sound) */
 };
-static Menu m_tape = { mi_tape, 6, 0 };
+static Menu m_tape = { mi_tape, 7, 0 };
 
 /* Settings = a NESTED dropdown (owner: second-level menu, no buttons - buttons belong to modal
    dialogs only). Every row wraps an opt_items[] value-item verbatim: Enter/Right cycles forward,
    Left cycles back / steps a RANGE down, all changes apply live. */
 static const MenuItem mi_settings[] = {
   /* (no "Sort" here: sorting lives in the Files menu - Sort mode + Reverse) */
-  /* (Play mode + Folders/Player X-Y/Time display removed; Play mode lives in the Play menu) */
-  {"Show hidden",    0,0,NULL, NULL, &opt_items[17]},   /* macOS .DS_Store/._* junk toggle */
+  /* (Play mode lives in the Play menu; ALL tape/MP3 params live in the Tape menu - no duplication here) */
+  {"Show hidden",    0,0,NULL, NULL, &opt_items[16]},   /* macOS .DS_Store/._* junk toggle */
   {"Scroll speed",   0,0,NULL, NULL, &opt_items[1]},
   {"Scroll delay",   0,0,NULL, NULL, &opt_items[2]},
   {"Pause on music", 0,0,NULL, NULL, &opt_items[5]},
+  {"On launch (music)",0,0,NULL, NULL, &opt_items[17]},
+  {"Show navigator on boot",0,0,NULL, NULL, &opt_items[18]},
   {"Volume",         0,0,NULL, NULL, &opt_items[6]},
   {"OSD dim",        0,0,NULL, NULL, &opt_items[7]},
   {"Window X",       0,0,NULL, NULL, &opt_items[8]},    /* navigator (DN canvas) position */
   {"Window Y",       0,0,NULL, NULL, &opt_items[9]},
-  {"Tape sound",     0,0,NULL, NULL, &opt_items[10]},
-  {"MP3 as tape",    0,0,NULL, NULL, &opt_items[11]},
-  {"Long leader",    0,0,NULL, NULL, &opt_items[12]},
-  {"MP3 preload",    0,0,NULL, NULL, &opt_items[13]},
-  {"MP3 sens",       0,0,NULL, NULL, &opt_items[14]},
 };
-static Menu m_settings = { mi_settings, 13, 0 };
+static Menu m_settings = { mi_settings, 10, 0 };
 
 static const MenuItem mi_opts[] = {
   {"~S~ettings",     0,           0, NULL, &m_settings},    /* nested dropdown (DN-style, no buttons) */
@@ -2110,8 +2151,10 @@ static void bg_pump(void) {
             unsigned el = player_elapsed_s();
             if (pct != g_music_last_pct || el != g_music_last_sec) { g_music_last_pct = pct; g_music_last_sec = el; dn_draw_status(); }
         }
-        if (!g_menu_open) browser_scroll_tick();                 /* marquee only when no dropdown covers the list */
-        status_scroll_tick();                                    /* row 22 sits below every dropdown - always safe */
+        /* NO browser_scroll_tick() here: bg_pump runs ONLY under a modal (menu/dialog), so animating the
+           cursor-row name marquee would repaint the list row THROUGH the modal (it bled into Copy/Move,
+           Delete, etc.). The main loop animates the marquee when the browser is the top surface. */
+        status_scroll_tick();                                    /* row 22 sits below every dialog - always safe */
     }
 }
 
@@ -2149,11 +2192,20 @@ static char sc_to_ascii(uint32_t code, int shift){
         case 0x35u: return shift?'Y':'y'; case 0x1Au: return shift?'Z':'z';
         case 0x16u: return shift?'!':'1'; case 0x1Eu: return shift?'@':'2'; case 0x26u: return shift?'#':'3';
         case 0x25u: return shift?'$':'4'; case 0x2Eu: return shift?'%':'5'; case 0x36u: return shift?'^':'6';
-        case 0x3Du: return shift?'&':'7'; case 0x3Eu: return shift?'(':'8'; case 0x46u: return shift?')':'9';
+        case 0x3Du: return shift?'&':'7'; case 0x3Eu: return shift?'*':'8'; case 0x46u: return shift?'(':'9';
         case 0x45u: return shift?')':'0';
-        case 0x4Eu: return shift?'_':'-';   /* minus / underscore: both valid 8.3 chars */
-        case 0x49u: return shift?'>':'.';   /* period = the 8.3 name/ext separator */
-        case 0x4Au: return shift?'?':'/';   /* slash = path separator (Copy-to-folder needs it) */
+        /* standard US symbol keys */
+        case 0x0Eu: return shift?'~':'`';
+        case 0x4Eu: return shift?'_':'-';
+        case 0x55u: return shift?'+':'=';
+        case 0x54u: return shift?'{':'[';
+        case 0x5Bu: return shift?'}':']';
+        case 0x5Du: return shift?'|':'\\';
+        case 0x4Cu: return shift?':':';';
+        case 0x52u: return shift?'"':'\'';
+        case 0x41u: return shift?'<':',';
+        case 0x49u: return shift?'>':'.';
+        case 0x4Au: return shift?'?':'/';
         default:    return 0;
     }
 }
@@ -2194,6 +2246,10 @@ static int get_keysym_blocking(void) {
             case SC_F2:    return K_F2;
             case SC_SPACE: return K_SPACE;
             case 0x66u:    return K_BACK;
+            case SC_KPMUL:   return '*';    /* numpad symbols are typable in text fields (masks / paths) */
+            case 0x71u:      return '.';    /* numpad .  */
+            case SC_KPMINUS: return '-';    /* numpad -  (also mask negation) */
+            case SC_KPPLUS:  return '+';    /* numpad +  */
             default: {
                 char ch = sc_to_ascii(code, g_kb_shift);   /* full printable set (letters/digits/symbols) for text fields + menu hotkeys */
                 if (ch) return (int)(unsigned char)ch;
@@ -2438,6 +2494,58 @@ static int dn_input_dialog(const char* title,const char* prompt,char* buf,int ma
     dn_keybar_browser();         /* restore the browser's status line (row 24 is outside the saved box) */
     return result==1;
 }
+/* ---- MP3 sens editor: a numeric-entry dialog with an inline explanation (issue: 0..4096 is far too
+   wide to click through). Opened from the Tape menu's "MP3 sens" row (Enter/Space). Uses g_bs[1] -
+   free while a bar dropdown is open (this item lives at level 0, no submenu). Digits only. ---- */
+static void mp3_sens_dialog(void){
+    const int W=DLG_W, H=13;                                  /* DLG_W wide -> reuse rn_draw_field / rn_draw_buttons verbatim */
+    int left=(DN_COLS-W)/2, top=(DN_ROWS-H)/2;
+    int fx=left+3, fy=top+8, brow=top+10;
+    char buf[8]; itoa_u(tune_hys_mp3, buf);
+    int len=slen(buf), cur=len, foff=0, focus=0, result=-1;
+    box_backup(&g_bs[1], left, top, W+2, H+1);
+    dn_win_draw(left,top,W,H,"MP3 tape sensitivity");
+    dn_puts(left+3,top+2,"Pilot edge-detect threshold for",DNK_DLG_FG,DNK_DLG_BG);
+    dn_puts(left+3,top+3,"reading MP3/WAV tape recordings.",DNK_DLG_FG,DNK_DLG_BG);
+    dn_puts(left+3,top+5,"Lower  = more sensitive (weak dumps).",DNK_DLG_FG,DNK_DLG_BG);
+    dn_puts(left+3,top+6,"Higher = rejects noise. Default 1024.",DNK_DLG_FG,DNK_DLG_BG);
+    dn_puts(left+3,top+7,"Value (0-4096):",DNK_DLG_FG,DNK_DLG_BG);
+    { static const char* const kb[3][2]={{"Enter","OK"},{"Tab","Next"},{"Esc","Cancel"}}; dn_keybar(kb,3); }
+    while(result<0){
+        if(cur<foff) foff=cur;
+        if(cur>=foff+DLG_FW) foff=cur-DLG_FW+1;
+        if(foff<0) foff=0;
+        rn_draw_field(fx,fy,buf,len,cur,foff,focus==0);
+        rn_draw_buttons(left,brow,focus);
+        int k=get_keysym_blocking();
+        if(k==K_ESC){ result=0; break; }
+        if(k==K_TAB){ focus=(focus+1)%3; continue; }
+        if(k==K_ENTER){ result=(focus==2)?0:1; break; }
+        if(focus==0){                                          /* editing the field (digits only) */
+            if(k==K_LEFT){ if(cur>0) cur--; continue; }
+            if(k==K_RIGHT){ if(cur<len) cur++; continue; }
+            if(k==K_HOME){ cur=0; continue; }
+            if(k==K_END){ cur=len; continue; }
+            if(k==K_DOWN){ focus=1; continue; }
+            if(k==K_BACK){ if(cur>0){ for(int i=cur-1;i<len;i++) buf[i]=buf[i+1]; len--; cur--; } continue; }
+            if(k>='0'&&k<='9'&&len<6){
+                for(int i=len;i>=cur;i--) buf[i+1]=buf[i];
+                buf[cur]=(char)k; len++; cur++; }
+        } else {                                               /* on a button */
+            if(k==K_UP)    { focus=0; continue; }
+            if(k==K_LEFT)  { focus=1; continue; }
+            if(k==K_RIGHT) { focus=2; continue; }
+            if(k==K_SPACE) { result=(focus==2)?0:1; break; }
+        }
+    }
+    if(result==1){                                             /* OK: parse, clamp, apply */
+        int v2=0; for(int i=0;i<len;i++) v2=v2*10+(buf[i]-'0');
+        if(v2<0) v2=0; if(v2>4096) v2=4096;
+        tune_hys_mp3=v2;
+    }
+    box_restore(&g_bs[1]);
+    dn_keybar_browser();
+}
 /* Build "0:/dir/name" into out from curpath + a leaf name. */
 static int path_of(char* out,const char* nm){
     int p=0; for(int i=0;curpath[i]&&p<190;i++) out[p++]=curpath[i];
@@ -2449,33 +2557,52 @@ static int path_of(char* out,const char* nm){
    Edit only the name -> rename in place; edit the folder part -> move; clear it and type a bare name
    -> rename in the current folder. Same-folder change = instant f_rename; different folder = move with
    a progress bar (copy + remove source). Missing destination folders are created first. */
+/* Resolve the Copy/Rename target field (issue #19) into an absolute destination folder + an optional
+   new name, standard cp rules:
+     "0:/.." absolute | "/.." from the drive root | bare -> under the current folder;
+     a trailing '/', or an existing directory, or group>1 -> DIRECTORY (keep the source name[s]);
+     otherwise the last component is a NEW NAME (a single-file target).
+   Fills destdir ("0:/.."), and renameto ("" = keep the source name). */
+static void copy_resolve(const char* typed, int group, char* destdir, int ddsz, char* renameto, int rnsz){
+    int tl=slen(typed), trailing=(tl>0 && typed[tl-1]=='/');
+    char abs[260]; int p=0;
+    if(typed[0] && typed[1]==':'){ for(int i=0;typed[i]&&p<259;i++) abs[p++]=typed[i]; }                    /* drive-absolute */
+    else if(typed[0]=='/'){ abs[p++]='0'; abs[p++]=':'; for(int i=0;typed[i]&&p<259;i++) abs[p++]=typed[i]; }/* from the root */
+    else { for(int i=0;curpath[i]&&p<220;i++) abs[p++]=curpath[i]; if(p&&abs[p-1]!='/') abs[p++]='/';
+           for(int i=0;typed[i]&&p<259;i++) abs[p++]=typed[i]; }                                            /* under current folder */
+    while(p>3 && abs[p-1]=='/') p--; abs[p]=0;                                                               /* drop trailing slashes */
+    int is_folder = group || trailing;
+    if(!is_folder){ FILINFO fi; if(f_stat(abs,&fi)==FR_OK && (fi.fattrib&AM_DIR)) is_folder=1; }             /* existing dir -> folder */
+    int c=-1; for(int i=0;abs[i];i++) if(abs[i]=='/') c=i;                                                   /* last '/' splits dir|name */
+    if(is_folder || c<0 || abs[c+1]==0){                                                                    /* the whole path is the folder */
+        int i=0; for(; abs[i] && i<ddsz-1; i++) destdir[i]=abs[i]; destdir[i]=0; renameto[0]=0;
+    } else {
+        int j=0; for(int i=c+1; abs[i] && j<rnsz-1; i++) renameto[j++]=abs[i]; renameto[j]=0;                /* new name */
+        int n=(c<=2)?2:c; int i=0; for(; i<n && i<ddsz-1; i++) destdir[i]=abs[i]; destdir[i]=0;              /* parent; keep "0:" for a root target */
+    }
+}
 static void rename_selected(void){
     if(fcount==0 || bcursor<0 || bcursor>=fcount) return;
-    if(selcount()>1){ group_copy_move(1, "Move"); return; }    /* multiple tagged -> group MOVE, not rename */
+    if(selcount()>1){ group_copy_move(1, "Rename/Move"); return; }   /* multiple tagged -> group move via the shared dialog */
     const char* nm=flist[bcursor];
     if(nm[0]=='.'&&nm[1]=='.'&&nm[2]==0) return;               /* never ".." */
     if(g_tape_on){ dn_status_msg("BUSY - TAPE LOADING"); return; }
     char oldp[220]; path_of(oldp, nm);
     char buf[220]; { int i=0; for(; oldp[i]&&i<219;i++) buf[i]=oldp[i]; buf[i]=0; }   /* pre-fill the FULL path */
-    if(!dn_input_dialog("Rename or move", "To:", buf, (int)sizeof(buf))) return;
+    int rmsrc=1, checkfree=0;                                  /* F6 = shared DN dialog, titled "Rename/Move", Remove source pre-checked */
+    if(!copy_move_dialog(buf, (int)sizeof(buf), &rmsrc, &checkfree, "Rename/Move")) return;
+    (void)checkfree;
     { int l=slen(buf); while(l>0 && buf[l-1]==' ') buf[--l]=0; }
     if(buf[0]==0) return;
-    /* normalise the edited text -> newp "0:/..." : has drive -> as-is; leading '/' -> under root;
-       otherwise (a bare name, no slash) -> in the current folder */
-    char newp[240]; int p=0;
-    if(buf[1]==':'){ for(int i=0;buf[i]&&p<239;i++) newp[p++]=buf[i]; }
-    else if(buf[0]=='/'){ newp[p++]='0'; newp[p++]=':'; for(int i=0;buf[i]&&p<239;i++) newp[p++]=buf[i]; }
-    else { for(int i=0;curpath[i]&&p<200;i++) newp[p++]=curpath[i]; if(p&&newp[p-1]!='/') newp[p++]='/'; for(int i=0;buf[i]&&p<239;i++) newp[p++]=buf[i]; }
-    while(p>3 && newp[p-1]=='/') p--;                          /* trailing "/" (folder given) -> keep original name */
-    if(p>0 && (newp[p-1]=='/' || buf[slen(buf)-1]=='/')){ for(int i=0;nm[i]&&p<239;i++) newp[p++]=nm[i]; }
-    newp[p]=0;
+    /* shared cp-style resolver -> destination folder + optional new name */
+    char destdir[220], renameto[100];
+    copy_resolve(buf, 0, destdir, (int)sizeof(destdir), renameto, (int)sizeof(renameto));
+    const char* newnm = renameto[0] ? renameto : nm;          /* dropped into a folder -> keep the original name */
+    char newp[340]; { int p=0; for(int i=0;destdir[i]&&p<250;i++) newp[p++]=destdir[i];
+        if(p==0||newp[p-1]!='/') newp[p++]='/'; for(int i=0;newnm[i]&&p<339;i++) newp[p++]=newnm[i]; newp[p]=0; }
     { int eq=1; for(int i=0;;i++){ if(oldp[i]!=newp[i]){ eq=0; break; } if(!oldp[i]) break; } if(eq) return; }  /* EXACT (case-sensitive) equal -> unchanged */
     int caseonly = (cicmp(oldp,newp)==0);                      /* differs ONLY by letter case */
-    /* destination folder = parent of newp */
-    char newdir[220]; { int c=-1; for(int i=0;newp[i];i++) if(newp[i]=='/') c=i;
-        if(c<=2){ newdir[0]='0';newdir[1]=':';newdir[2]='/';newdir[3]=0; }
-        else { int i=0; for(; i<c && i<219; i++) newdir[i]=newp[i]; newdir[i]=0; } }
-    int in_place = (cicmp(newdir, curpath)==0);                /* same folder -> pure rename */
+    int in_place = (cicmp(destdir, curpath)==0);               /* same folder -> pure rename */
     if(player_active() && playing_idx==bcursor){ player_stop(); playing_idx=-1; g_music_path[0]=0; apply_music_halt(); }
     int isdir=fisdir[bcursor];
     if(in_place){                                              /* rename in place: instant, no progress */
@@ -2483,17 +2610,18 @@ static void rename_selected(void){
         FRESULT r;
         if(caseonly){                                          /* FAT is case-insensitive: renaming to the same name in a
                                                                   different case hits "target exists" -> go via a temp name */
-            char tmp[240]; int t=0; for(int i=0;newdir[i]&&t<230;i++) tmp[t++]=newdir[i];
+            char tmp[240]; int t=0; for(int i=0;destdir[i]&&t<230;i++) tmp[t++]=destdir[i];
             if(t&&tmp[t-1]!='/') tmp[t++]='/'; { const char* tn="_BLBTMP_"; for(int i=0;tn[i]&&t<239;i++) tmp[t++]=tn[i]; } tmp[t]=0;
             r = f_rename(oldp, tmp);
             if(r==FR_OK) r = f_rename(tmp, newp);
         } else {
             r = f_rename(oldp, newp);
+            if(r==FR_EXIST && g_copy_mode==CPM_OVERWRITE){ f_unlink(newp); r = f_rename(oldp, newp); }   /* Overwrite mode: replace the existing target */
         }
         sdop_freeze_end();
         if(r!=FR_OK){ dn_status_msg(r==FR_EXIST?"NAME EXISTS":"FAILED"); return; }
     } else {                                                   /* move to another folder: copy + remove source, with a bar */
-        mkdir_path(newdir);
+        mkdir_path(destdir);
         uint64_t total = isdir ? count_tree(oldp) : (uint64_t)fsz[bcursor];
         path_of(oldp, nm);                                     /* count_tree mutated oldp -> rebuild */
         int rc = copy_move_run(oldp, newp, isdir, total, 1, "Move");
@@ -2655,10 +2783,93 @@ static uint64_t count_tree(char* path){
     f_closedir(&d);
     return tot;
 }
-static int copy_file_pg(const char* src, const char* dst){   /* 1=ok, 0=fail, -1=abort; drives the progress bar */
-    FIL fs, fd; UINT br, bw; int rc=1;
+/* ===== Copy/Move conflict resolution (issue #19): g_copy_* (declared above) are set by the shared
+   dialog and honoured per file by copy_file_pg, so single/group/move share one code path. ===== */
+
+/* Byte-for-byte read-back of a freshly written full copy. 1=match, 0=differ or error, -1=abort. */
+static int copy_verify(const char* src, const char* dst){
+    static uint8_t v1[4096], v2[4096];      /* file-scope: keep it off the recursion stack */
+    FIL a, b; UINT ra, rb; int ok=1;
+    if(f_open(&a, src, FA_READ)!=FR_OK) return 0;
+    if(f_open(&b, dst, FA_READ)!=FR_OK){ f_close(&a); return 0; }
+    if(f_size(&a)!=f_size(&b)) ok=0;
+    while(ok==1){
+        pg_tick(); if(g_pg_abort){ ok=-1; break; }
+        if(f_read(&a, v1, sizeof(v1), &ra)!=FR_OK){ ok=0; break; }
+        if(f_read(&b, v2, sizeof(v2), &rb)!=FR_OK){ ok=0; break; }
+        if(ra!=rb){ ok=0; break; }
+        if(ra==0) break;
+        for(UINT i=0;i<ra;i++) if(v1[i]!=v2[i]){ ok=0; break; }
+    }
+    f_close(&a); f_close(&b);
+    return ok;
+}
+
+/* Ask mode: a target already exists -> small modal to choose per file. Returns CPM_OVERWRITE or
+   CPM_SKIP (the action), or -1 to cancel the whole operation. "For all" latches g_copy_askall.
+   46 cells wide so box_backup/restore covers it (it sits over the progress dialog). */
+static int copy_ask_conflict(const char* dst){
+    const int W=46, H=9, left=(DN_COLS-W)/2, top=(DN_ROWS-H)/2;
+    const char* names[3]={"Overwrite","Skip","Cancel"};
+    const int  bwid[3]={13,8,10};   /* = label+4 -> face==bwid, so advancing by bwid+1 keeps the gaps equal */
+    int focus=0, forall=0, result=-2;
+    box_backup(&g_bs[1], left, top, W+2, H+1);
+    dn_win_draw(left,top,W,H,"File exists");
+    dn_putsn(left+3,top+2, base_name(dst), W-6, DNK_DLG_FG, DNK_DLG_BG);
+    { static const char* const kb[3][2]={{"Enter","Choose"},{"Tab","Next"},{"Esc","Cancel"}}; dn_keybar(kb,3); }
+    while(result==-2){
+        dn_check(left+3, top+4, "Apply to all remaining", forall, focus==3, 0);
+        { int gap=3, total=(bwid[0]+1)+gap+(bwid[1]+1)+gap+(bwid[2]+1), bx=left+(W-total)/2;
+          dn_fill(left+1, top+6, W-2, 2, DNK_DLG_BG);
+          dn_button(bx, top+6, names[0], focus==0, bwid[0]); bx+=bwid[0]+1+gap;
+          dn_button(bx, top+6, names[1], focus==1, bwid[1]); bx+=bwid[1]+1+gap;
+          dn_button(bx, top+6, names[2], focus==2, bwid[2]); }
+        int k=get_keysym_blocking();
+        if(k==K_ESC){ result=-1; break; }
+        if(k==K_TAB){ focus=(focus+(g_kb_shift?3:1))%4; continue; }
+        if(k==K_LEFT){ if(focus>0 && focus<=2) focus--; continue; }
+        if(k==K_RIGHT){ if(focus<2) focus++; continue; }
+        if(k==K_UP){ if(focus==3) focus=0; continue; }
+        if(k==K_DOWN){ if(focus<3) focus=3; continue; }
+        if(k==K_SPACE && focus==3){ forall=!forall; continue; }
+        if(k==K_ENTER || k==K_SPACE){ result=(focus==0)?CPM_OVERWRITE:(focus==1)?CPM_SKIP:-1; break; }
+    }
+    box_restore(&g_bs[1]);
+    if(result>=0 && forall) g_copy_askall=result;
+    return result;
+}
+
+static int copy_file_pg(const char* src, const char* dst){   /* 1=copied, 2=skipped, 0=fail, -1=abort; honours g_copy_mode */
+    FILINFO di; int exists = (f_stat(dst,&di)==FR_OK);
+    int mode = g_copy_mode;
+    if(exists && mode==CPM_ASK){
+        int a = (g_copy_askall>=0) ? g_copy_askall : copy_ask_conflict(dst);
+        if(a<0) return -1;                                   /* Cancel -> abort the whole op */
+        mode = a;                                            /* CPM_OVERWRITE or CPM_SKIP */
+    }
+    if(exists){
+        if(mode==CPM_SKIP){ FILINFO si; if(f_stat(src,&si)==FR_OK) g_pg_done+=si.fsize; pg_tick(); return 2; }
+        if(mode==CPM_REFRESH){
+            FILINFO si;
+            if(f_stat(src,&si)==FR_OK){
+                uint32_t sd=((uint32_t)si.fdate<<16)|si.ftime, dd=((uint32_t)di.fdate<<16)|di.ftime;
+                if(sd<=dd){ g_pg_done+=si.fsize; pg_tick(); return 2; }   /* target same-or-newer -> skip */
+            }
+            mode=CPM_OVERWRITE;
+        }
+    } else if(mode==CPM_APPEND || mode==CPM_RESUME){
+        mode=CPM_OVERWRITE;                                  /* nothing to append to -> plain copy */
+    }
+    FIL fs, fd; UINT br, bw; int rc=1; BYTE omode; FSIZE_t skipsrc=0; int full=0;
     if(f_open(&fs, src, FA_READ)!=FR_OK) return 0;
-    if(f_open(&fd, dst, FA_CREATE_ALWAYS|FA_WRITE)!=FR_OK){ f_close(&fs); return 0; }
+    if(mode==CPM_APPEND){ omode=FA_OPEN_APPEND|FA_WRITE; }
+    else if(mode==CPM_RESUME){
+        FSIZE_t ds=di.fsize, ss=f_size(&fs);
+        if(ds>=ss){ f_close(&fs); g_pg_done+=ss; pg_tick(); return 2; }   /* already complete -> skip */
+        skipsrc=ds; omode=FA_OPEN_APPEND|FA_WRITE; g_pg_done+=ds;
+    } else { omode=FA_CREATE_ALWAYS|FA_WRITE; full=1; }
+    if(skipsrc) f_lseek(&fs, skipsrc);
+    if(f_open(&fd, dst, omode)!=FR_OK){ f_close(&fs); return 0; }
     for(;;){
         pg_tick(); if(g_pg_abort){ rc=-1; break; }
         if(f_read(&fs, snapbuf, sizeof(snapbuf), &br)!=FR_OK){ rc=0; break; }
@@ -2667,6 +2878,12 @@ static int copy_file_pg(const char* src, const char* dst){   /* 1=ok, 0=fail, -1
         g_pg_done += bw;
     }
     f_close(&fs); f_close(&fd);
+    if(rc==1 && full && g_copy_verify){                      /* verify only a full overwrite/new copy */
+        pg_set_item("Verifying...");
+        int v = copy_verify(src, dst);
+        if(v<0) rc=-1; else if(v==0) rc=0;
+        pg_set_item(base_name(src));
+    }
     return rc;
 }
 /* Recursively copy a file or folder. src/dst are mutable "0:/..." buffers (>=200). 1=ok,0=fail,-1=abort. */
@@ -2684,7 +2901,7 @@ static int copy_entry(char* src, char* dst, int isdir){
         if(rc<=0) break;
     }
     f_closedir(&d);
-    return rc;
+    return rc<=0?rc:1;                                 /* folder ok -> 1 (never leak a child's "2=skipped") */
 }
 /* Recursively delete a folder + contents; drives the progress bar; honours Cancel. 1=ok,0=fail,-1=abort. */
 static int rmdir_recursive(char* path){
@@ -2708,11 +2925,12 @@ static int rmdir_recursive(char* path){
 /* Shared copy/move worker: copy src->dst with the progress dialog; if removesrc, delete the source
    after (= move). src/dst are mutable "0:/..." buffers (>=220); total = pre-counted bytes. 1=ok,0=fail,-1=abort. */
 static int copy_move_run(char* src, char* dst, int isdir, uint64_t total, int removesrc, const char* title){
+    g_copy_askall=-1;                                              /* fresh op: mode/verify come from the Rename/Move dialog */
     g_pg_total = total?total:1; g_pg_done=0;
     char save[220]; { int i=0; for(; src[i]&&i<219;i++) save[i]=src[i]; save[i]=0; }   /* copy_entry mutates src */
     pg_open(title);
     int rc = copy_entry(src, dst, isdir);
-    if(rc>0 && removesrc){                              /* move = copy, then remove the source */
+    if(rc==1 && removesrc){                             /* move = copy, then remove the source (never on a skip) */
         { int i=0; for(; save[i]&&i<219;i++) src[i]=save[i]; src[i]=0; }
         pg_set_item("Removing source...");
         rc = isdir ? rmdir_recursive(src) : (f_unlink(src)==FR_OK);
@@ -2749,41 +2967,121 @@ static void stop_if_playing_snapshot(void){
     for(int i=0;i<g_snc;i++) if(cicmp(g_snm[i], pn)==0 && cicmp(curpath, play_dir)==0){
         player_stop(); playing_idx=-1; g_music_path[0]=0; apply_music_halt(); return; }
 }
+/* DN Copy/Move dialog (issue #19): 78x15 modal - target path + 6 conflict-mode radios + 3 option
+   checkboxes + OK/Cancel, one linear Tab focus ring. Fills dst plus *removesrc and *checkfree and
+   sets g_copy_mode / g_copy_verify; returns 1=OK, 0=Cancel. Repaints the navigator on close (a full
+   redraw is allowed for a closing modal), since 78 cells exceed the BoxSave width. */
+static int copy_move_dialog(char* dst, int dstsz, int* removesrc, int* checkfree, const char* deftitle){
+    enum { FOC_FIELD=0, FOC_RADIO, FOC_CHECK, FOC_OK, FOC_CANCEL, NFOC };
+    enum { CFL_CHECKFREE=1, CFL_REMOVE=2, CFL_VERIFY=4 };
+    const int W=78, H=15, left=(DN_COLS-W)/2, top=(DN_ROWS-H)/2;
+    const int fx=left+2, fy=top+2, fw=W-4;               /* target-path field spans the window width */
+    const char* rlab[6]={"Overwrite","Append","Resume","Skip","Refresh","Ask"};
+    const char* clab[3]={"Check free space","Remove source (Move)","Verify writes"};
+    int rcol=left+3, ccol=left+42, wtop=top+6, brow=top+12;   /* two columns: radios | checkboxes */
+    int len=slen(dst), cur=len, foff=0;
+    int focus=FOC_FIELD, rcur=g_copy_defmode, rmode=g_copy_defmode, ccur=0;
+    int cflags=(*removesrc)?CFL_REMOVE:0;
+    int result=-1;
+    dn_win_draw(left,top,W,H,deftitle);          /* caller's caption: "Copy" (F5) or "Rename/Move" (F6) */
+    dn_puts(left+2,top+1,"Target folder:",DNK_DLG_FG,DNK_DLG_BG);
+    dn_puts(rcol,top+4,"On name clash:",DNK_DLG_FG,DNK_DLG_BG);
+    dn_puts(ccol,top+4,"Options:",DNK_DLG_FG,DNK_DLG_BG);
+    { static const char* const kb[4][2]={{"Enter","OK"},{"Tab","Next"},{"Space","Set"},{"Esc","Cancel"}}; dn_keybar(kb,4); }
+    while(result<0){
+        if(cur<foff) foff=cur; if(cur>=foff+fw) foff=cur-fw+1; if(foff<0) foff=0;
+        for(int i=0;i<fw;i++){ int idx=foff+i; unsigned ch=(idx<len)?(unsigned char)dst[idx]:' ';
+            int isc=(focus==FOC_FIELD)&&idx==cur; dn_putc(fx+i,fy,ch, isc?DNK_FLD_BG:DNK_FLD_FG, isc?DNK_FLD_FG:DNK_FLD_BG); }
+        for(int i=0;i<6;i++) dn_radio(rcol, wtop+i, rlab[i], i==rmode, focus==FOC_RADIO && i==rcur, 0);
+        for(int i=0;i<3;i++) dn_check(ccol, wtop+i, clab[i], (cflags>>i)&1, focus==FOC_CHECK && i==ccur, 0);
+        { int bw=10, gap=4, total=(bw+1)+gap+(bw+1), bx=left+(W-total)/2; dn_fill(left+1,brow,W-2,2,DNK_DLG_BG);
+          dn_button(bx, brow, "OK", focus!=FOC_CANCEL, bw); dn_button(bx+bw+1+gap, brow, "Cancel", focus==FOC_CANCEL, bw); }
+        int k=get_keysym_blocking();
+        if(k==K_ESC){ result=0; break; }
+        if(k==K_TAB){ focus=(focus+(g_kb_shift?NFOC-1:1))%NFOC; continue; }
+        if(k==K_ENTER){ if(focus==FOC_RADIO) rmode=rcur; result=(focus==FOC_CANCEL)?0:1; break; }
+        switch(focus){
+        case FOC_FIELD:
+            if(k==K_LEFT){ if(cur>0) cur--; }
+            else if(k==K_RIGHT){ if(cur<len) cur++; }
+            else if(k==K_HOME){ cur=0; }
+            else if(k==K_END){ cur=len; }
+            else if(k==K_DOWN){ focus=FOC_RADIO; }
+            else if(k==K_BACK){ if(cur>0){ for(int i=cur-1;i<len;i++) dst[i]=dst[i+1]; len--; cur--; } }
+            else if(k>=0x20 && k<0x7F && len<dstsz-1){ for(int i=len;i>=cur;i--) dst[i+1]=dst[i]; dst[cur]=(char)k; len++; cur++; }
+            break;
+        case FOC_RADIO:                                      /* cursor moves the highlight; (*) is set only by Space */
+            if(k==K_UP){ if(rcur>0) rcur--; else focus=FOC_FIELD; }
+            else if(k==K_DOWN){ if(rcur<5) rcur++; }
+            else if(k==K_SPACE){ rmode=rcur; }
+            else if(k==K_RIGHT){ focus=FOC_CHECK; }
+            break;
+        case FOC_CHECK:
+            if(k==K_UP){ if(ccur>0) ccur--; }
+            else if(k==K_DOWN){ if(ccur<2) ccur++; else focus=FOC_OK; }
+            else if(k==K_SPACE){ cflags^=(1<<ccur); }
+            else if(k==K_LEFT){ focus=FOC_RADIO; }
+            break;
+        case FOC_OK:
+            if(k==K_SPACE){ result=1; }
+            else if(k==K_RIGHT){ focus=FOC_CANCEL; }
+            else if(k==K_LEFT || k==K_UP){ focus=FOC_CHECK; }
+            break;
+        case FOC_CANCEL:
+            if(k==K_SPACE){ result=0; }
+            else if(k==K_LEFT){ focus=FOC_OK; }
+            else if(k==K_UP){ focus=FOC_CHECK; }
+            break;
+        }
+    }
+    if(result==1){ g_copy_mode=rmode; g_copy_defmode=rmode; g_copy_verify=(cflags&CFL_VERIFY)?1:0;
+                   *removesrc=(cflags&CFL_REMOVE)?1:0; *checkfree=(cflags&CFL_CHECKFREE)?1:0; }
+    render_browser();     /* full repaint clears the 78-cell modal (wider than a BoxSave) */
+    return result==1;
+}
 /* Group copy (removesrc=0) or move (removesrc=1) of the snapshot to a destination folder, one bar for all. */
 static void group_copy_move(int removesrc, const char* title){
     if(g_tape_on){ dn_status_msg("BUSY - TAPE LOADING"); return; }
     if(snapshot_sel()==0) return;
-    char dstdir[80]; { int j=0; for(; curpath[j]&&j<79;j++) dstdir[j]=curpath[j]; dstdir[j]=0; }
-    if(!dn_input_dialog(removesrc?"Move to folder":"Copy to folder", "Folder:", dstdir, (int)sizeof(dstdir))) return;
+    char dstdir[220]; { int j=0; for(; curpath[j]&&j<219;j++) dstdir[j]=curpath[j]; dstdir[j]=0; }
+    int rmsrc=removesrc, checkfree=0;
+    if(!copy_move_dialog(dstdir, (int)sizeof(dstdir), &rmsrc, &checkfree, title)) return;   /* dialog repaints on close */
     { int l=slen(dstdir); while(l>0&&dstdir[l-1]==' ') dstdir[--l]=0; }
     if(dstdir[0]==0) return;
-    char dfold[200]; int p=0;
-    if(dstdir[1]==':'){ for(int i=0;dstdir[i]&&p<190;i++) dfold[p++]=dstdir[i]; }
-    else { dfold[p++]='0'; dfold[p++]=':'; if(dstdir[0]!='/') dfold[p++]='/'; for(int i=0;dstdir[i]&&p<190;i++) dfold[p++]=dstdir[i]; }
-    while(p>3 && dfold[p-1]=='/') p--; dfold[p]=0;
+    char dfold[220], gren[100];                          /* shared cp-style resolver: destination folder + optional new name */
+    copy_resolve(dstdir, g_snc>1, dfold, (int)sizeof(dfold), gren, (int)sizeof(gren));
     uint64_t total=0;                                    /* progress denominator over the whole group */
     for(int i=0;i<g_snc;i++){ if(g_sdir[i]){ char cc[220]; path_of(cc,g_snm[i]); total+=count_tree(cc); } else total+=g_ssz[i]; }
     if(total==0) total=1;
+    if(checkfree){                                       /* [X] Check free space: warn before a short volume */
+        FATFS* fsp; DWORD frecl;
+        if(f_getfree("0:", &frecl, &fsp)==FR_OK){
+            uint64_t freeb=(uint64_t)frecl*fsp->csize*512u;
+            if(freeb<total && !dn_confirm("Not enough space", "Continue anyway?")) return;
+        }
+    }
     stop_if_playing_snapshot();
     mkdir_path(dfold);
+    g_copy_askall=-1;                                    /* fresh op: Ask "for all" starts unset */
     g_pg_total=total; g_pg_done=0;
-    pg_open(title);
+    pg_open(rmsrc?"Move":"Copy");
     int okall=1, aborted=0;
     for(int i=0;i<g_snc;i++){
         char src[220]; path_of(src, g_snm[i]);
-        char dst[240]; int q=0; for(int k=0;dfold[k]&&q<200;k++) dst[q++]=dfold[k];
-        if(q==0||dst[q-1]!='/') dst[q++]='/'; for(int k=0;g_snm[i][k]&&q<239;k++) dst[q++]=g_snm[i][k]; dst[q]=0;
+        const char* dnm = (gren[0] && g_snc==1) ? gren : g_snm[i];   /* single: honour a new name; group: keep names */
+        char dst[340]; int q=0; for(int k=0;dfold[k]&&q<250;k++) dst[q++]=dfold[k];
+        if(q==0||dst[q-1]!='/') dst[q++]='/'; for(int k=0;dnm[k]&&q<339;k++) dst[q++]=dnm[k]; dst[q]=0;
         if(cicmp(src,dst)==0) continue;                  /* same place -> skip */
         pg_set_item(g_snm[i]);
         int rc = copy_entry(src, dst, g_sdir[i]);
         if(rc<0){ aborted=1; break; }
         if(rc==0){ okall=0; continue; }
-        if(removesrc){ char s2[220]; path_of(s2,g_snm[i]); if(g_sdir[i]) rmdir_recursive(s2); else f_unlink(s2); }
+        if(rmsrc && rc==1){ char s2[220]; path_of(s2,g_snm[i]); if(g_sdir[i]) rmdir_recursive(s2); else f_unlink(s2); }
     }
     pg_close();
     sd_scan();                                           /* clears fsel (fresh listing) */
     if(browser_on) render_browser();
-    dn_status_msg(aborted?"CANCELLED": okall?(removesrc?"MOVED":"COPIED"):"SOME FAILED");
+    dn_status_msg(aborted?"CANCELLED": okall?(rmsrc?"MOVED":"COPIED"):"SOME FAILED");
 }
 static void delete_selected(void){
     if(fcount==0||bcursor<0||bcursor>=fcount) return;
@@ -2855,6 +3153,64 @@ static void mkdir_path(const char* path){          /* create every missing compo
 static void copy_selected(void){                       /* F5: copy the tagged group (or the cursor entry) to a folder */
     group_copy_move(0, "Copy");
 }
+/* ---- Group select by mask (DN Gray +/-/*; here Shift+KP +/-/*). --------------------------------
+   in_mask1: case-insensitive wildcard ('*' any run, '?' any one char), iterative with backtracking.
+   in_filter: comma/semicolon list of masks, a leading '-' negates one (e.g. "*.tap,*.tzx" or
+   "*.* -*.tmp"). A name without a '.' gets an implicit trailing '.' so DOS "*.*" also matches it. */
+static char g_selmask[64] = "*.*";                     /* remembered mask (DN default) */
+static int in_mask1(const char* n, const char* m){
+    const char *star=0, *nb=0;
+    while(*n){
+        char cn=*n, cm=*m;
+        char a=(cn>='a'&&cn<='z')?(char)(cn-32):cn, b=(cm>='a'&&cm<='z')?(char)(cm-32):cm;   /* uppercase compare */
+        if(cm=='*'){ star=m++; nb=n; continue; }
+        if(cm=='?' || b==a){ m++; n++; continue; }
+        if(star){ m=star+1; n=++nb; continue; }
+        return 0;
+    }
+    while(*m=='*') m++;
+    return *m==0;
+}
+static int in_filter(const char* name, const char* filt){
+    char nm[NAMELEN+2]; int j=0, dot=0;
+    for(int i=0; name[i] && j<NAMELEN; i++){ nm[j++]=name[i]; if(name[i]=='.') dot=1; }
+    if(!dot) nm[j++]='.'; nm[j]=0;                      /* implicit '.' -> "*.*" also matches extensionless names */
+    int anypos=0, pos=0, neg=0;
+    const char* p=filt;
+    while(*p){
+        char m[64]; int k=0;
+        while(*p && *p!=',' && *p!=';'){ if(*p!=' ' && k<63) m[k++]=*p; p++; }
+        m[k]=0; if(*p) p++;
+        if(!m[0]) continue;
+        int inv=(m[0]=='-'); const char* mm=inv?m+1:m;
+        if(!mm[0]) continue;
+        int hit = in_mask1(nm, mm);
+        if(inv){ if(hit) neg=1; } else { anypos=1; if(hit) pos=1; }   /* negation wins; positive needed if any given */
+    }
+    return (anypos?pos:1) && !neg;
+}
+/* Shift+KP+ (sel=1) / Shift+KP- (sel=0): tag/untag every entry matching a typed mask. */
+static void select_by_mask(int sel){
+    if(!browser_on || fcount==0) return;
+    if(g_tape_on){ dn_status_msg("BUSY - TAPE LOADING"); return; }
+    char m[64]; { int i=0; for(; g_selmask[i]&&i<63;i++) m[i]=g_selmask[i]; m[i]=0; }
+    if(!dn_input_dialog(sel?"Select group":"Unselect group", "Mask:", m, (int)sizeof(m))) return;
+    { int l=slen(m); while(l>0&&m[l-1]==' ') m[--l]=0; }
+    if(m[0]==0) return;
+    { int i=0; for(; m[i]&&i<63;i++) g_selmask[i]=m[i]; g_selmask[i]=0; }
+    int n=0;
+    for(int i=0;i<fcount;i++){ if(is_dotdot(i)) continue; if(in_filter(flist[i], m)){ fsel[i]=(uint8_t)sel; n++; } }
+    render_browser();
+    { char b[40]; int p=0; const char* a=sel?"Selected ":"Unselected "; for(int i=0;a[i];i++) b[p++]=a[i];
+      char nb[8]; itoa_u(n,nb); for(int i=0;nb[i];i++) b[p++]=nb[i]; b[p]=0; dn_status_msg(b); }
+}
+/* Shift+KP* : invert the selection over all entries (never ".."). */
+static void invert_selection(void){
+    if(!browser_on || fcount==0) return;
+    for(int i=0;i<fcount;i++) if(!is_dotdot(i)) fsel[i]=!fsel[i];
+    render_browser();
+    dn_status_msg("Inverted");
+}
 /* F7: make directory. Accepts a bare name (under the current folder) or a full/relative path with
    slashes -> mkdir_path creates the whole missing chain. */
 static void mkdir_selected(void){
@@ -2878,32 +3234,54 @@ static void mkdir_selected(void){
 }
 /* ---- DN help window (replaces the legacy 1bpp help screen). Any key / Esc closes. ---- */
 static void dn_help(void){
-    int W=56, H=20, left=(DN_COLS-W)/2, top=(DN_ROWS-H)/2;   /* wider than the box-save buffer -> repaint browser on close */
-    dn_win_draw(left,top,W,H," ZX-BulboNavigator - Keys ");
+    int W=60, H=17, left=(DN_COLS-W)/2, top=(DN_ROWS-H)/2;   /* wider than the box-save buffer -> repaint browser on close */
     static const char* const HL[][2] = {
         {"Up/Down","Move the cursor"},
         {"PgUp/PgDn","Scroll a page"},
         {"Enter","Open folder / load program / play music"},
+        {"Ins","Tag file/folder (group select) + down"},
+        {"Space","Pause / resume playback"},
         {"BkSp","Stop playback / stop tape load"},
-        {"Space/Ins","Tag file/folder (group select) + down"},
+        {"Shift+KP","+/-/* select / unselect / invert (mask)"},
+        {"Ctrl+F3-6","Sort name/ext/size/date (repeat=rev)"},
         {"F2","Cycle music play mode"},
-        {"F3","Sort mode   (Alt+F3 = reverse)"},
-        {"F5","Copy file/folder"},
+        {"F5","Copy files / folders"},
         {"F6","Rename or move"},
         {"F7","Make directory"},
         {"F8","Delete"},
         {"F9","Open the menu bar"},
-        {"F12","Hide / show the navigator"},
-        {"+ / -","Volume up / down  (numpad)"},
         {"F10","Pause the machine"},
         {"F11","Hard-reset the machine"},
+        {"F12","Hide / show the navigator"},
+        {"Num +/-","Volume up / down"},
         {"Esc","Back / close"},
     };
-    int n=(int)(sizeof(HL)/sizeof(HL[0])), y=top+2, x=left+3;
-    for(int i=0;i<n;i++){ dn_puts(x,y+i,HL[i][0],DNK_HOTKEY,DNK_DLG_BG); dn_puts(x+10,y+i,HL[i][1],DNK_DLG_FG,DNK_DLG_BG); }
+    int n=(int)(sizeof(HL)/sizeof(HL[0])), rows=H-2, kx=13, off=0;
+    dn_win_draw(left,top,W,H," ZX-BulboNavigator - Keys ");
     { char v[40]; version_str(v); dn_puts(left+W-slen(v)-3,top+H-1,v,DNK_DLG_FRAME,DNK_DLG_BG); }   /* firmware version in the bottom border */
-    { static const char* const kb[1][2]={{"Esc","Close"}}; dn_keybar(kb,1); }
-    (void)get_keysym_blocking();   /* any key closes */
+    { static const char* const kb[2][2]={{"Up/Dn","Scroll"},{"Esc","Close"}}; dn_keybar(kb,2); }
+    for(;;){
+        for(int r=0;r<rows;r++){
+            int i=off+r, ry=top+1+r;
+            dn_fill(left+1,ry,W-2,1,DNK_DLG_BG);
+            if(i<n){ dn_puts(left+3,ry,HL[i][0],DNK_HOTKEY,DNK_DLG_BG); dn_puts(left+3+kx,ry,HL[i][1],DNK_DLG_FG,DNK_DLG_BG); }
+        }
+        { int sc=left+W-1, y0=top+1, sh=rows-2;                          /* scrollbar ON the right frame, like the file panel */
+          dn_putc(sc, y0,        0x1Eu, DNK_DLG_FRAME, DNK_DLG_BG);       /* up arrow */
+          dn_putc(sc, y0+rows-1, 0x1Fu, DNK_DLG_FRAME, DNK_DLG_BG);       /* down arrow */
+          if(n>rows){
+              int ts=sh*rows/n; if(ts<1)ts=1; if(ts>sh)ts=sh;
+              int tp=(sh-ts)*off/(n-rows); if(tp<0)tp=0; if(tp>sh-ts)tp=sh-ts;
+              for(int r=0;r<sh;r++) dn_putc(sc, y0+1+r, 0xDBu, (r>=tp&&r<tp+ts)?DNK_DLG_FRAME:FG(8), DNK_DLG_BG);   /* white thumb over gray track */
+          } else for(int r=0;r<sh;r++) dn_putc(sc, y0+1+r, 0xDBu, FG(8), DNK_DLG_BG);
+        }
+        int k=get_keysym_blocking();
+        if(k==K_UP)  { if(off>0) off--; continue; }
+        if(k==K_DOWN){ if(off+rows<n) off++; continue; }
+        if(k==K_PGUP){ off = (off>rows)?off-rows:0; continue; }
+        if(k==K_PGDN){ off += rows; if(off > n-rows) off = (n>rows)?n-rows:0; continue; }
+        break;   /* any other key closes */
+    }
     render_browser();              /* repaint the browser over the help window (wider than the box-save buffer) */
 }
 
@@ -2947,12 +3325,32 @@ static void do_player_stop(void){
 }
 static void do_player_pause(void){
     if(g_tape_on){ pause_toggle(); return; }                    /* tape: freeze the machine (tape pauses in lock-step) */
-    if(player_active()){
-        player_pause_toggle(); apply_music_halt(); update_banner();
-        if(browser_on){                                          /* repaint the play-path rows + the status glyph */
-            for(int r=0;r<BROWS;r++){ int i=btop+r; if(i<fcount && on_play_path(i)) dn_draw_file_row(i); }
-            dn_draw_status();
-        }
+    if(!player_active()) return;
+    if(player_paused()){                                        /* music paused -> resume ONLY with the cursor on the paused track/folder */
+        if(browser_on && on_play_path(bcursor)) resume_music();
+        return;
+    }
+    /* music playing -> pause it. ALWAYS suspend: fade the player out and hand the audio mux to the machine.
+       A RUNNING machine is then heard (like a stop); a HALTED machine stays silent (its fabric PCM is forced
+       to silence), so the switch is inaudible either way - and the mux is now on the machine, so un-pausing
+       the machine later immediately restores its sound. Machine HALT + navigator are NOT touched. */
+    player_suspend();
+    update_banner();
+    if(browser_on){
+        for(int r=0;r<BROWS;r++){ int i=btop+r; if(i<fcount && on_play_path(i)) dn_draw_file_row(i); }
+        dn_draw_status();
+    }
+}
+/* Resume a paused track: mux back to music, machine mutes. Handles both a suspend (mux was on the
+   machine) and a plain pause (mux stayed on the player). Used by the Player menu and cursor+Space. */
+static void resume_music(void){
+    if(player_suspended())   player_resume_suspended();  /* flip the mux back to the music */
+    else if(player_paused()) player_pause_toggle();      /* plain unpause (mux already on the player) */
+    else return;
+    apply_music_halt(); update_banner();
+    if(browser_on){
+        for(int r=0;r<BROWS;r++){ int i=btop+r; if(i<fcount && on_play_path(i)) dn_draw_file_row(i); }
+        dn_draw_status();
     }
 }
 static void choose_play_mode(void){
@@ -2977,14 +3375,9 @@ static void choose_play_mode(void){
             for(int i=0;i<5;i++){
                 int ry = top+2+i;
                 int is_cur = (focus == 0 && i == choice);
-                uint32_t fg = is_cur ? FG(0) : DNK_DLG_FG;
-                /* Dialog cursor must be 100% opaque -> use FG(3) (solid Cyan) instead of BG(3) */
-                uint32_t bg = is_cur ? FG(3) : DNK_DLG_BG;
-                dn_fill(left+1, ry, W-2, 1, bg);
-                const char* radio = (i == temp_mode) ? "(*)" : "( )";
-                dn_puts(left+3, ry, radio, fg, bg);
-                dn_puts(left+8, ry, modes[i][0], fg, bg);
-                dn_puts(left+21, ry, modes[i][1], is_cur ? fg : FG(8), bg);
+                dn_fill(left+1, ry, W-2, 1, DNK_DLG_BG);        /* clear row to dialog bg -> no full-width bar */
+                dn_radio(left+3, ry, modes[i][0], i==temp_mode, is_cur, 0);   /* cursor highlight = option width, like F5 */
+                dn_puts(left+21, ry, modes[i][1], FG(8), DNK_DLG_BG);         /* description column: always dim, not highlighted */
             }
             dn_fill(left+1, brow, W-2, 2, DNK_DLG_BG);
             int bw = 10, gap = 4, total = (bw+1) + gap + (bw+1);
@@ -3068,6 +3461,53 @@ static void choose_play_mode(void){
         dn_status_msg(CH_PLAY[opt_playmode]);
     }
 }
+/* Files -> Sort: pick the sort field + direction in a dialog (like Play Mode). */
+static void choose_sort_mode(void){
+    int W=46, H=12, left=(DN_COLS-W)/2, top=(DN_ROWS-H)/2, brow=top+9;
+    static const char* const modes[4][2] = {
+        {"Name",      "Sort by file name"},
+        {"Extension", "Sort by extension"},
+        {"Size",      "Sort by file size"},
+        {"Date",      "Sort by date / time"},
+    };
+    static const int idx2mode[4] = {0,3,2,1};              /* radio row -> sortmode code (NAME=0 EXT=3 SIZE=2 DATE=1) */
+    int cur=0; for(int i=0;i<4;i++) if(idx2mode[i]==sortmode) cur=i;   /* start on the current field */
+    int mark=cur, desc=g_sort_desc, focus=0, result=-1;    /* focus: 0=radio 1=Descending 2=OK 3=Cancel */
+    box_backup(&g_bs[0], left, top, W+2, H+1);
+    dn_win_draw(left,top,W,H,"Sort files");
+    { static const char* const kb[4][2]={{"Enter","OK"},{"Tab","Next"},{"Space","Set"},{"Esc","Cancel"}}; dn_keybar(kb,4); }
+    while(result<0){
+        for(int i=0;i<4;i++){
+            int ry=top+2+i, is_cur=(focus==0 && i==cur);
+            dn_fill(left+1,ry,W-2,1,DNK_DLG_BG);
+            dn_radio(left+3, ry, modes[i][0], i==mark, is_cur, 0);          /* cursor highlight = option width */
+            dn_puts(left+18, ry, modes[i][1], FG(8), DNK_DLG_BG);
+        }
+        dn_fill(left+1, top+7, W-2, 1, DNK_DLG_BG);
+        dn_check(left+3, top+7, "Descending (reverse)", desc, focus==1, 0);
+        { int bw=10, gap=4, total=(bw+1)+gap+(bw+1), bx=left+(W-total)/2; dn_fill(left+1,brow,W-2,2,DNK_DLG_BG);
+          dn_button(bx, brow, "OK", focus!=3, bw); dn_button(bx+bw+1+gap, brow, "Cancel", focus==3, bw); }
+        int k=get_keysym_blocking();
+        if(k==K_ESC){ result=0; break; }
+        if(k==K_TAB){ focus=(focus+(g_kb_shift?3:1))%4; continue; }
+        if(k==K_ENTER){ if(focus==0) mark=cur; result=(focus==3)?0:1; break; }
+        switch(focus){
+        case 0: if(k==K_UP){ if(cur>0) cur--; } else if(k==K_DOWN){ if(cur<3) cur++; else focus=1; } else if(k==K_SPACE){ mark=cur; } break;   /* Down past last radio -> checkbox */
+        case 1: if(k==K_SPACE){ desc=!desc; } else if(k==K_UP){ focus=0; } else if(k==K_DOWN){ focus=2; } break;                              /* Up -> radios, Down -> OK */
+        case 2: if(k==K_SPACE){ result=1; } else if(k==K_RIGHT){ focus=3; } else if(k==K_LEFT||k==K_UP){ focus=1; } break;
+        case 3: if(k==K_SPACE){ result=0; } else if(k==K_LEFT){ focus=2; } else if(k==K_UP){ focus=1; } break;
+        }
+    }
+    if(result==1){
+        sortmode = idx2mode[mark]; g_sort_desc = desc;
+        sort_entries(); remap_playing_idx();
+        bcursor=0; btop=0; sel_scroll=0; last_scroll=0;
+        render_browser();                                  /* new order + clears the dialog */
+    } else {
+        box_restore(&g_bs[0]);
+    }
+    dn_keybar_browser();
+}
 static void app_dispatch(int cmd){
     switch(cmd){
         case cmFileLoad:
@@ -3089,7 +3529,10 @@ static void app_dispatch(int cmd){
         case cmFileMkdir:
             mkdir_selected();
             break;
-        case cmFileRev:                                          /* Reverse: Alt+F3 parity */
+        case cmFileSort:                                         /* Files -> Sort: field + direction dialog */
+            choose_sort_mode();
+            break;
+        case cmFileRev:                                          /* Reverse (legacy; folded into the Sort dialog) */
             if(sd_mounted && fcount){
                 g_sort_desc = !g_sort_desc;
                 sort_entries(); remap_playing_idx();
@@ -3107,7 +3550,7 @@ static void app_dispatch(int cmd){
             do_player_stop();
             break;
         case cmPlayPause:
-            do_player_pause();
+            if(player_paused()) resume_music(); else do_player_pause();
             break;
         case cmPlayMode:
             choose_play_mode();
@@ -3167,6 +3610,16 @@ static void menu_value_changed(MenuState* st, int lvl){
     }
 }
 
+/* Activate a value-item (Enter / Space / hotkey): a RANGE carrying an editor callback opens its own
+   dialog (e.g. MP3 sens - direct numeric entry beats clicking through 0..4096); anything else cycles
+   +1. Left/Right still nudge the value by the fine step either way. */
+static void menuitem_enter(const MenuItem* it, MenuState* st, int lvl){
+    menu_item* vit = it->value;
+    if (vit && vit->kind==ITEM_RANGE && vit->action) vit->action();
+    else menuitem_value_cycle(it, +1);
+    menu_value_changed(st, lvl);
+}
+
 static int menubar_exec(int start){
     int bar = start < 0 ? 0 : start;
     int done = 0;
@@ -3194,31 +3647,33 @@ static int menubar_exec(int start){
             MenuState* s = &st[lvl];
             int k = get_keysym_blocking();
             switch (k) {
-                case K_LEFT:
-                    if (lvl > 0) {
-                        const MenuItem* it = &s->menu->items[s->cur];
-                        if (it->name && it->value && !it->disabled) {   /* submenu: Left steps the value BACK (RANGE down / CHOICE prev) */
-                            menuitem_value_cycle(it, -1);
-                            menu_value_changed(st, lvl);
-                        } else { box_restore(&g_bs[1]); lvl = 0; }      /* non-value row: back to the parent */
-                    } else {
-                        bar = (bar - 1 + g_bar_n) % g_bar_n;            /* top level: previous bar menu */
+                case K_LEFT: {                                          /* arrows adjust ONLY numeric (RANGE) params; a CHOICE stays put (Space/Enter cycles it) so arrows can leave */
+                    const MenuItem* it = &s->menu->items[s->cur];
+                    menu_item* vit = (it->name && !it->disabled) ? it->value : 0;
+                    if (vit && vit->kind==ITEM_RANGE) {                 /* numeric: Left nudges the value DOWN, never leaves */
+                        menuitem_value_cycle(it, -1);
+                        menu_value_changed(st, lvl);
+                    } else if (lvl > 0) {                               /* CHOICE / non-value in a submenu: back to the parent */
+                        box_restore(&g_bs[1]); lvl = 0;
+                    } else {                                            /* top level: previous bar menu */
+                        bar = (bar - 1 + g_bar_n) % g_bar_n;
                         in_menu = 0;
                     }
                     break;
-                case K_RIGHT:
-                    if (lvl > 0) {
-                        const MenuItem* it = &s->menu->items[s->cur];
-                        if (it->name && it->value && !it->disabled) {   /* submenu: Right steps the value FORWARD */
-                            menuitem_value_cycle(it, +1);
-                            menu_value_changed(st, lvl);
-                        }
-                    } else {
-                        const MenuItem* it = &s->menu->items[s->cur];
+                }
+                case K_RIGHT: {
+                    const MenuItem* it = &s->menu->items[s->cur];
+                    menu_item* vit = (it->name && !it->disabled) ? it->value : 0;
+                    if (vit && vit->kind==ITEM_RANGE) {                 /* numeric: Right nudges the value UP, never leaves */
+                        menuitem_value_cycle(it, +1);
+                        menu_value_changed(st, lvl);
+                    } else if (lvl == 0) {
                         if (it->name && it->sub && !it->disabled) menu_open_sub(st, &lvl);   /* DN: Right opens the submenu */
                         else { bar = (bar + 1) % g_bar_n; in_menu = 0; }                     /* else: next bar menu */
                     }
+                    /* CHOICE / non-value at lvl>0: Right does nothing */
                     break;
+                }
                 case K_UP:
                 case K_DOWN: {
                     int old_cur = s->cur;
@@ -3232,13 +3687,17 @@ static int menubar_exec(int start){
                     menubox_draw_row(s->menu, s->cur, s->left, s->top, s->W, s->cur);
                     break;
                 }
+                case K_SPACE: {                             /* Space activates an inline value-item (editor dialog for RANGE+action, else cycle); ignored on commands/submenus */
+                    const MenuItem* it = &s->menu->items[s->cur];
+                    if (it->name && it->value && !it->disabled) menuitem_enter(it, st, lvl);
+                    break;
+                }
                 case K_ENTER: {
                     const MenuItem* it = &s->menu->items[s->cur];
                     if (it->disabled || !it->name) break;
                     if (it->sub && lvl == 0) { menu_open_sub(st, &lvl); break; }   /* Enter opens the nested dropdown */
-                    if (it->value) {                        /* inline value-item: cycle + repaint (live list refresh if it re-sorts) */
-                        menuitem_value_cycle(it, +1);
-                        menu_value_changed(st, lvl);
+                    if (it->value) {                        /* inline value-item: editor dialog (RANGE+action) or cycle + repaint */
+                        menuitem_enter(it, st, lvl);
                         break;
                     }
                     ret = it->cmd;
@@ -3270,7 +3729,7 @@ static int menubar_exec(int start){
                             menubox_draw_row(s->menu, s->cur, s->left, s->top, s->W, old_cur);
                             menubox_draw_row(s->menu, s->cur, s->left, s->top, s->W, s->cur);
                             if (it->sub && lvl == 0) menu_open_sub(st, &lvl);
-                            else if (it->value) { menuitem_value_cycle(it, +1); menu_value_changed(st, lvl); }
+                            else if (it->value) { menuitem_enter(it, st, lvl); }
                             else if (it->cmd) { ret = it->cmd; done = 1; in_menu = 0; }
                             break;
                         }
@@ -3313,18 +3772,18 @@ static void toggle_view(int v){ if(osd_view==v) close_osd(); else open_view(v); 
    bit-exact - registers, envelope phase and the noise LFSR all survive the freeze - so there is no
    save/restore and no resume click. Modal: while paused only Pause (or the F10 fallback) is live. */
 static int paused = 0, pst = 0;   /* paused: banner flag; pst: E1-run pause-key matcher state */
-static int halt_src = 0;     /* bitmask: bit0=manual Pause, bit1=auto pause-on-music. HALT held while nonzero. */
 static void apply_halt(void){            /* single owner of IJ_CTRL bit0 (HALT) */
     if(halt_src){ IJ_CTRL = 1;
         for(volatile uint32_t t=0; t<8000000u && !(IJ_STAT & 1u); t++){} }   /* assert + wait HALT_ACK (bounded: no ACK must not wedge the ARM) */
     else IJ_CTRL = 0;                                       /* release only when no source remains */
 }
-static void apply_music_halt(void){      /* music start/stop or PAUSE-MUS option change */
-    int want = opt_pausemusic && player_active() && !player_paused() && g_app_path[0];
-    if(want) halt_src |= 2; else halt_src &= ~2;
+static void apply_music_halt(void){      /* music STARTED over a game -> HALT. SET-ONLY: pausing / stopping music
+                                            NEVER un-halts (owner: un-pause is MANUAL only). The music-HALT is cleared
+                                            only by the manual Pause key, turning PAUSE-MUS off, or a fresh app load. */
+    if(opt_pausemusic && player_active() && !player_paused()) halt_src |= 2;   /* halt the running machine whenever music plays (no loaded snapshot required) */
     apply_halt();
 }
-static void music_halt_changed(void){ apply_music_halt(); update_banner(); }   /* F9 onchange */
+static void music_halt_changed(void){ if(!opt_pausemusic) halt_src &= ~2u; apply_music_halt(); update_banner(); }   /* F9 onchange: OFF clears the music-HALT */
 /* Blocking SD ops (config SAVE, directory scans) stall the main loop long enough to underrun the
    512-deep tape FIFO and corrupt a running load. The tape replays in LOCK-STEP with the machine
    (pe3M5_core is halt-gated), so freezing the machine for the op's duration is bit-exact: the tape
@@ -3370,10 +3829,19 @@ static void render_banner(void){         /* shown when (music playing) OR (pause
 static void render_pause_sign(void){
     if(halt_src & 3u){
         ban_select(); ban_clear();
-        draw_glyph(2, 0, pause_glyph);
-        draw_text_scrolled(12, 0, 1, "PAUSE", 0);
+        /* Big PAUSE indicator on the transparent banner plane, at the screen's top-right (over the game too,
+           since the banner is an independent plane): two bars + "PAUSE", BOTH the same height (24 px). */
+        int sc=3, H=8*sc, bw=8, gap=8;
+        int barsW=2*bw+gap, txtW=5*8*sc, grp=barsW+12+txtW;
+        int gx=BAN_W-grp-8, by=(BAN_H-H)/2;
+        for(int y=by;y<by+H;y++){
+            for(int x=gx;x<gx+bw;x++) setpix(x,y);
+            for(int x=gx+bw+gap;x<gx+2*bw+gap;x++) setpix(x,y);
+        }
+        draw_text(gx+barsW+12, by, sc, "PAUSE");             /* same 24 px height as the bars */
         osd_select();
         ban_blit();
+        BAN_POS = (16u<<16) | 1008u;                         /* top-right corner (Y0=16; plane right edge ~ screen x 1264) */
         BAN_CTRL = 1;
     } else BAN_CTRL = 0;
 }
@@ -3519,10 +3987,14 @@ void main(void){
 
     /* Step 14.4: real DN-style file browser on the colour canvas at boot (640x400 @ 80x25, CP866). */
     apply_pos();                                 /* navigator position from Window X/Y (default 320,160 = centred) */
-    browser_on = 1; osd_on = 1; opt_on = 0; osd_view = 3;
-    sd_scan();                                   /* mount + read 0:/ into flist[] (shows NO CARD if none) */
-    render_browser();                            /* draw the DN browser to the canvas */
-    OSD_CTRL = 2u;                               /* bit1 = colour OSD (DN) on; bit0 (1bpp) off */
+    if(opt_bootnav){                             /* BOOT NAV = YES (default): open the navigator at boot */
+        browser_on = 1; osd_on = 1; opt_on = 0; osd_view = 3;
+        sd_scan();                               /* mount + read 0:/ into flist[] (shows NO CARD if none) */
+        render_browser();                        /* draw the DN browser to the canvas */
+        OSD_CTRL = 2u;                           /* bit1 = colour OSD (DN) on; bit0 (1bpp) off */
+    } else {                                     /* BOOT NAV = NO: boot straight to the machine; F12 opens the navigator */
+        OSD_CTRL = 0; osd_on = 0; browser_on = 0; opt_on = 0; osd_view = 0;
+    }
 
     /* Drain + heartbeat loop. Keep it non-blocking: exactly ONE KBD_HB write per pass (the fabric
        deadman edge-detector would miss a tight burst of kicks) and no blocking I/O on this path. */
@@ -3574,14 +4046,33 @@ void main(void){
         if(code==0xF0u || code==0xE0u) continue;   /* prefix frames */
         kb_alt = g_kd[0x11];                        /* Alt held (for Alt+F3) - from the one table */
 
+        /* DN sort hotkeys: Ctrl+F3=name F4=ext F5=date F6=size; pressing the same field again reverses.
+           Checked before the F5/F6 actions so Ctrl+F5/F6 sort instead of copy/rename. */
+        if(g_kd[0x14] && browser_on && rising){
+            int nm = (code==SC_F3)?0 : (code==SC_F4)?3 : (code==SC_F5)?2 : (code==SC_F6)?1 : -1;   /* F5=size F6=date */
+            if(nm>=0){
+                if(sortmode==nm) g_sort_desc=!g_sort_desc; else { sortmode=nm; g_sort_desc=0; }
+                sort_entries(); remap_playing_idx();
+                bcursor=0; btop=0; sel_scroll=0; last_scroll=0; dn_draw_list();
+                dn_status_msg(sort_label());
+                continue;
+            }
+        }
+
+        { int kbmod = g_kd[0x14] ? 1 : 0;                      /* DN dynamic hint bar: Ctrl held -> the sort F-keys */
+          if(browser_on && kbmod!=g_kbar_mod){ dn_keybar_browser_mode(kbmod); g_kbar_mod=kbmod; } }
+
         /* single-shot action keys (rising edge only -> immune to typematic + to a modal eating the break) */
         if(code==SC_F10){ if(rising) pause_toggle(); continue; }                       /* Pause fallback */
         if(code==SC_F8){ if(rising && browser_on) delete_selected(); continue; }       /* F8: delete (DN-style) */
         if(code==SC_F6){ if(rising && browser_on) rename_selected(); continue; }       /* F6: rename / move */
         if(code==SC_F7){ if(rising && browser_on) mkdir_selected(); continue; }         /* F7: make directory */
         if(code==SC_F11){ if(rising){ g_app_stopped=1; update_banner(); } continue; }  /* hard reset marker */
-        if(code==SC_KPPLUS ){ if(!release){ opt_vol+=5; if(opt_vol>100)opt_vol=100; apply_vol(); } continue; }  /* volume up (hold ramps) */
-        if(code==SC_KPMINUS){ if(!release){ opt_vol-=5; if(opt_vol<0)  opt_vol=0;   apply_vol(); } continue; }  /* volume down */
+        if(code==SC_KPPLUS ){ if(g_kd[0x12]||g_kd[0x59]){ if(rising && browser_on) select_by_mask(1); }         /* Shift+KP+ : select by mask */
+                              else if(!release){ opt_vol+=5; if(opt_vol>100)opt_vol=100; apply_vol(); } continue; }  /* KP+ : volume up (hold ramps) */
+        if(code==SC_KPMINUS){ if(g_kd[0x12]||g_kd[0x59]){ if(rising && browser_on) select_by_mask(0); }         /* Shift+KP- : unselect by mask */
+                              else if(!release){ opt_vol-=5; if(opt_vol<0)  opt_vol=0;   apply_vol(); } continue; }  /* KP- : volume down */
+        if(code==SC_KPMUL  ){ if((g_kd[0x12]||g_kd[0x59]) && rising && browser_on) invert_selection(); continue; } /* Shift+KP* : invert selection */
 
         if(release) continue;                       /* below: makes only */
         switch(code){
@@ -3595,11 +4086,7 @@ void main(void){
             case SC_HOME:  if(browser_on) browser_move(-fcount); break;      /* Home: jump to first item */
             case SC_END:   if(browser_on) browser_move(fcount); break;       /* End: jump to last item */
             case SC_ENTER: if(rising && browser_on) browser_enter(); break;  /* single-shot: load/enter */
-            case SC_F3:    if(rising && browser_on){
-                              if(kb_alt) g_sort_desc = !g_sort_desc;                /* Alt+F3: reverse direction */
-                              else { sortmode=(sortmode+1)&3; g_sort_desc=0; }      /* F3: next sort mode, asc */
-                              sort_entries(); remap_playing_idx();
-                              bcursor=0; btop=0; sel_scroll=0; last_scroll=0; dn_draw_list(); } break;
+            /* F3 is free now: sorting moved to Ctrl+F3..F6; F3 reserved for the file viewer */
             case SC_F2:    if(rising && browser_on){ opt_playmode=(opt_playmode+1)%N_PLAYMODES;   /* cycle play mode */
                               dn_status_msg(CH_PLAY[opt_playmode]);
                               g_music_last_pct=0xFFFFFFFFu; g_music_last_sec=0xFFFFFFFFu; } break;
