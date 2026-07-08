@@ -8,7 +8,7 @@ Languages: [English](README.md) · **Русский**
 
 Если проект вам понравился, будет очень приятно, если вы угостите меня чашечкой кофе:
 
-[![ko-fi](https://ko-fi.com/img/githubbutton_sm.svg)](https://ko-fi.com/G2F222TXLI)
+[![ko-fi](https://ko-fi.com/img/githubbutton_sm.svg)](https://ko-fi.com/G2F222TXLI) [![DonationAlerts](https://img.shields.io/badge/Donate-DonationAlerts-fb5b2d?style=for-the-badge&logo=donationalerts&logoColor=white)](https://www.donationalerts.com/r/alex_electron)
 
 Аппаратный эмулятор ZX Spectrum на SoC Xilinx Zynq: запусти открытое ядро ZX Spectrum на недорогой и легко доступной плате EBAZ4205, при этом адаптировав его под архитектуру Xilinx. Опубликованная сборка работает на открытом ядре **Atlas `zx`**; ядра MiST / MiSTer остаются в качестве запасного варианта для машин, которые не поддерживает Atlas.
 
