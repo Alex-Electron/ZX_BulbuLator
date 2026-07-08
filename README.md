@@ -13,7 +13,7 @@ Telegram: https://t.me/zx_bulbulator
 
 If you've enjoyed the project, it would be really nice of you to buy me a cup of coffee:
 
-[![ko-fi](https://ko-fi.com/img/githubbutton_sm.svg)](https://ko-fi.com/G2F222TXLI)
+[![ko-fi](https://ko-fi.com/img/githubbutton_sm.svg)](https://ko-fi.com/G2F222TXLI) [![DonationAlerts](https://img.shields.io/badge/Donate-DonationAlerts-fb5b2d?style=for-the-badge&logo=donationalerts&logoColor=white)](https://www.donationalerts.com/r/alex_electron)
 
 A hardware ZX Spectrum emulator on a Xilinx Zynq SoC: bring up an open ZX Spectrum
 core on the cheap, easy-to-find EBAZ4205 board, reworking it for the Xilinx
