@@ -219,10 +219,18 @@ So far:
   it over HDMI, while the ZX Spectrum core runs in the background. Uses the AYUMI soft-synth library. Requires D-Cache 
   (enabled via a custom `lscript.ld` for the Cortex-A9) for real-time 47996 Hz playback without audio underruns. 
   Audio is pushed via AXI to a new hardware FIFO in the PL, replacing the fabric audio when active.
+- **[Step 14 — Colour OSD & the ZX-BulboNavigator](research/14-color-osd/).** The 1-bpp strip becomes a
+  true-colour, 80×25 DOS Navigator-style file manager running on the idle ARM, over the live core: a
+  browser with sort and mask-select, a full Copy/Move dialog, a machine-agnostic tape station
+  (`.tap`/`.tzx`/`.wav`/`.mp3`, with a hardware tape-head reader model), the music player folded in
+  (PSG/MP3/WAV, play modes, non-blocking pause), and a data-driven menu whose settings persist to
+  `bulbulator.ini`.
 
 More steps get added as I get them working.
 
 ## Changelog
+- **2026-07-08 — Step 14: colour OSD & the ZX-BulboNavigator.** The 1-bpp strip is replaced by a true-colour 640×400 ARGB8888 DDR OSD (`osd_ddr_rd` over AXI-HP1 + a per-pixel alpha compositor), hosting a full DOS Navigator-style file manager on the idle ARM: a browser with `Ctrl+F3-6` sort, mask select, a 78×15 Copy/Move dialog (six conflict modes), rename / mkdir / recursive delete; a data-driven menu bar with options saved to `bulbulator.ini`; a machine-agnostic tape station (`.tap`/`.tzx`/`.wav`/`.mp3` with a hardware tape-head reader model, MP3/WAV-as-tape, Tape Sound, Mute-machine-on-load); the music player folded in (PSG/MP3/WAV, play modes, non-blocking pause, MP3 preload); a pause bitmask, boot-nav, and a transparent PAUSE sign. A clean clone reproduces the bitstream — the PS/2 watchdog patch is vendored in `third_party/atlas-zx-ps2-watchdog/` and overlaid at build time. (control-plane VERSION `0xB01B0017`, firmware v0.14.92).
+
 - **2026-06-30 — Step 13: Universal ARM music player.** A machine-agnostic music player built into the ARM control plane. Press **Enter** on a `.psg` file in the F5 browser to play it over HDMI, while the ZX Spectrum core runs in the background. Uses the AYUMI soft-synth library. Requires D-Cache (enabled via custom `lscript.ld` for the Cortex-A9) for real-time 47996 Hz playback without audio underruns. Audio is pushed via AXI to a new hardware FIFO in the PL, replacing the fabric audio when active. (control-plane VERSION `0xB01B000B`).
 
 - **2026-06-27 — Step 12: loading a snapshot.** The file browser becomes a loader: press **Enter** on a
