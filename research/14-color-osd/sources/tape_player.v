@@ -52,6 +52,8 @@ module tape_player #(
             rd_en <= 1'b0;                              // default: no pop this cycle
             if (!run) begin
                 busy <= 1'b0; tape_ear <= 1'b0;         // stopped -> release ear low, drop any mid-pulse
+                if (!empty) rd_en <= 1'b1;              // AND drain any queued pulses so a restart begins at the FILE start,
+                                                        // not on leftover FIFO (fixes: quick BkSp-stop then Enter replays a stale pilot)
             end else if (t_en) begin
                 if (busy && (cnt > {{(DUR_W-1){1'b0}},1'b1})) begin
                     cnt <= cnt - 1'b1;                  // hold the current pulse

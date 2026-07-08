@@ -343,7 +343,7 @@ module bulbulator_zx_ddr_top
         cap_geom_s1<=cap_geom_sp; cap_geom_s2<=cap_geom_s1; cap_geom_s3<=cap_geom_s2;
         if (cap_geom_s2==cap_geom_s3) cap_geom_f<=cap_geom_s2;
     end
-    axi_ctl #(.VERSION(32'hB01B0016)) ctl (
+    axi_ctl #(.VERSION(32'hB01B0017)) ctl (
         .aclk(fclk100), .aresetn(aresetn),
         .s_awid(gp0_awid), .s_awaddr(gp0_awaddr), .s_awlen(gp0_awlen),
         .s_awvalid(gp0_awvalid), .s_awready(gp0_awready),

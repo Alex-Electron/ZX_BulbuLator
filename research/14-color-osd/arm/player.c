@@ -69,6 +69,7 @@ volatile uint32_t g_rb_min = 0xFFFFFFFFu;        /* telemetry: lowest rb_count s
 
 static int  g_playing = 0;
 static int  g_paused  = 0;
+static volatile int g_suspended = 0;      /* launch-suspend: paused with the mux released to the machine, source + ring position kept */
 static int  g_ended   = 0;                /* set on natural EOF (consume-once for auto-advance) */
 static int  prod_done = 0;                /* producer hit source EOF (decay tail already pushed) */
 static volatile int g_idle_muxup = 0;   /* between tracks: source freed but the mux stays engaged (ISR
@@ -331,7 +332,7 @@ static void stream_produce(void){
 /* ---------------- transport ---------------- */
 static void consumer_stop_now(void){        /* IRQ-safe teardown of the consumer + mux */
     Xil_ExceptionDisable();
-    c_on = 0; AUDIO_CTRL = 0; pace_hold = 0; a_gain = 0; a_target = 0;
+    c_on = 0; AUDIO_CTRL = 0; pace_hold = 0; a_gain = 0; a_target = 0; g_suspended = 0;
     rb_r = rb_w;                            /* flush unplayed samples */
     g_idle_muxup = 0;                       /* mux released */
     Xil_ExceptionEnable();
@@ -399,7 +400,7 @@ static void track_arm(void){                /* common start-of-track state (all 
     a_gain = 0; a_target = 256;             /* fade-in from silence */
     pace_hold = 0; prod_done = 0;
     g_idle_muxup = 0;                       /* NEW: mux was already up (gapless) or off (normal start) */
-    g_playing = 1; g_paused = 0; g_ended = 0;
+    g_playing = 1; g_paused = 0; g_ended = 0; g_suspended = 0;
     c_on = 1;
     Xil_ExceptionEnable();
     AUDIO_CTRL = 1;                         /* mux to player (ring still silent -> no step) */
@@ -498,6 +499,27 @@ void player_pause_toggle(void){
         pace_hold = 0;                                      /* ... then release the freeze so the ISR wakes clean */
     }
 }
+/* Launch-suspend: pause + release the audio mux to the machine, keeping the source + ring position.
+   The machine becomes audible; player_resume_suspended() re-engages the mux and fades back in. */
+void player_suspend(void){
+    if (!g_playing || g_suspended) return;
+    if (!g_paused){ g_paused = 1; a_target = 0; }           /* fade out (same path as pause) */
+    XTime t0, t; XTime_GetTime(&t0);
+    while (a_gain > 0){ if(!audio_irq_on) player_isr_tick();
+        XTime_GetTime(&t); if ((uint64_t)(t - t0) > (uint64_t)COUNTS_PER_SECOND/50u) break; }   /* fade-out, 20 ms bound */
+    XTime_GetTime(&t0);
+    while (!(AUDIO_STAT & 0x1u)){ XTime_GetTime(&t);
+        if ((uint64_t)(t - t0) > (uint64_t)COUNTS_PER_SECOND/100u) break; }                     /* drain the faded tail, 10 ms */
+    AUDIO_CTRL = 0;                 /* mux -> fabric: the machine is audible; ring + source stay frozen (pace_hold) */
+    g_suspended = 1;
+}
+void player_resume_suspended(void){
+    if (!g_suspended) return;
+    AUDIO_CTRL = 1;                 /* mux -> player */
+    a_target = 256; g_paused = 0; pace_hold = 0;   /* fade back in from the held ring position */
+    g_suspended = 0;
+}
+int player_suspended(void){ return g_suspended; }
 
 /* ---------------- PRODUCER: main-loop pump (decode into the ring; consumer feeds the fabric) ---------------- */
 void player_pump(void){

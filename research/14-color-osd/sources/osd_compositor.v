@@ -142,6 +142,7 @@ module banner_compositor #(
     wire [15:0] mg = bgc*OP + dg*ia;
     wire [15:0] mb = bb*OP + db*ia;
     wire [23:0] rgb_bg = { mr[15:8], mg[15:8], mb[15:8] };
-    assign rgb_out = (ban_en && in_win) ? (pix ? INK : rgb_bg) : rgb_in;
+    assign rgb_out = (ban_en && in_win && pix) ? INK : rgb_in;   // INK pixels only -> transparent elsewhere (no bg strip)
+    wire _unused_bg = |rgb_bg;                                    // keep the (now-unused) bg blend from warning
 endmodule
 //-------------------------------------------------------------------------------------------------
