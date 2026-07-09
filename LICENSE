@@ -6,10 +6,10 @@ the terms of the GNU General Public License as published by the Free Software
 Foundation, either version 2 of the License, or (at your option) any later
 version.  SPDX-License-Identifier: GPL-2.0-or-later
 
-This project builds on GPL-licensed FPGA cores - notably the ZX Spectrum core
-by Sorgelig and contributors (GPL-2.0-or-later) and JT49 by Jose Tejada
-(GPL-3.0-or-later). Because the build links JT49, any distributed bitstream is
-effectively GPL-3.0-or-later. Full per-component attribution and licences are
+This project builds on GPL-licensed FPGA cores - notably the "zx" 48K/128K core
+by theexperimentgroup / UnAmigaReloaded (which bundles JT49 by Jose Tejada,
+GPL-3.0-or-later, plus SAA1099 by Sorgelig and T80). Because the build links
+JT49, any distributed bitstream is effectively GPL-3.0-or-later. Attribution is
 in THIRD_PARTY.md; the pinned upstream sources (get_deps.sh) are the
 corresponding source for any prebuilt binaries shipped here.
 

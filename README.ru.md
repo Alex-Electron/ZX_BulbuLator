@@ -46,7 +46,7 @@ Languages: [English](README.md) · **Русский**
 
 ## Что она должна уметь
 
-Ядра: ZX Spectrum 48K, 128K и Pentagon 128 с точной синхронизацией INT (320 строк на кадр).
+Ядра: ZX Spectrum 48K и 128K работают уже сейчас; Pentagon (320 строк на кадр, без контеншена) и другие машины — в планах (Шаг 15 и далее).
 
 Для ввода предусмотрены: клавиатура PS/2 через два контакта FPGA, джойстики Kempston и Sinclair, а также геймпады Dendy / Sega.
 
@@ -224,6 +224,6 @@ Languages: [English](README.md) · **Русский**
 
 BulbuLator — свободное ПО под лицензией GNU General Public License версии 2 или (по вашему выбору) любой более поздней. Его можно использовать, изучать, собирать, прошивать, изменять и распространять; если вы распространяете изменённую версию или устройство на его основе — держите исходники открытыми под GPL и указывайте авторов. Для обычного использования и правок «для себя» не ограничивается ничего.
 
-Лицензия GPL — потому что проект построен на GPL-ядрах FPGA: ZX-ядро Sorgelig и соавторов ([Atlas `zx`](https://github.com/AtlasFPGA/zx), GPL-2.0-or-later) и звуковое ядро JT49 Хосе Техады (GPL-3.0-or-later); из-за JT49 любой распространяемый битстрим фактически идёт под GPL-3.0-or-later. Остальные компоненты сохраняют свои пермиссивные лицензии — [hdl-util/hdmi](https://github.com/hdl-util/hdmi) (Apache-2.0/MIT), AYUMI (MIT), minimp3 (CC0), speexdsp (BSD). Полная покомпонентная атрибуция — в [THIRD_PARTY.md](THIRD_PARTY.md); закреплённые исходники, которые тянет `get_deps.sh`, — это corresponding source для любых готовых бинарников.
+Лицензия GPL — потому что проект построен на GPL-ядрах FPGA: многоплатформенное ZX-ядро 48K/128K (theexperimentgroup / UnAmigaReloaded, [Atlas `zx`](https://github.com/AtlasFPGA/zx)), в состав которого входит звуковое ядро JT49 Хосе Техады (GPL-3.0-or-later); из-за JT49 любой распространяемый битстрим фактически идёт под GPL-3.0-or-later. Остальные компоненты сохраняют свои пермиссивные лицензии — [hdl-util/hdmi](https://github.com/hdl-util/hdmi) (Apache-2.0/MIT), AYUMI (MIT), minimp3 (CC0), speexdsp (BSD). Полная покомпонентная атрибуция — в [THIRD_PARTY.md](THIRD_PARTY.md); закреплённые исходники, которые тянет `get_deps.sh`, — это corresponding source для любых готовых бинарников.
 
 Для ввода с ленты используется входная схема *Tape Load Reader* из проекта [Murmulator](https://murmulator.ru/) ([схемы](https://github.com/AlexEkb4ever/MURMULATOR_classical_scheme), GPL-3.0) — это внешнее аппаратное дополнение, подключённое к плате; ссылка на него и указание авторства приведены здесь, но само устройство не распространяется.

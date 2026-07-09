@@ -16,10 +16,10 @@ which permits this combination.
 | Component | Role | Licence | Copyright | How |
 |---|---|---|---|---|
 | **This project** (ARM firmware, our RTL, scripts, docs, board-top) | the platform | GPL-2.0-or-later | © 2026 Alexander Lavrinovich | in repo |
-| **Atlas `zx`** — ZX Spectrum / Pentagon core (`Alex-Electron/zx` @ `407b653`, downstream of `sorgelig/ZX_Spectrum-128K_MIST`) | the machine core | GPL-2.0-or-later | © 2016-2019 Sorgelig & contributors | fetched |
+| **`zx`** — multi-board ZX Spectrum **48K/128K** core, **no Pentagon** (theexperimentgroup / Atlas / UnAmigaReloaded; `Alex-Electron/zx` @ `407b653` ← `AtlasFPGA/zx` ← `UnAmigaReloaded-fpga/zx`) | the machine core | GPL (v3+ via JT49) | © theexperimentgroup / UnAmigaReloaded | fetched |
 | ├ **JT49** — AY-3-8910 / YM2149 sound | in the core | **GPL-3.0-or-later** | © Jose Tejada (jotego) | fetched (via zx) |
 | ├ **SAA1099** — SAA sound | in the core | GPL-2.0-or-later | © 2016 Sorgelig | fetched (via zx) |
-| └ **T80** — Z80 CPU | in the core | permissive (Wallner-style) | © Daniel Wallner / Sorgelig | fetched (via zx) |
+| └ **T80** — Z80 CPU | in the core | permissive (Wallner) | © Daniel Wallner | fetched (via zx) |
 | **hdl-util/hdmi** (`Alex-Electron/hdmi` @ `fbade3d`) | HDMI TMDS + audio | Apache-2.0 OR MIT | © hdl-util contributors | fetched |
 | **Digilent vivado-library / rgb2dvi** (@ `f4613ff`) | rgb2dvi IP (Steps 3-4 only) | Digilent licence (permissive) | © Digilent Inc. | fetched (sparse) |
 | **AYUMI** — software AY emulation | music player (PSG) | MIT | © Peter Sovietov | vendored |
@@ -33,6 +33,9 @@ which permits this combination.
   wired to the board; credited and linked, not shipped here.
 
 ## Notes
+- The `zx` core is 48K/128K only. Pentagon support (Step 15) will import the proven Pentagon timing
+  from `sorgelig/ZX_Spectrum-128K_MIST` (`ula.sv`, GPL-2.0) — that is a *separate* upstream, not the
+  origin of the current core.
 - `assemble.sh` overlays `third_party/atlas-zx-ps2-watchdog/ps2.v` onto the fetched core so a clean
   clone reproduces the on-hardware keyboard fix; the file stays GPL-2.0-or-later.
 - To reproduce a shipped binary: `./get_deps.sh` (pins every core by commit) then build — see the
