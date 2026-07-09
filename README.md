@@ -277,12 +277,22 @@ More steps get added as I get them working.
 
 ## License
 
-[MIT](LICENSE) © Alexander Lavrinovich
+[GPL-2.0-or-later](LICENSE) © 2026 Alexander Lavrinovich
 
-The MIT licence covers this project's own work (the board-top, scripts, and notes).
-The cores it builds on keep their own licences — see each step's credits and the
-upstream projects ([Atlas `zx`](https://github.com/AtlasFPGA/zx),
-[hdl-util/hdmi](https://github.com/hdl-util/hdmi)).
+BulbuLator is free software under the GNU General Public License, version 2 or (at
+your option) any later version. You may use, study, build, flash, modify and
+redistribute it; if you distribute a modified version or a device based on it, keep
+the source open under the GPL and credit the authors. For plain use and tinkering,
+nothing is restricted.
+
+It is GPL because it builds on GPL FPGA cores — the ZX Spectrum core by Sorgelig and
+contributors ([Atlas `zx`](https://github.com/AtlasFPGA/zx), GPL-2.0-or-later) and the
+JT49 AY core by Jose Tejada (GPL-3.0-or-later); linking JT49 makes any distributed
+bitstream effectively GPL-3.0-or-later. Other components keep their own permissive
+licences — [hdl-util/hdmi](https://github.com/hdl-util/hdmi) (Apache-2.0/MIT), AYUMI
+(MIT), minimp3 (CC0), speexdsp (BSD). Full per-component attribution is in
+[THIRD_PARTY.md](THIRD_PARTY.md); the pinned upstream sources fetched by `get_deps.sh`
+are the corresponding source for any prebuilt binaries shipped here.
 
 The tape input uses the *Tape Load Reader* front-end circuit from the
 [Murmulator](https://murmulator.ru/) project
