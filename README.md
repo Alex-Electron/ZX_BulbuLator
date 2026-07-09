@@ -67,8 +67,8 @@ room for bigger machines, though the build still targets the 7010 everyone has.
 
 ## What it should do
 
-The cores: ZX Spectrum 48K, 128K, and Pentagon 128 with accurate INT timing
-(320 lines per frame).
+The cores: ZX Spectrum 48K and 128K run today; Pentagon (320-line frame, no
+contention) and other machines are on the roadmap (Step 15 onward).
 
 For input there is a PS/2 keyboard on two FPGA pins, Kempston and Sinclair
 joysticks, and Dendy / Sega gamepads.
@@ -285,10 +285,10 @@ redistribute it; if you distribute a modified version or a device based on it, k
 the source open under the GPL and credit the authors. For plain use and tinkering,
 nothing is restricted.
 
-It is GPL because it builds on GPL FPGA cores — the ZX Spectrum core by Sorgelig and
-contributors ([Atlas `zx`](https://github.com/AtlasFPGA/zx), GPL-2.0-or-later) and the
-JT49 AY core by Jose Tejada (GPL-3.0-or-later); linking JT49 makes any distributed
-bitstream effectively GPL-3.0-or-later. Other components keep their own permissive
+It is GPL because it builds on GPL FPGA cores — the multi-board ZX 48K/128K core
+(theexperimentgroup / UnAmigaReloaded, [Atlas `zx`](https://github.com/AtlasFPGA/zx)),
+which bundles the JT49 AY core by Jose Tejada (GPL-3.0-or-later); linking JT49 makes
+any distributed bitstream effectively GPL-3.0-or-later. Other components keep their own permissive
 licences — [hdl-util/hdmi](https://github.com/hdl-util/hdmi) (Apache-2.0/MIT), AYUMI
 (MIT), minimp3 (CC0), speexdsp (BSD). Full per-component attribution is in
 [THIRD_PARTY.md](THIRD_PARTY.md); the pinned upstream sources fetched by `get_deps.sh`
