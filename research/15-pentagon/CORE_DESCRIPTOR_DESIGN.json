@@ -1,0 +1,195 @@
+{
+  "summary": "Design a per-core descriptor architecture: selecting a core dynamically loads its settings + input map into the menu (MiSTer-style)",
+  "agentCount": 6,
+  "logs": [],
+  "result": {
+    "summary": "Both proposals converge on the same core idea (an INI-style .CORE sidecar next to each .bit.bin, a RAM-built Machine submenu, and a per-core/2-player 32-bit joystick), and differ mainly in ambition and rollout risk. Recommended synthesis: adopt Proposal 2's future-proof descriptor FORMAT (section-headed INI, symbolic setting ids, a generic reg/shift/width/invert bitfield map, and named composite appliers for packed regs) so we never have to re-cut the file schema; but keep Proposal 1's repeatable machine-row concept so today's picker (128K/Pentagon/48-Atlas/48-MiSTer) and per-machine tuning tags survive unchanged; and ship it via Proposal 1's incremental phasing behind a compiled-in built-in descriptor that reproduces Atlas + MiSTer48 byte-for-byte. That built-in is simultaneously the never-brick fallback and the hardware regression gate. The dynamic FS-scan (retiring N_MACHINES) is real but deferred to a late phase behind a known-core registry, so early phases carry near-zero risk to the shipping ZX path. Honest effort: ~7-10 focused days across 5 independently-shippable phases; Phase 1 is a pure compile-time refactor with a byte-identical hardware result.",
+    "descriptorSpec": "Format: line-based, section-stateful INI text, one file per core, ~1-2 KB, sibling of the bitstream at 0:/CORES/<NAME>.CORE (next to <NAME>.BIT.BIN). Parsed by extending the existing config_load()/cfg_set() line-splitter (loader_main.c:3888-3899): trim, skip blank/#/;, but treat '[' as a SECTION HEADER instead of skipping it. On the descriptor path only, widen the shared key[24]/val[24] scratch to key[32]/val[96] (labels + choice lists exceed the 23-char cap) and copy every string into a per-descriptor char-pool arena so pointers have stable RAM backing (no rodata alias, no stack dangle). Values parse as decimal, 0x-hex, or '|'-split string lists. No JSON, no floats, no malloc. Sections and fields:\\n\\n[core]: name (uppercase SD/registry key, backing store for g_cur_core); label (UI/picker/wizard-title string); version = expected REG_VERSION[15:0] and optional machine_id = expected MACHINE_ID (GP0+0x60) for boot self-identification; cfg = default MACHINE_CFG (GP0+0xBC) word latched before overrides; players = 1|2.\\n\\n[machine] (repeatable, >=1; this is the blend that preserves today's picker): label | tag | cfg_base(hex). One row per selectable machine this ONE bitstream hosts. Atlas ships 3 rows (128K cfg_base=0, Pentagon=1, 48=2) all pointing at the same bitfile; MiSTer48 ships 1 row. tag is the STABLE ini key, never reordered. Selecting a machine whose core differs from resident -> PCAP reload; same-bitfile -> guarded HALT->latch MACHINE_CFG->reset flip (exactly today's two paths).\\n\\n[setting] (repeatable): id (stable symbolic key for <tag>.<id> persistence AND to break the opt_items[]-by-literal-index coupling); label; kind = choice|toggle|range (maps 1:1 to item_kind: choice/toggle->ITEM_CHOICE, range->ITEM_RANGE); choices=A|B|C (toggle implies OFF|ON); min/max/step/unit for range; default. Register binding is ONE of two forms: (a) DIRECT bitfield -> reg=0xBC shift=S width=W [invert=1] : value read-modify-written into GP0[reg] bits [S +: W], invert emits logical NOT (reproduces snow_off=!snow) — this is the generic zero-ARM-code path for any future core register; (b) NAMED composite -> param=<name> naming one of a small fixed firmware applier set (crop_l/r/t/b, paper_h/v, pint_v/h, scr_x/y) for packed/clamped regs (CROP_A/B, PAPER, PENT_INT). apply = live (poke while running, default) | reset (guarded cold reboot).\\n\\n[buttons p1] / [buttons p2] (p2 optional; presence + players=2 enables player 2): bitK = LABEL 0xNN — per-player, per-JOY_STATE-bit semantic label + default PS/2 make-code. Bit NUMBER is RTL-fixed (0=R 1=L 2=D 3=U, 4-7 core-defined); the descriptor only relabels/rebinds, never renumbers.",
+    "architecture": "Selecting a core/machine drives the menu and controls through one resident descriptor plus a light registry, with today's engine reused verbatim.\\n\\nRegistry vs resident split (no heap): g_reg[MAX_CORES] holds only light identity per core {name,label,tag,version,machine_id,bitfile} + its machine rows; exactly ONE selected core's full descriptor (settings[MAX_SETTINGS], buttons[2][8], string pool) is resident in g_core. Other cores' persisted tweaks stay in the resident cfgbuf ini text and are re-seeded on switch, so only one heavy record is ever in RAM.\\n\\nMenu: machine_menu_sync() (4266) stops choosing among the three const tables mi_machine_zx/_pent/_48 and instead BUILDS into statically-sized RAM buffers — menu_item g_core_vals[MAX_SETTINGS], MenuItem g_core_rows[MAX_SETTINGS+crop], int g_core_optval[MAX_SETTINGS] (live) + g_core_optprev[] (diff shadow). Row 0 stays the Machine selector {&opt_items[20]} (unchanged); then one wrapper row per [setting] pointing at OWNED &g_core_vals[i] (NOT &opt_items[N]); crop rows stay firmware-owned per-machine. m_machine.items/.count point at the RAM buffer; g_menu_restructure=1 reuses the existing geometry-recompute + re-render path (5946-5960) with zero renderer change. Global Display/Navigator/Audio/Tape menus keep using opt_items[] by literal index untouched — the single most fragile coupling is never reindexed.\\n\\nRegister assembly: machine_cfg_word() (4032) drops its if-ladder for a loop — cfg = current machine row's cfg_base, then OR each reg==0xBC setting's (val<<shift, inverted if flagged). A generic core_val_changed() onchange (the engine's void(*)(void) can't say which item fired) re-derives EVERY register RMW from current values, routes param= settings to the named appliers, and runs the guarded HALT/latch/reset only if an apply=reset setting differs from its shadow.\\n\\nInput: JOY_STATE (GP0+0x100) bit order stays RTL-fixed. g_joymap[8]->g_joymap[2][8]; global JOYBTN/JOYDEF -> g_core.jbtn[2][8]/jdef[2][8]. joymap_eval() (678) widens to 32-bit: mask per player from g_kd[], SOCD-cancel each half, write m1|(m2<<16); players==1 leaves [31:16]=0 so ZX Kempston is byte-identical. Wizard title/labels/bit-count derive from g_core (+ P1/P2 toggle when [buttons p2] present).\\n\\nSwitch flow (apply_machine, 4038): flush leaving values -> if bitfile != g_cur_core, pl_reload() (1538, unchanged, IRQ-masked PCAP) then g_cur_core=&g_core.name[] (stable buffer) -> bind resident descriptor from the ALREADY-PARSED registry (no FatFs mid-switch) -> load joymap from defaults then persisted <tag>.joymap*, force JOY_STATE refresh, RE-SAMPLE LOAD_CAPS (fixes the latched-once cap at 679-681) -> fabric_reinit latches descriptor cfg -> rebuild menu. Missing/garbage .CORE -> compiled-in built-in descriptor, never touches the running PL.\\n\\nBoot identity: replace the hardcoded REG_VERSION==0x0059->MISTER map (6449) with a match of live REG_VERSION[15:0]/MACHINE_ID against each registry version field (deferred to Phase 4; earlier phases keep the 2-way map).",
+    "phasedPlan": [
+      {
+        "phase": "Phase 1 — descriptor abstraction, compile-time only (SMALLEST FIRST)",
+        "work": "Introduce core_desc/setting_desc/machine-row structs + a compiled-in built-in registry that reproduces Atlas (3 machine rows: 128K cfg_base=0, Pentagon=1, 48=2; settings ula_late=reg:0xBC:2:1 apply=reset, snow=reg:0xBC:4:1 invert apply=live) and MiSTer48 EXACTLY. Route machine_cfg_word() (4032) through the loop form and machine_menu_sync() (4266) through core_menu_build() into RAM buffers with OWNED menu_items. NO SD parsing, NO joystick change, opt_items[] untouched.",
+        "deliverable": "Pure refactor. On hardware: 128K/Pentagon/48/MiSTer48 switch, menus, and MACHINE_CFG bits are byte-identical to today. This proves the descriptor abstraction drives the live menu + cfg word with zero behavior change and zero new-format risk."
+      },
+      {
+        "phase": "Phase 2 — .CORE sidecar parser + boot scan + fallback",
+        "work": "Add core_desc_path() (.CORE suffix beside core_path at 830), a section-stateful parser reusing config_load's splitter with the widened key[32]/val[96] buffer + string-pool arena, and a boot scan of 0:/CORES/*.CORE. Ship an Atlas.CORE + MiSTer48.CORE on SD that reproduce the Phase-1 built-ins. Missing/garbage file -> built-in fallback.",
+        "deliverable": "On hardware: with the SD descriptors present, behavior matches the built-in byte-for-byte; delete/corrupt them and it silently falls back to built-in. Proves the file format end-to-end WITHOUT needing a new core."
+      },
+      {
+        "phase": "Phase 3 — unified per-core / 2-player joystick",
+        "work": "g_joymap[8]->g_joymap[2][8]; per-core labels/defaults from g_core (jbtn/jdef); widen joymap_eval (678) to 32-bit m1|(m2<<16) with per-half SOCD; re-sample LOAD_CAPS in apply_machine; wizard drops the hardcoded '(Kempston)' title (4548) and derives title/labels/bit-count from g_core + a P1/P2 toggle; persist <tag>.joymap/<tag>.joymap2 via SAVEKV.",
+        "deliverable": "Testable on ZX alone: Kempston QAOP+Space still works identically (P2 half stays 0), but bindings now persist per machine tag and the wizard is core-aware. Independently shippable before any NES RTL exists."
+      },
+      {
+        "phase": "Phase 4 — dynamic core/machine list + boot self-ID + persistence rework",
+        "work": "N_MACHINES #define -> runtime registry count; picker (4856) geometry from live count; deterministic tag-sort ordering; boot g_cur_core via REG_VERSION/MACHINE_ID match against descriptor version fields (replace 6449 hardcode); cfg_set() routes <tag>.<id> generically by symbolic id (retire the pint_v/paper_h suffix ladder); legacy defmachine=/<oldtag>.<param> migration so existing ZX users keep their tuning; enlarge/stream config_save's 1536B stack buffer o[] to prevent stack-smash as core count grows.",
+        "deliverable": "Adding a core needs NO ARM edit. On hardware: reorder/rename SD descriptors, saved configs still resolve by tag; boot correctly self-identifies the resident core."
+      },
+      {
+        "phase": "Phase 5 — land NES/Dendy (thesis validation)",
+        "work": "RTL side (out of this firmware's scope): NES core publishes a unique REG_VERSION[15:0] + MACHINE_ID + LOAD_CAPS bit0, and decodes JOY_STATE p1[15:0]/p2[31:16] with NES bit semantics on the fixed 0=R 1=L 2=D 3=U order. Firmware side: author NES.CORE, drop NES.BIT.BIN + NES.CORE on the SD.",
+        "deliverable": "On hardware, with ZERO firmware rebuild: NES appears in the picker, its Machine submenu builds from the descriptor, its A/B/Select/Start buttons bind and drive JOY_STATE, and it PCAP-loads on selection. This is the end-to-end proof of the whole design."
+      }
+    ],
+    "nesDescriptorExample": "# 0:/CORES/NES.CORE  -- BulbuLator per-core descriptor (sibling of NES.BIT.BIN)\n[core]\nname       = NES\nlabel      = NINTENDO / DENDY\nversion    = 0x0070            ; expected REG_VERSION[15:0] for boot self-ID\nmachine_id = 0x004E            ; expected MACHINE_ID (GP0+0x60)\ncfg        = 0x0000            ; default MACHINE_CFG at cold boot\nplayers    = 2\n\n# one machine hosted by this bitstream:  label | tag | cfg_base(hex)\n[machine]\nrow = NES / DENDY | nes | 0x0000\n\n# --- Machine-submenu settings ---------------------------------------\n[setting]                       ; DIRECT bitfield map -> MACHINE_CFG[1:0]\nid=region  label=REGION  kind=choice  choices=NTSC|PAL|DENDY  default=0\nreg=0xBC   shift=0  width=2   apply=reset      ; region change cold-boots\n\n[setting]\nid=palette label=PALETTE kind=choice choices=FCEUX|NES CLASSIC|SONY CXA default=0\nreg=0xBC   shift=4  width=2   apply=live\n\n[setting]\nid=sprlimit label=8-SPRITE LIMIT kind=toggle default=1   ; OFF|ON implied\nreg=0xBC   shift=6  width=1   apply=live\n\n[setting]                       ; NAMED composite applier (reuses firmware cropper)\nid=crop_t  label=OVERSCAN TOP  kind=range  max=16 step=1 default=8  param=crop_t\n[setting]\nid=crop_b  label=OVERSCAN BOTTOM kind=range max=16 step=1 default=8 param=crop_b\n\n# --- Input: D-pad + A B Select Start = exactly the 8 JOY_STATE bits --\n# bit ORDER fixed by RTL (0=R 1=L 2=D 3=U); only labels/keys are per-core.\n[buttons p1]\nbit0 = RIGHT  0x23   ; D\nbit1 = LEFT   0x1C   ; A\nbit2 = DOWN   0x1B   ; S\nbit3 = UP     0x1D   ; W\nbit4 = A      0x42   ; K\nbit5 = B      0x3B   ; J\nbit6 = SELECT 0x29   ; Space\nbit7 = START  0x5A   ; Enter\n\n[buttons p2]                    ; presence + players=2 enables player 2\n# non-extended keys only (joymap_capture drops 0xE0/0xF0 -> no real arrows)\nbit0 = RIGHT  0x74   ; KP6\nbit1 = LEFT   0x6B   ; KP4\nbit2 = DOWN   0x72   ; KP2\nbit3 = UP     0x75   ; KP8\nbit4 = A      0x4B   ; L\nbit5 = B      0x4C   ; ;\nbit6 = SELECT 0x66   ; Backspace\nbit7 = START  0x5A   ; Enter\n# machine_cfg_word() = cfg_base(0) | region<<0 | palette<<4 | sprlimit<<6\n# crop_t/crop_b are param= appliers, saved as nes.crop_t / nes.crop_b, NOT in MACHINE_CFG",
+    "openQuestions": [
+      "Picker UX / model granularity: the synthesis KEEPS today's flat picker (128K, Pentagon, 48-Atlas, 48-MiSTer as separate rows via repeatable [machine] rows in the Atlas descriptor), NOT Proposal 2's collapse-Atlas-to-one-core-plus-a-Model-setting. Confirm you want the familiar flat list preserved rather than a shorter core list with Model as an in-menu reset-setting.",
+      "Settings persistence scope: persist per MACHINE tag (<machinetag>.<id>, matches today's per-machine crop/INT tuning) or per CORE tag? Crop is per-machine today; a core-wide setting like NES region is moot for single-machine cores but the choice matters for future multi-machine cores.",
+      "Discovery trust model: do you want a core the firmware has NEVER heard of to appear purely from an SD .CORE (true MiSTer 'drop a file' model, accepting ordering/identity risk), or a known-core allowlist where SD descriptors only override built-ins? Recommendation: allowlist through Phase 3, open discovery in Phase 4.",
+      "Player-2 input source: enable keyboard-driven P2 now (numpad defaults, but it contends with menu/UI keys and only works while OSD is closed), or gate P2 behind real hardware joystick input and ship the 32-bit path dormant?",
+      "Extended-key capture: fix joymap_capture/g_kd to bind real arrow / keypad keys distinctly (they currently collide with non-extended twins because 0xE0/0xF0 frames are dropped), or accept letter-key defaults forever? Affects how clean the NES d-pad defaults can be.",
+      "MACHINE_CFG bit3 (force_atlas): leave reserved/unemitted as today, or let a descriptor drive it now? RTL behavior for bit3 is untested from this firmware.",
+      "Menu depth: settings stay a single flat submenu (engine is hard-limited to 2 levels, st[2]/g_bs[2]). Confirm no core will need nested sub-submenus, or budget the renderer extension.",
+      "LOAD_CAPS bit1 = '2-player capable': reserve it now so the P2 half is fabric-gated (not just descriptor-gated), letting a 1-player core hard-suppress P2 regardless of descriptor?",
+      "Core file suffix: .CORE acceptable, or prefer .INI/.DESC? Note FatFs 8.3/case behavior — settle on an uppercase convention matching .BIT.BIN."
+    ],
+    "recommendation": "Ship the future-proof FORMAT, roll it out incrementally. Concretely: (1) Adopt Proposal 2's descriptor schema — section-headed INI, symbolic setting ids, generic reg/shift/width/invert bitfield mapping, and the small fixed set of named composite appliers (crop/paper/pint/scr) — because that surface is what lets ANY future core map its registers with zero ARM code and is the thing most expensive to re-cut later. (2) But retain Proposal 1's repeatable machine-row idea so today's picker and per-machine tuning tags (zx128/pent1024/zx48/zx48mr) survive byte-for-byte — do not collapse Atlas's three machines into a reset-setting, which would silently change the UX and the persistence granularity. (3) Execute via Proposal 1's incremental phasing behind a compiled-in built-in descriptor that reproduces Atlas + MiSTer48 exactly; that built-in is both the never-brick fallback (pl_reload already errors before touching the PL, so a bad .CORE degrades to built-in) and the hardware regression gate for every phase. Start with Phase 1 as a pure compile-time refactor whose success criterion is 'nothing changed on hardware' — the safest possible first step that still proves the whole abstraction. Defer the dynamic FS-scan / N_MACHINES retirement to Phase 4 behind a known-core allowlist, and land NES in Phase 5 as the zero-rebuild proof. Honest effort: ~7-10 focused days; Phases 1-3 are low-risk and independently shippable on the ZX path, Phase 4 carries the real complexity (dynamic count + boot self-ID + legacy ini migration + save-buffer growth), Phase 5 is mostly RTL + descriptor authoring. Two hard invariants to never violate along the way: never reindex opt_items[] (per-core rows must use owned menu_items), and never renumber JOY_STATE bits (relabel/rebind only)."
+  },
+  "workflowProgress": [
+    {
+      "type": "workflow_phase",
+      "index": 1,
+      "title": "Изучение"
+    },
+    {
+      "type": "workflow_phase",
+      "index": 2,
+      "title": "Дизайн"
+    },
+    {
+      "type": "workflow_phase",
+      "index": 3,
+      "title": "Синтез"
+    },
+    {
+      "type": "workflow_agent",
+      "index": 1,
+      "label": "read:menu-engine",
+      "phaseIndex": 1,
+      "phaseTitle": "Изучение",
+      "agentId": "aabac88ff41043257",
+      "model": "claude-opus-4-8[1m]",
+      "state": "done",
+      "startedAt": 1784920992998,
+      "queuedAt": 1784920989906,
+      "attempt": 1,
+      "lastToolName": "StructuredOutput",
+      "lastToolSummary": "ARM loader data-driven menu engine + per-machine/per-core w…",
+      "promptPreview": "Read the ARM menu engine in /Users/alex/Yandex.Disk.localized/DIY/EBAZ4205/BulbuLator/research/15-pentagon/arm/loader_main.c. Focus on the DATA-DRIVEN menu system: the opt_items[] array (search \"menu_item opt_items\"), the MenuItem/Menu structs, ITEM_CHOICE/ITEM_ACTION kinds, how submenus (mi_machine_pent/mi_machine_48/mi_machine_zx) reference opt_items by index, machine_menu_sync() (repoints the M…",
+      "lastProgressAt": 1784921143025,
+      "tokens": 67095,
+      "toolCalls": 14,
+      "durationMs": 150027,
+      "resultPreview": "{\"area\":\"ARM loader data-driven menu engine + per-machine/per-core wiring (research/15-pentagon/arm/loader_main.c)\",\"currentModel\":\"The menu is built at COMPILE TIME from static tables and is only lightly re-pointed at runtime. Two type systems cooperate: (1) the value-item primitive `menu_item`/`item_kind` (ITEM_CHOICE/ITEM_ACTION/ITEM_RANGE, lines 3974-3985) — a label + a pointer to a live `opt_…"
+    },
+    {
+      "type": "workflow_agent",
+      "index": 2,
+      "label": "read:input-joy",
+      "phaseIndex": 1,
+      "phaseTitle": "Изучение",
+      "agentId": "a2e66097898229bbf",
+      "model": "claude-opus-4-8[1m]",
+      "state": "done",
+      "startedAt": 1784920991964,
+      "queuedAt": 1784920989907,
+      "attempt": 1,
+      "lastToolName": "StructuredOutput",
+      "lastToolSummary": "ARM keyboard→virtual-joystick (JOYMAP) input model in resea…",
+      "promptPreview": "Read the ARM input/joystick code in /Users/alex/Yandex.Disk.localized/DIY/EBAZ4205/BulbuLator/research/15-pentagon/arm/loader_main.c. Focus on JOYMAP: g_joymap[8], JOYDEF, joymap_eval() (keyboard g_kd[] -> 8-bit mask -> JOY_STATE @GP0+0x100), joymap_wizard()/joymap_capture()/act_joymap(), the \"JOYSTICK MAP\" menu item, ini joymap= save/load, and the JOY_STATE bit protocol (0=R 1=L 2=D 3=U 4=Fire 5=…",
+      "lastProgressAt": 1784921136472,
+      "tokens": 51685,
+      "toolCalls": 13,
+      "durationMs": 144507,
+      "resultPreview": "{\"area\":\"ARM keyboard→virtual-joystick (JOYMAP) input model in research/15-pentagon/arm/loader_main.c — how it maps PS/2 keys to the JOY_STATE MMIO pad, and where a per-core (ZX Kempston / NES-Dendy / Sega / C64) unified input descriptor would attach.\",\"currentModel\":\"Today JOYMAP is a single GLOBAL 8-bit Kempston pad, keyboard-only, single-player. A fixed 8-entry table g_joymap[8] holds one PS/2 …"
+    },
+    {
+      "type": "workflow_agent",
+      "index": 3,
+      "label": "read:core-reload-config",
+      "phaseIndex": 1,
+      "phaseTitle": "Изучение",
+      "agentId": "abff7f60038f9d959",
+      "model": "claude-opus-4-8[1m]",
+      "state": "done",
+      "startedAt": 1784920992007,
+      "queuedAt": 1784920989908,
+      "attempt": 1,
+      "lastToolName": "StructuredOutput",
+      "lastToolSummary": "ARM runtime PL core-reload + per-machine config in research…",
+      "promptPreview": "Read the ARM core-reload + config in /Users/alex/Yandex.Disk.localized/DIY/EBAZ4205/BulbuLator/research/15-pentagon/arm/loader_main.c and note the RTL contract. Focus on: pl_reload()/fabric_reinit_after_reload()/fs cmd 9, CH_MACHINE[]/MACHINE_TAG[]/CH_MACHINE_CORE[]/machine_core()/core_path() (cores at 0:/CORES/<NAME>.BIT.BIN), g_cur_core (set from VERSION register REG_VERSION), machine_cfg_word()…",
+      "lastProgressAt": 1784921191232,
+      "tokens": 76830,
+      "toolCalls": 14,
+      "durationMs": 199225,
+      "resultPreview": "{\"area\":\"ARM runtime PL core-reload + per-machine config in research/15-pentagon/arm/loader_main.c (Step 15, v0.15.143-145). RTL contract via GP0 AXI regs (0x40000000) + a non-cacheable KVM/FS mailbox at DDR 0x0F700000.\",\"currentModel\":\"Everything about machines and cores is COMPILE-TIME, hard-coded; the only SD-sourced artifact is the raw bitstream at 0:/CORES/<NAME>.BIT.BIN. There are N_MACHINES…"
+    },
+    {
+      "type": "workflow_agent",
+      "index": 4,
+      "label": "design:incremental",
+      "phaseIndex": 2,
+      "phaseTitle": "Дизайн",
+      "agentId": "aa535291b237c266f",
+      "model": "claude-opus-4-8[1m]",
+      "state": "done",
+      "startedAt": 1784921195390,
+      "queuedAt": 1784921192853,
+      "attempt": 1,
+      "lastToolName": "StructuredOutput",
+      "lastToolSummary": "Per-core .CORE descriptor (INI-style) boot-scanned into a s…",
+      "promptPreview": "You are designing a PER-CORE DESCRIPTOR architecture for the BulbuLator (bare-metal ARM Cortex-A9 control plane, FPGA cores hot-swapped via PCAP). Owner's mental model (verbatim): \"there is a core, there are its outputs, there are settings specific to it; when we select a core, its settings are read and dynamically loaded into the menu.\" So each core ships a descriptor (on SD next to its .bit.bin)…",
+      "lastProgressAt": 1784921567113,
+      "tokens": 88291,
+      "toolCalls": 10,
+      "durationMs": 371723,
+      "resultPreview": "{\"approach\":\"Per-core .CORE descriptor (INI-style) boot-scanned into a static RAM registry; the existing opt_items[]/menubar engine is reused unchanged — machine_cfg_word(), machine_menu_sync() and the joymap become descriptor-driven by binding value-items to descriptor fields at core-select time.\",\"descriptorFormat\":\"Line-based key=value, parsed by the SAME one-pass reader as config_load() (loade…"
+    },
+    {
+      "type": "workflow_agent",
+      "index": 5,
+      "label": "design:clean",
+      "phaseIndex": 2,
+      "phaseTitle": "Дизайн",
+      "agentId": "af751a4a5b1fbfc1c",
+      "model": "claude-opus-4-8[1m]",
+      "state": "done",
+      "startedAt": 1784921195737,
+      "queuedAt": 1784921192853,
+      "attempt": 1,
+      "lastToolName": "StructuredOutput",
+      "lastToolSummary": "Per-core .CORE sidecar descriptor (INI-like, reuses the con…",
+      "promptPreview": "You are designing a PER-CORE DESCRIPTOR architecture for the BulbuLator (bare-metal ARM Cortex-A9 control plane, FPGA cores hot-swapped via PCAP). Owner's mental model (verbatim): \"there is a core, there are its outputs, there are settings specific to it; when we select a core, its settings are read and dynamically loaded into the menu.\" Like MiSTer's core+config manifest.\n\nTake the CLEAN / FUTURE…",
+      "lastProgressAt": 1784921627914,
+      "tokens": 93741,
+      "toolCalls": 11,
+      "durationMs": 432176,
+      "resultPreview": "{\"approach\":\"Per-core .CORE sidecar descriptor (INI-like, reuses the config parser) + a generic descriptor-driven menu/register/input builder; \\\"machine\\\" becomes \\\"core\\\", intra-core variants become an apply=reset choice setting. Drop .bit.bin + .CORE on SD = new core, zero ARM rebuild.\",\"descriptorFormat\":\"Line-based INI-style key=value text, one file per core, ~1-2 KB, sibling of the .bit.bin. …"
+    },
+    {
+      "type": "workflow_agent",
+      "index": 6,
+      "label": "synthesize",
+      "phaseIndex": 3,
+      "phaseTitle": "Синтез",
+      "agentId": "a174b658d99f7199f",
+      "model": "claude-opus-4-8[1m]",
+      "state": "done",
+      "startedAt": 1784921633166,
+      "queuedAt": 1784921629827,
+      "attempt": 1,
+      "lastToolName": "StructuredOutput",
+      "lastToolSummary": "Both proposals converge on the same core idea (an INI-style…",
+      "promptPreview": "You are the lead architect. Two design proposals (incremental vs clean/future-proof) for a per-core descriptor system in the BulbuLator are below, plus the current-code understanding. Synthesize ONE coherent recommended design that: (1) honours the owner's model (select core -> its descriptor drives the menu + controls dynamically); (2) is shippable incrementally but doesn't paint us into a corner…",
+      "lastProgressAt": 1784921816643,
+      "tokens": 60933,
+      "toolCalls": 4,
+      "durationMs": 183477,
+      "resultPreview": "{\"summary\":\"Both proposals converge on the same core idea (an INI-style .CORE sidecar next to each .bit.bin, a RAM-built Machine submenu, and a per-core/2-player 32-bit joystick), and differ mainly in ambition and rollout risk. Recommended synthesis: adopt Proposal 2's future-proof descriptor FORMAT (section-headed INI, symbolic setting ids, a generic reg/shift/width/invert bitfield map, and named…"
+    }
+  ],
+  "totalTokens": 438575,
+  "totalToolCalls": 66
+}
