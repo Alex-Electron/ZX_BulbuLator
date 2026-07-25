@@ -1,0 +1,95 @@
+// nes_wrap.v - BulbuLator wrapper around the NESTang `NES` core (Round-1: BRAM cartridge, NROM-class).
+// Bundles: NES core + nes_mem_bram (true-dual-port BRAM) + joypad shifter, and CENTRALISES the
+// aclk(control-plane)->nesclk(core) CDC: mapper_flags / joy / loading / resets are all quasi-static
+// or slow, so a 2-FF synchroniser into nesclk is correct and lets the whole aclk<->nesclk crossing be
+// declared asynchronous (set_clock_groups) for timing closure. The ROM LOAD port stays in aclk (ld_clk)
+// and writes the dual-port BRAM in its own domain (no lost strobes).
+//
+// Joypad bit order (joy1/joy2 [7:0]) = NES shift order, A first: bit0=A 1=B 2=Select 3=Start 4=Up 5=Down 6=Left 7=Right.
+
+module nes_wrap (
+    input  wire        clk,          // NES master ~21.5 MHz (nesclk)
+    input  wire        ld_clk,       // control-plane clock (aclk/fclk100) - ROM load port
+    input  wire        reset_nes,    // aclk: soft reset pulse (ctl_nes_reset)
+    input  wire        cold_reset,   // aclk: power-on reset level
+    input  wire [1:0]  sys_type,     // region (static)
+    input  wire [63:0] mapper_flags, // aclk (quasi-static, latched before reset release)
+
+    // ARM ROM load port (aclk domain)
+    input  wire        loading,      // aclk (quasi-static)
+    input  wire        ld_we,
+    input  wire        ld_sel,
+    input  wire [21:0] ld_addr,
+    input  wire [7:0]  ld_data,
+
+    // two parallel joypads (aclk, slow)
+    input  wire [7:0]  joy1,
+    input  wire [7:0]  joy2,
+
+    output wire [5:0]  color,
+    output wire [8:0]  cycle,
+    output wire [8:0]  scanline,
+    output wire [2:0]  emphasis,
+    output wire [15:0] sample,
+    output wire        apu_ce
+);
+    // ---- aclk -> nesclk 2-FF synchronisers (quasi-static / slow signals) ----
+    (* ASYNC_REG="TRUE" *) reg [63:0] mf_s1=0, mf_s2=0;
+    (* ASYNC_REG="TRUE" *) reg [7:0]  j1_s1=8'hFF, j1_s2=8'hFF, j2_s1=8'hFF, j2_s2=8'hFF;
+    (* ASYNC_REG="TRUE" *) reg [1:0]  ldg_s=2'b00, rn_s=2'b00, cr_s=2'b00;
+    always @(posedge clk) begin
+        mf_s1 <= mapper_flags; mf_s2 <= mf_s1;
+        j1_s1 <= joy1; j1_s2 <= j1_s1;  j2_s1 <= joy2; j2_s2 <= j2_s1;
+        ldg_s <= {ldg_s[0], loading};
+        rn_s  <= {rn_s[0],  reset_nes};
+        cr_s  <= {cr_s[0],  cold_reset};
+    end
+    wire loading_ns = ldg_s[1];
+    wire core_reset = cr_s[1] | ldg_s[1] | rn_s[1];   // in nesclk
+
+    // ---- cartridge memory buses ----
+    wire [21:0] cpumem_addr, ppumem_addr;
+    wire        cpumem_read, cpumem_write, ppumem_read, ppumem_write;
+    wire [7:0]  cpumem_dout, ppumem_dout, cpumem_din, ppumem_din;
+    nes_mem_bram mem (
+        .clk(clk), .ld_clk(ld_clk), .loading(loading_ns),
+        .cpumem_addr(cpumem_addr), .cpumem_read(cpumem_read), .cpumem_write(cpumem_write),
+        .cpumem_dout(cpumem_dout), .cpumem_din(cpumem_din),
+        .ppumem_addr(ppumem_addr), .ppumem_read(ppumem_read), .ppumem_write(ppumem_write),
+        .ppumem_dout(ppumem_dout), .ppumem_din(ppumem_din),
+        .ld_we(ld_we & loading), .ld_sel(ld_sel), .ld_addr(ld_addr), .ld_data(ld_data)   // aclk-domain load
+    );
+
+    // ---- joypad parallel->serial shifter (nesclk) ----
+    wire [2:0] joypad_out;  wire [1:0] joypad_clock;
+    reg  [7:0] sh1 = 8'hFF, sh2 = 8'hFF;  reg jclk1_d, jclk2_d;
+    always @(posedge clk) begin
+        jclk1_d <= joypad_clock[0];  jclk2_d <= joypad_clock[1];
+        if (joypad_out[0]) begin sh1 <= j1_s2; sh2 <= j2_s2; end
+        else begin
+            if (joypad_clock[0] & ~jclk1_d) sh1 <= {1'b1, sh1[7:1]};
+            if (joypad_clock[1] & ~jclk2_d) sh2 <= {1'b1, sh2[7:1]};
+        end
+    end
+    wire [4:0] joypad1_data = {4'b0000, sh1[0]};
+    wire [4:0] joypad2_data = {4'b0000, sh2[0]};
+
+    NES core (
+        .clk(clk), .reset_nes(core_reset), .cold_reset(cr_s[1]), .sys_type(sys_type),
+        .nes_div(), .mapper_flags(mf_s2),
+        .sample(sample), .color(color),
+        .joypad_out(joypad_out), .joypad_clock(joypad_clock),
+        .joypad1_data(joypad1_data), .joypad2_data(joypad2_data),
+        .fds_busy(1'b0), .fds_eject(1'b0), .diskside_req(), .diskside(2'b00),
+        .audio_channels(5'b11111),
+        .cpumem_addr(cpumem_addr), .cpumem_read(cpumem_read), .cpumem_write(cpumem_write),
+        .cpumem_dout(cpumem_dout), .cpumem_din(cpumem_din),
+        .ppumem_addr(ppumem_addr), .ppumem_read(ppumem_read), .ppumem_write(ppumem_write),
+        .ppumem_dout(ppumem_dout), .ppumem_din(ppumem_din),
+        .bram_addr(), .bram_din(8'h00), .bram_dout(), .bram_write(), .bram_override(),
+        .cycle(cycle), .scanline(scanline),
+        .int_audio(1'b1), .ext_audio(1'b0), .apu_ce(apu_ce),
+        .gg(1'b0), .gg_code(129'b0), .gg_avail(), .gg_reset(1'b0),
+        .emphasis(emphasis), .save_written()
+    );
+endmodule

@@ -1,0 +1,255 @@
+#!/usr/bin/env python3
+# -*- coding: utf-8 -*-
+"""
+wsz_convert.py - BulbuLator Step 14 Winamp-skin (.wsz) converter.
+
+A .wsz is a ZIP of 8-bit (256-colour, palettised) BMP sprites plus a few colour
+config files (PLEDIT.TXT, VISCOLOR.TXT). This tool decodes every BMP through its
+own palette to full true-colour RGB (so nothing is limited to 16/256 colours on
+our side - the on-device canvas is ARGB8888), slices the named Winamp sprites by
+their fixed layout, and emits:
+
+  * PNGs (for eyeball verification of the decode/palette),
+  * a C header with a chosen sprite baked as ARGB8888 (JTAG bring-up, no SD),
+  * (later) a binary SKIN.PAK for the on-device loader to read from SD.
+
+Pure stdlib (zipfile, struct, zlib) - no Pillow needed.
+Contact: lavrinovich.alex@gmail.com
+"""
+import sys, os, struct, zlib, zipfile
+
+# ---------------------------------------------------------------- BMP decode
+def _decode_rle8(data, off, w, h, pal):
+    """BI_RLE8 -> RGB list (top-down). RLE rows are bottom-up; row 0 of the run = bottom row."""
+    out = [(0, 0, 0)] * (w * h)
+    x = 0; y = 0; p = off; n = len(data)
+    while p + 1 < n:
+        cnt = data[p]; val = data[p+1]; p += 2
+        row = h - 1 - y                                    # RLE is bottom-up -> flip to top-down
+        if cnt > 0:                                        # encoded run: cnt px of index val
+            for _ in range(cnt):
+                if 0 <= x < w and 0 <= row < h: out[row*w + x] = pal[val]
+                x += 1
+        elif val == 0:  x = 0; y += 1                      # end of line
+        elif val == 1:  break                              # end of bitmap
+        elif val == 2:                                     # delta
+            x += data[p]; y += data[p+1]; p += 2
+        else:                                              # absolute run of `val` literal indices
+            for k in range(val):
+                px = data[p+k]
+                if 0 <= x < w and 0 <= row < h: out[row*w + x] = pal[px]
+                x += 1
+            p += val
+            if val & 1: p += 1                             # pad to 16-bit boundary
+    return out
+
+def decode_bmp(data):
+    """8/24/32-bpp BMP (BI_RGB or BI_RLE8) -> (w, h, [ (r,g,b), ... ] top-down, row-major)."""
+    if data[:2] != b'BM':
+        raise ValueError("not a BMP")
+    off_bits = struct.unpack_from('<I', data, 0x0A)[0]
+    dib      = struct.unpack_from('<I', data, 0x0E)[0]
+    w, h     = struct.unpack_from('<ii', data, 0x12)
+    bpp      = struct.unpack_from('<H', data, 0x1C)[0]
+    comp     = struct.unpack_from('<I', data, 0x1E)[0]
+    clr_used = struct.unpack_from('<I', data, 0x2E)[0]
+    top_down = h < 0
+    h = abs(h)
+    # palette (<=8bpp): BGRA quads right after the DIB header
+    pal = []
+    if bpp <= 8:
+        cnt = clr_used if clr_used else (1 << bpp)
+        base = 14 + dib
+        for i in range(cnt):
+            b, g, r, _ = data[base + i*4: base + i*4 + 4]
+            pal.append((r, g, b))
+    if comp == 1:                                          # BI_RLE8
+        if bpp != 8: raise ValueError("RLE8 needs 8bpp")
+        return w, h, _decode_rle8(data, off_bits, w, h, pal)
+    if comp not in (0,):
+        raise ValueError("unsupported compression %d" % comp)
+    stride = ((w * bpp + 31) // 32) * 4
+    out = [None] * (w * h)
+    for row in range(h):
+        src_y = row if top_down else (h - 1 - row)         # BMP rows are bottom-up
+        ro = off_bits + src_y * stride
+        for x in range(w):
+            if bpp == 8:
+                out[row*w + x] = pal[data[ro + x]]
+            elif bpp == 24:
+                b, g, r = data[ro + x*3: ro + x*3 + 3]
+                out[row*w + x] = (r, g, b)
+            elif bpp == 32:
+                b, g, r, _ = data[ro + x*4: ro + x*4 + 4]
+                out[row*w + x] = (r, g, b)
+            else:
+                raise ValueError("unsupported bpp %d" % bpp)
+    return w, h, out
+
+# ---------------------------------------------------------------- PNG encode
+def write_png(path, w, h, rgb):
+    def chunk(tag, payload):
+        c = tag + payload
+        return struct.pack('>I', len(payload)) + c + struct.pack('>I', zlib.crc32(c) & 0xffffffff)
+    raw = bytearray()
+    for y in range(h):
+        raw.append(0)                                       # filter: none
+        for x in range(w):
+            r, g, b = rgb[y*w + x]
+            raw += bytes((r, g, b))
+    png = b'\x89PNG\r\n\x1a\n'
+    png += chunk(b'IHDR', struct.pack('>IIBBBBB', w, h, 8, 2, 0, 0, 0))   # 8-bit RGB
+    png += chunk(b'IDAT', zlib.compress(bytes(raw), 9))
+    png += chunk(b'IEND', b'')
+    with open(path, 'wb') as f:
+        f.write(png)
+
+# ---------------------------------------------------------------- C header
+def emit_c_argb(path, name, w, h, rgb, transparent=(0,0,0)):
+    """Bake a sprite as ARGB8888 (alpha=0 for the transparent key colour)."""
+    with open(path, 'w') as f:
+        f.write("/* auto-generated by wsz_convert.py - do not edit */\n")
+        f.write("#include <stdint.h>\n")
+        f.write("#define %s_W %d\n#define %s_H %d\n" % (name.upper(), w, name.upper(), h))
+        f.write("static const uint32_t %s[%d] = {\n" % (name, w*h))
+        line = []
+        for i, (r, g, b) in enumerate(rgb):
+            a = 0 if (r, g, b) == transparent else 255
+            line.append("0x%08X" % ((a << 24) | (r << 16) | (g << 8) | b))
+            if len(line) == 8:
+                f.write("  " + ",".join(line) + ",\n"); line = []
+        if line:
+            f.write("  " + ",".join(line) + ",\n")
+        f.write("};\n")
+
+# ---------------------------------------------------------------- compositor
+def crop(rgb, sw, x, y, cw, ch):
+    """Crop a cw x ch sub-rect from a source RGB list of width sw."""
+    return [rgb[(y+j)*sw + (x+i)] for j in range(ch) for i in range(cw)]
+
+def paste(dst, dw, src, sw, sh, dx, dy):
+    """Opaque paste of a sw x sh sprite onto dst (width dw) at (dx,dy)."""
+    for j in range(sh):
+        for i in range(sw):
+            dst[(dy+j)*dw + (dx+i)] = src[j*sw + i]
+
+def compose_main(dec):
+    """Composite the full Winamp main window: MAIN + titlebar + transport + sliders + posbar
+       + mono/stereo, at the canonical Winamp 2.x coordinates (Webamp sprite map).
+       dec = {NAME.BMP: (w,h,rgb)}. Returns (275,116, rgb)."""
+    mw, mh, main = dec['MAIN.BMP']
+    win = list(main)
+    def put(name, sx, sy, cw, ch, dx, dy):
+        if name not in dec: return
+        sw, sh, rgb = dec[name]
+        paste(win, mw, crop(rgb, sw, sx, sy, cw, ch), cw, ch, dx, dy)
+    # titlebar (active state) -> top 14 px
+    put('TITLEBAR.BMP', 27, 0, 275, 14, 0, 0)
+    # mono / stereo indicators (show stereo lit, mono dim)
+    put('MONOSTER.BMP', 29, 12, 27, 12, 212, 41)   # mono  (off row)
+    put('MONOSTER.BMP',  0,  0, 29, 12, 239, 41)   # stereo (on  row)
+    # NOTE: the VOLUME slider is intentionally NOT baked here - it is drawn on-device from the live
+    # F9 volume (opt_vol), see draw_volume() in loader_main.c (baked separately as skin_volume.h).
+    # balance slider: centre track + centred knob (static; no balance control yet)
+    put('BALANCE.BMP', 9, 15*13, 38, 13, 177, 57)
+    put('BALANCE.BMP', 15, 422, 14, 11, 177 + (38-14)//2, 58)
+    # position bar: 248-px groove + 29-px thumb at the left
+    put('POSBAR.BMP',   0, 0, 248, 10, 16, 72)
+    put('POSBAR.BMP', 248, 0,  29, 10, 16, 72)
+    # transport buttons (normal row): prev/play/pause/stop/next 23x18, eject 22x16
+    for k, dx in enumerate((16, 39, 62, 85, 108)):
+        put('CBUTTONS.BMP', k*23, 0, 23, 18, dx, 88)
+    put('CBUTTONS.BMP', 114, 0, 22, 16, 136, 89)
+    return mw, mh, win
+
+# ---------------------------------------------------------------- playlist window
+def compose_pledit(dec, W, H):
+    """Compose a Winamp PLEDIT (playlist) window at W x H from PLEDIT.BMP frame pieces:
+       top bar (corners + tiled fill + centred title), tiled side edges, bottom bar.
+       Interior left black (PLEDIT NormalBG) for the status text drawn on-device.
+       Winamp 2.x PLEDIT sprite coords (Webamp map)."""
+    pw, ph, pl = dec['PLEDIT.BMP']
+    win = [(0, 0, 0)] * (W * H)                         # black interior (NormalBG #000000)
+    def put(sx, sy, cw, ch, dx, dy):
+        paste(win, W, crop(pl, pw, sx, sy, cw, ch), cw, ch, dx, dy)
+    def tile_h(sx, sy, cw, ch, x0, x1, y):
+        x = x0
+        while x < x1:
+            w = min(cw, x1 - x); paste(win, W, crop(pl, pw, sx, sy, w, ch), w, ch, x, y); x += cw
+    def tile_v(sx, sy, cw, ch, y0, y1, x):
+        y = y0
+        while y < y1:
+            h = min(ch, y1 - y); paste(win, W, crop(pl, pw, sx, sy, cw, h), cw, h, x, y); y += ch
+    # top bar (h=20): tiled fill, then corners, then centred title
+    tile_h(127, 0, 25, 20, 0, W, 0)
+    put(0,   0, 25, 20, 0,      0)                       # top-left corner
+    put(153, 0, 25, 20, W-25,   0)                       # top-right corner
+    put(26,  0, 100,20, (W-100)//2, 0)                   # centred "WINAMP PLAYLIST" title
+    # side edges (y = 20 .. H-38)
+    tile_v(0,  42, 12, 29, 20, H-38, 0)                  # left edge
+    tile_v(31, 42, 20, 29, 20, H-38, W-20)               # right edge (scrollbar groove)
+    # bottom bar (h=38): left cluster + right cluster (abut at W=275)
+    put(0,   72, 125, 38, 0,     H-38)                   # bottom-left
+    put(126, 72, 150, 38, W-150, H-38)                   # bottom-right
+    return W, H, win
+
+# ---------------------------------------------------------------- main
+def main():
+    if len(sys.argv) < 3:
+        print("usage: wsz_convert.py <skin.wsz> <outdir>"); return 1
+    wsz, outdir = sys.argv[1], sys.argv[2]
+    os.makedirs(outdir, exist_ok=True)
+    z = zipfile.ZipFile(wsz)
+    names = {n.upper(): n for n in z.namelist()}
+    want = ['MAIN.BMP', 'CBUTTONS.BMP', 'TEXT.BMP', 'NUMBERS.BMP', 'POSBAR.BMP', 'TITLEBAR.BMP',
+            'VOLUME.BMP', 'BALANCE.BMP', 'PLEDIT.BMP', 'MONOSTER.BMP', 'PLAYPAUS.BMP', 'SHUFREP.BMP']
+    dec = {}
+    for wname in want:
+        if wname not in names:
+            continue
+        try:
+            w, h, rgb = decode_bmp(z.read(names[wname]))
+        except Exception as e:
+            print("  SKIP %-14s (%s)" % (wname, e)); continue
+        dec[wname] = (w, h, rgb)
+        stem = os.path.splitext(wname)[0].lower()
+        write_png(os.path.join(outdir, stem + ".png"), w, h, rgb)
+        print("  %-14s %3dx%-3d -> %s.png" % (wname, w, h, stem))
+    # compose the static base window (everything except the live volume slider), verify + bake
+    if 'MAIN.BMP' in dec:
+        w, h, rgb = compose_main(dec)
+        write_png(os.path.join(outdir, "composed.png"), w, h, rgb)
+        emit_c_argb(os.path.join(outdir, "skin_main.h"), "skin_main", w, h, rgb, transparent=None)
+        print("  composed.png + baked skin_main.h  (%dx%d base window)" % (w, h))
+    # bake the full VOLUME.BMP so the ARM can draw the live volume slider (track level + knob)
+    if 'VOLUME.BMP' in dec:
+        vw, vh, vrgb = dec['VOLUME.BMP']
+        emit_c_argb(os.path.join(outdir, "skin_volume.h"), "skin_volume", vw, vh, vrgb, transparent=None)
+        print("  baked skin_volume.h  (%dx%d, %d level tracks + knob at (15,422))" % (vw, vh, 28))
+    # bake NUMBERS.BMP so the ARM can draw the big LCD time digits in the skin's time field (0-9, 9px each)
+    if 'NUMBERS.BMP' in dec:
+        nw, nh, nrgb = dec['NUMBERS.BMP']
+        emit_c_argb(os.path.join(outdir, "skin_numbers.h"), "skin_numbers", nw, nh, nrgb, transparent=None)
+        print("  baked skin_numbers.h  (%dx%d: digits 0-9, ~9px each)" % (nw, nh))
+    # bake TEXT.BMP (Winamp 5x6 bitmap font) so the ARM can draw the kbps/kHz numbers in the main window's
+    # dedicated fields (kbps at 111,43 ; kHz at 156,43). Digits 0-9 are the font row at y=3, x = digit*5.
+    if 'TEXT.BMP' in dec:
+        tw, th, trgb = dec['TEXT.BMP']
+        emit_c_argb(os.path.join(outdir, "skin_text.h"), "skin_text", tw, th, trgb, transparent=None)
+        print("  baked skin_text.h  (%dx%d: 5x6 bitmap font, digits at row y=3)" % (tw, th))
+    # bake POSBAR.BMP so the ARM can animate the progress thumb (groove 0..247 + thumb at x=248, 29x10)
+    if 'POSBAR.BMP' in dec:
+        pw, ph, prgb = dec['POSBAR.BMP']
+        emit_c_argb(os.path.join(outdir, "skin_posbar.h"), "skin_posbar", pw, ph, prgb, transparent=None)
+        print("  baked skin_posbar.h  (%dx%d: 248-px groove + 29-px thumb at x=248)" % (pw, ph))
+    # compose the PLEDIT playlist window (docks under the main window; status text drawn on-device)
+    if 'PLEDIT.BMP' in dec:
+        PLW, PLH = 275, 84
+        w, h, rgb = compose_pledit(dec, PLW, PLH)
+        write_png(os.path.join(outdir, "composed_pl.png"), w, h, rgb)
+        emit_c_argb(os.path.join(outdir, "skin_pl.h"), "skin_pl", w, h, rgb, transparent=None)
+        print("  composed_pl.png + baked skin_pl.h  (%dx%d playlist window)" % (w, h))
+    return 0
+
+if __name__ == '__main__':
+    sys.exit(main())
