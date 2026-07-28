@@ -1,6 +1,6 @@
 read_verilog -sv [glob hdmi/src/*.sv]
 read_verilog -sv hdmi_wrap.sv
-read_verilog axi_ctl.v fb_capture_rr.v async_fifo.v fb_wr_axi.v fb_bufmgr3.v fb_line_disp.v atlas_core/ps2.v
+read_verilog axi_ctl.v fb_capture_rr.v async_fifo.v fb_wr_axi.v fb_bufmgr3.v fb_line_disp.v atlas_core/ps2.v osd_compositor.v osd_ddr_rd.v
 read_verilog nes_core/nes_mem_bram.v nes_core/nes_wrap.v nes_core/nes_video.v bulbulator_nes_top.v
 read_verilog -sv nes_core/t65/T65_Pack.v nes_core/t65/T65_MCode.v nes_core/t65/T65_ALU.v nes_core/t65/T65.v
 read_verilog -sv [glob nes_core/mappers/*.sv]
