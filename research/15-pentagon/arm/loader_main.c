@@ -628,7 +628,7 @@ static void browser_status(const char* s){   /* transient feedback (MOUNT/READ/F
 /* Title screen (shown when the OSD opens with F12): just the name, centred, scale 2. */
 /* Firmware build tag shown on the F12 splash (bump per milestone). The PL core VERSION
    (0x4000_0000) is shown live too, so the splash states exactly which firmware + bitstream run. */
-#define BULB_FW "v0.15.147"
+#define BULB_FW "v0.15.148"
 static char hexnib(uint32_t v){ return (v<10) ? ('0'+v) : ('A'+v-10); }
 /* Single source of truth for the version line ("v0.13 core 0xB01B0013"): the ARM firmware tag
    BULB_FW + the live PL core VERSION read from register 0x00. Used by BOTH the F12 splash
@@ -4404,33 +4404,33 @@ static Menu m_tape = { mi_tape, 12, 0 };
    parameters"). All per-machine: paper, INT timing, AND crop (crop differs per machine - different
    line counts). ZX 128K has no paper/INT tuners (pentagon-gated in RTL) but still has its own crop. */
 static const MenuItem mi_machine_zx[] = {
-  {"Machine",        0,0,NULL, NULL, &opt_items[20]},
-  {"ULA timing",     0,0,NULL, NULL, &opt_items[37]},      /* 128/+2 Ferranti ULA also has the physical Early/Late variation */
-  {"ULA snow",       0,0,NULL, NULL, &opt_items[38]},      /* v145: 128K ULA I:R snow ON(faithful)/OFF(clean) */
-  {"Crop left",      0,0,NULL, NULL, &opt_items[27]},      /* per-machine crop */
-  {"Crop right",     0,0,NULL, NULL, &opt_items[28]},
-  {"Crop top",       0,0,NULL, NULL, &opt_items[29]},
-  {"Crop bottom",    0,0,NULL, NULL, &opt_items[30]},
+  {"Machine",        0,0,NULL, NULL, &opt_items[21]},
+  {"ULA timing",     0,0,NULL, NULL, &opt_items[38]},      /* 128/+2 Ferranti ULA also has the physical Early/Late variation */
+  {"ULA snow",       0,0,NULL, NULL, &opt_items[39]},      /* v145: 128K ULA I:R snow ON(faithful)/OFF(clean) */
+  {"Crop left",      0,0,NULL, NULL, &opt_items[28]},      /* per-machine crop */
+  {"Crop right",     0,0,NULL, NULL, &opt_items[29]},
+  {"Crop top",       0,0,NULL, NULL, &opt_items[30]},
+  {"Crop bottom",    0,0,NULL, NULL, &opt_items[31]},
 };
 static const MenuItem mi_machine_pent[] = {
-  {"Machine",        0,0,NULL, NULL, &opt_items[20]},
-  {"Paper H off",    0,0,NULL, NULL, &opt_items[23]},      /* paper within frame - H (border distribution) */
-  {"Paper V off",    0,0,NULL, NULL, &opt_items[24]},      /* paper within frame - V */
-  {"Pentagon INT V", 0,0,NULL, NULL, &opt_items[21]},      /* TIMING (not position); changing re-times border FX -> reload demo */
-  {"Pentagon INT H", 0,0,NULL, NULL, &opt_items[22]},      /* (future here: Turbo, INT len, ROM, RAM) */
-  {"Crop left",      0,0,NULL, NULL, &opt_items[27]},      /* per-machine crop */
-  {"Crop right",     0,0,NULL, NULL, &opt_items[28]},
-  {"Crop top",       0,0,NULL, NULL, &opt_items[29]},
-  {"Crop bottom",    0,0,NULL, NULL, &opt_items[30]},
+  {"Machine",        0,0,NULL, NULL, &opt_items[21]},
+  {"Paper H off",    0,0,NULL, NULL, &opt_items[24]},      /* paper within frame - H (border distribution) */
+  {"Paper V off",    0,0,NULL, NULL, &opt_items[25]},      /* paper within frame - V */
+  {"Pentagon INT V", 0,0,NULL, NULL, &opt_items[22]},      /* TIMING (not position); changing re-times border FX -> reload demo */
+  {"Pentagon INT H", 0,0,NULL, NULL, &opt_items[23]},      /* (future here: Turbo, INT len, ROM, RAM) */
+  {"Crop left",      0,0,NULL, NULL, &opt_items[28]},      /* per-machine crop */
+  {"Crop right",     0,0,NULL, NULL, &opt_items[29]},
+  {"Crop top",       0,0,NULL, NULL, &opt_items[30]},
+  {"Crop bottom",    0,0,NULL, NULL, &opt_items[31]},
 };
 static const MenuItem mi_machine_48[] = {
-  {"Machine",        0,0,NULL, NULL, &opt_items[20]},
-  {"ULA timing",     0,0,NULL, NULL, &opt_items[37]},      /* Type 1/Early or Type 2/Late, exactly 1 CPU T apart */
-  {"ULA snow",       0,0,NULL, NULL, &opt_items[38]},      /* v145: 48K ULA I:R snow ON(faithful)/OFF(clean) - Atlas 48K only */
-  {"Crop left",      0,0,NULL, NULL, &opt_items[27]},
-  {"Crop right",     0,0,NULL, NULL, &opt_items[28]},
-  {"Crop top",       0,0,NULL, NULL, &opt_items[29]},
-  {"Crop bottom",    0,0,NULL, NULL, &opt_items[30]},
+  {"Machine",        0,0,NULL, NULL, &opt_items[21]},
+  {"ULA timing",     0,0,NULL, NULL, &opt_items[38]},      /* Type 1/Early or Type 2/Late, exactly 1 CPU T apart */
+  {"ULA snow",       0,0,NULL, NULL, &opt_items[39]},      /* v145: 48K ULA I:R snow ON(faithful)/OFF(clean) - Atlas 48K only */
+  {"Crop left",      0,0,NULL, NULL, &opt_items[28]},
+  {"Crop right",     0,0,NULL, NULL, &opt_items[29]},
+  {"Crop top",       0,0,NULL, NULL, &opt_items[30]},
+  {"Crop bottom",    0,0,NULL, NULL, &opt_items[31]},
 };
 static Menu m_machine = { mi_machine_pent, 9, 0 };         /* set by machine_menu_sync() */
 static void machine_menu_sync(void){                       /* point the Machine submenu at the current machine's param set */
@@ -4441,8 +4441,8 @@ static void machine_menu_sync(void){                       /* point the Machine 
 }
 
 static const MenuItem mi_display[] = {                     /* GLOBAL DISPLAY: machine-independent (crop moved to Machine - it's per-machine) */
-  {"Screen X",       0,0,NULL, NULL, &opt_items[25]},      /* whole frame H position on HDMI */
-  {"Screen Y",       0,0,NULL, NULL, &opt_items[26]},      /* whole frame V position on HDMI */
+  {"Screen X",       0,0,NULL, NULL, &opt_items[26]},      /* whole frame H position on HDMI */
+  {"Screen Y",       0,0,NULL, NULL, &opt_items[27]},      /* whole frame V position on HDMI */
   {"OSD dim",        0,0,NULL, NULL, &opt_items[7]},
 };
 static Menu m_display = { mi_display, 3, 0 };
@@ -4452,15 +4452,15 @@ static const MenuItem mi_navigator[] = {                   /* UI / browser */
   {"Window Y",       0,0,NULL, NULL, &opt_items[9]},
   {"Scroll speed",   0,0,NULL, NULL, &opt_items[1]},
   {"Scroll delay",   0,0,NULL, NULL, &opt_items[2]},
-  {"Show hidden",    0,0,NULL, NULL, &opt_items[16]},      /* macOS .DS_Store/._* junk toggle */
-  {"Show navigator on boot",0,0,NULL, NULL, &opt_items[18]},
+  {"Show hidden",    0,0,NULL, NULL, &opt_items[17]},      /* macOS .DS_Store/._* junk toggle */
+  {"Show navigator on boot",0,0,NULL, NULL, &opt_items[19]},
 };
 static Menu m_navigator = { mi_navigator, 6, 0 };
 
 static const MenuItem mi_audio[] = {                       /* (tape/MP3 params -> Tape menu; play mode -> Play menu) */
   {"Volume",         0,0,NULL, NULL, &opt_items[6]},
   {"Pause on music", 0,0,NULL, NULL, &opt_items[5]},
-  {"On launch (music)",0,0,NULL, NULL, &opt_items[17]},
+  {"On launch (music)",0,0,NULL, NULL, &opt_items[18]},
 };
 static Menu m_audio = { mi_audio, 3, 0 };
 
