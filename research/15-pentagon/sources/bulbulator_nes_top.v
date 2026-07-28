@@ -283,17 +283,70 @@ module bulbulator_nes_top (
         .sx0_a(12'd0), .sy0_a(12'd0), .cropw_a(12'd256), .croph_a(12'd240),
         .rgb(rgb24), .live(ld_live), .underrun_cnt(ld_underrun));
 
-    // HP1 (OSD reader) unused in Round-1 -> tie its AR channel idle
-    assign hp1_araddr=32'd0; assign hp1_arid=6'd0; assign hp1_arlen=4'd0; assign hp1_arsize=3'd0;
-    assign hp1_arburst=2'd0; assign hp1_arcache=4'd0; assign hp1_arprot=3'd0; assign hp1_arlock=2'd0;
-    assign hp1_arqos=4'd0; assign hp1_arvalid=1'b0; assign hp1_rready=1'b1;
+    // OSD compositor (1-bpp toast strip over raw NES scanout)
+    wire [23:0] rgb24_osd;
+    osd_compositor osd_i (
+        .clk_pixel(clk_pixel), .aclk(fclk100),
+        .osd_enable_a(zx_osd_en), .osd_we(zx_osd_we),
+        .osd_waddr(zx_osd_waddr), .osd_wdata(zx_osd_wdata), .osd_bg_a(zx_osd_bg), .osd_op_a(zx_osd_op), .osd_pos_a(zx_osd_pos),
+        .cx(cx), .cy(cy), .rgb_in(rgb24), .rgb_out(rgb24_osd)
+    );
 
-    //==== HDMI out (rgb direct, NES APU sample to both channels) ====
+    // DDR-backed TRUE-COLOUR OSD layer read over HP1 port
+    reg [31:0] odpos_s1=32'd0, odpos_s2=32'd0, odpos_s3=32'd0, odpos_q=32'd0;
+    (* ASYNC_REG="TRUE" *) reg [1:0] oden_s = 2'b00;
+    always @(posedge clk_pixel) begin
+        odpos_s1<=zx_ddr_osd_pos; odpos_s2<=odpos_s1; odpos_s3<=odpos_s2;
+        if (odpos_s2==odpos_s3) odpos_q<=odpos_s2;
+        oden_s <= {oden_s[0], zx_ddr_osd_en};
+    end
+    wire [23:0] osd_ddr_rgb; wire [7:0] osd_ddr_a; wire osd_ddr_active;
+    osd_ddr_rd #(.CW(640), .CH(400)) osddr (
+        .clk(fclk100), .resetn(core_resetn), .osd_base(zx_osd_ddr_base), .frame_kick(frame_kick_d),
+        .ar_addr(hp1_araddr), .ar_id(hp1_arid), .ar_len(hp1_arlen), .ar_size(hp1_arsize),
+        .ar_burst(hp1_arburst), .ar_cache(hp1_arcache), .ar_prot(hp1_arprot),
+        .ar_lock(hp1_arlock), .ar_qos(hp1_arqos), .ar_valid(hp1_arvalid), .ar_ready(hp1_arready),
+        .r_data(hp1_rdata), .r_last(hp1_rlast), .r_valid(hp1_rvalid), .r_ready(hp1_rready),
+        .rd_clk(clk_pixel), .cx(cx), .cy(cy),
+        .x0(odpos_q[10:0]), .y0(odpos_q[26:16]), .en(oden_s[1]),
+        .osd_rgb(osd_ddr_rgb), .osd_a(osd_ddr_a), .osd_active(osd_ddr_active)
+    );
+
+    // Pipelining stage for OSD blend alignment
+    reg [10:0] cx_d1 = 11'd0, cx_d2 = 11'd0, cy_d1 = 11'd0, cy_d2 = 11'd0;
+    always @(posedge clk_pixel) begin cx_d1<=cx; cx_d2<=cx_d1; cy_d1<=cy; cy_d2<=cy_d1; end
+
+    reg [23:0] rgb24_osd_q = 24'd0;
+    always @(posedge clk_pixel) rgb24_osd_q <= rgb24_osd;
+
+    reg        od_act_d1 = 1'b0; reg [7:0] od_a_d1 = 8'd0; reg [23:0] od_rgb_d1 = 24'd0;
+    always @(posedge clk_pixel) begin
+        od_act_d1 <= osd_ddr_active; od_a_d1 <= osd_ddr_a; od_rgb_d1 <= osd_ddr_rgb;
+    end
+
+    wire [7:0]  od_ia = 8'd255 - od_a_d1;
+    wire [15:0] od_r = od_rgb_d1[23:16]*od_a_d1 + rgb24_osd_q[23:16]*od_ia;
+    wire [15:0] od_g = od_rgb_d1[15:8] *od_a_d1 + rgb24_osd_q[15:8] *od_ia;
+    wire [15:0] od_b = od_rgb_d1[7:0]  *od_a_d1 + rgb24_osd_q[7:0]  *od_ia;
+    reg [23:0] rgb24_ddr_q = 24'd0;
+    always @(posedge clk_pixel)
+        rgb24_ddr_q <= od_act_d1 ? { od_r[15:8], od_g[15:8], od_b[15:8] } : rgb24_osd_q;
+
+    // Independent status BANNER
+    wire [23:0] rgb24_ovl;
+    banner_compositor banner_i (
+        .clk_pixel(clk_pixel), .aclk(fclk100),
+        .ban_enable_a(zx_ban_en), .ban_we(zx_ban_we),
+        .ban_waddr(zx_ban_waddr), .ban_wdata(zx_ban_wdata), .ban_pos_a(zx_ban_pos),
+        .cx(cx_d2), .cy(cy_d2), .rgb_in(rgb24_ddr_q), .rgb_out(rgb24_ovl)
+    );
+
+    //==== HDMI out (pipelined and composited) ====
     wire [2:0] tmds;  wire tmds_clock;
     wire signed [15:0] nes_audio = $signed(nes_sample) - 16'sd16384;   // rough unsigned->signed centering
     hdmi_wrap hdmi_ (
         .clk_pixel_x5(clk_ser), .clk_pixel(clk_pixel), .clk_audio(clk_audio_r), .reset(hdmi_reset),
-        .rgb(rgb24), .audio_left(nes_audio), .audio_right(nes_audio),
+        .rgb(rgb24_ovl), .audio_left(nes_audio), .audio_right(nes_audio),
         .tmds(tmds), .tmds_clock(tmds_clock), .cx(cx), .cy(cy));
     OBUFDS obuf_clk (.I(tmds_clock), .O(TMDS_Clk_p), .OB(TMDS_Clk_n));
     genvar gi; generate for (gi=0; gi<3; gi=gi+1) begin : tb
