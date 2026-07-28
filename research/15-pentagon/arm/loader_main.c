@@ -628,7 +628,7 @@ static void browser_status(const char* s){   /* transient feedback (MOUNT/READ/F
 /* Title screen (shown when the OSD opens with F12): just the name, centred, scale 2. */
 /* Firmware build tag shown on the F12 splash (bump per milestone). The PL core VERSION
    (0x4000_0000) is shown live too, so the splash states exactly which firmware + bitstream run. */
-#define BULB_FW "v0.15.148"
+#define BULB_FW "v0.15.149"
 static char hexnib(uint32_t v){ return (v<10) ? ('0'+v) : ('A'+v-10); }
 /* Single source of truth for the version line ("v0.13 core 0xB01B0013"): the ARM firmware tag
    BULB_FW + the live PL core VERSION read from register 0x00. Used by BOTH the F12 splash
@@ -1486,15 +1486,6 @@ static void render_browser_dn(void){
 }
 static void render_browser(void){ render_browser_dn(); }   /* single entry point - all call sites now draw DN */
 static void open_browser(void){
-    if (cicmp(g_cur_core, "ATLAS") != 0) {
-        /* We are in NES mode. Since NES has no OSD compositor, we must PCAP-reload
-           the ATLAS core to show the browser / menu, resetting back to Spectrum. */
-        opt_defmachine = 0; // default back to ZX 128K
-        apply_machine();
-        if (cicmp(g_cur_core, "ATLAS") != 0) {
-            return; // reload failed or ATLAS.BIT.BIN missing
-        }
-    }
     sel_scroll=0; last_scroll=0; scroll_started=0; opt_on=0;
     OSD_CTRL=(OSD_CTRL|2u)&~1u; osd_on=1; browser_on=1; osd_view=3;   /* DN browser on the colour layer (bit1); drop the 1bpp plane */
     render_browser();        /* INSTANT window before any SD I/O - a keypress always shows something */
@@ -4407,6 +4398,8 @@ static const MenuItem mi_machine_zx[] = {
   {"Machine",        0,0,NULL, NULL, &opt_items[21]},
   {"ULA timing",     0,0,NULL, NULL, &opt_items[38]},      /* 128/+2 Ferranti ULA also has the physical Early/Late variation */
   {"ULA snow",       0,0,NULL, NULL, &opt_items[39]},      /* v145: 128K ULA I:R snow ON(faithful)/OFF(clean) */
+  {"Paper H off",    0,0,NULL, NULL, &opt_items[24]},      /* paper within frame - H (border distribution) */
+  {"Paper V off",    0,0,NULL, NULL, &opt_items[25]},      /* paper within frame - V */
   {"Crop left",      0,0,NULL, NULL, &opt_items[28]},      /* per-machine crop */
   {"Crop right",     0,0,NULL, NULL, &opt_items[29]},
   {"Crop top",       0,0,NULL, NULL, &opt_items[30]},
@@ -4427,6 +4420,8 @@ static const MenuItem mi_machine_48[] = {
   {"Machine",        0,0,NULL, NULL, &opt_items[21]},
   {"ULA timing",     0,0,NULL, NULL, &opt_items[38]},      /* Type 1/Early or Type 2/Late, exactly 1 CPU T apart */
   {"ULA snow",       0,0,NULL, NULL, &opt_items[39]},      /* v145: 48K ULA I:R snow ON(faithful)/OFF(clean) - Atlas 48K only */
+  {"Paper H off",    0,0,NULL, NULL, &opt_items[24]},      /* paper within frame - H */
+  {"Paper V off",    0,0,NULL, NULL, &opt_items[25]},      /* paper within frame - V */
   {"Crop left",      0,0,NULL, NULL, &opt_items[28]},
   {"Crop right",     0,0,NULL, NULL, &opt_items[29]},
   {"Crop top",       0,0,NULL, NULL, &opt_items[30]},
@@ -4435,8 +4430,8 @@ static const MenuItem mi_machine_48[] = {
 static Menu m_machine = { mi_machine_pent, 9, 0 };         /* set by machine_menu_sync() */
 static void machine_menu_sync(void){                       /* point the Machine submenu at the current machine's param set */
     if(opt_defmachine==1){ m_machine.items=mi_machine_pent; m_machine.count=9; }
-    else if(opt_defmachine>=2){ m_machine.items=mi_machine_48; m_machine.count=7; }   /* both 48K variants (Atlas / MiSTer) share the 48K submenu (+ULA snow row) */
-    else                 { m_machine.items=mi_machine_zx;   m_machine.count=7; }      /* 128K submenu (+ULA snow row) */
+    else if(opt_defmachine>=2){ m_machine.items=mi_machine_48; m_machine.count=9; }   /* both 48K variants (Atlas / MiSTer) share the 48K submenu (+ULA snow row) */
+    else                 { m_machine.items=mi_machine_zx;   m_machine.count=9; }      /* 128K submenu (+ULA snow row) */
     m_machine.deflt=0;
 }
 
