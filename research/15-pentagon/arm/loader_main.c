@@ -4188,9 +4188,13 @@ static void apply_crop(void){
     CROP_B = (croph<<16) | (cropw & 0xFFFFu);
 }
 static unsigned machine_cfg_word(void){
-    unsigned cfg = (opt_defmachine==1) ? 1u : (opt_defmachine>=2) ? 2u : 0u;   /* idx 2,3 = 48K submode (Atlas or MiSTer core) */
-    if(opt_defmachine!=1 && opt_ulalate) cfg |= 4u;       /* Ferranti ULA variation exists on 48K and 128K, not Pentagon */
+    unsigned cfg = (opt_defmachine==1) ? 1u : (opt_defmachine>=2 && opt_defmachine<=3) ? 2u : 0u;   /* idx 2,3 = 48K submode (Atlas or MiSTer core) */
+    if(opt_defmachine!=1 && opt_defmachine!=4 && opt_ulalate) cfg |= 4u;       /* Ferranti ULA variation exists on 48K and 128K, not Pentagon */
     if(!opt_snow) cfg |= 16u;                             /* bit4 = snow_off: ULA snow OFF (clean). Atlas core honours it; mister48 ignores it. Default ON = faithful. */
+    if(opt_defmachine==4) {
+        /* NES overrides: region<<0, palette<<4, sprlimit<<6 (assume 1) */
+        cfg = ((unsigned)opt_region & 3u) | (((unsigned)opt_palette & 3u) << 4) | (1u << 6);
+    }
     return cfg;
 }
 static void apply_machine(void){
