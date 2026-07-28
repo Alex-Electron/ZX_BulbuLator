@@ -154,6 +154,7 @@ unsigned player_progress(void);   /* 0..100 playback progress */
 #define SLCR_FPGARST (*(volatile uint32_t*)0xF8000240u)
 static int  pl_reload(const char* path);         /* v0.15.143: runtime PL core-reload (defined below) */
 static void fabric_reinit_after_reload(void);    /* v0.15.143: re-push full fabric state after a PL core-reload */
+static void apply_machine(void);                 /* Step 15: apply machine mode (defined below) */
 #include "nes_rom.c"                              /* v146: iNES/NES2.0 header parser (nes_parse_header, nes_hdr_t) - test main() guarded out */
 static int  nes_load(const char* path);          /* v146: parse .nes -> stream PRG/CHR into the NES core BRAM (defined below) */
 
@@ -176,6 +177,9 @@ static int  nes_load(const char* path);          /* v146: parse .nes -> stream P
 #define opt_tapesync   (*(volatile int*)     (KMB+0x24u))
 #define opt_autostart  (*(volatile int*)     (KMB+0x28u))
 #define opt_defmachine (*(volatile int*)     (KMB+0x2Cu))
+static int opt_defspec = 0;
+static int opt_region = 0;
+static int opt_palette = 0;
 #define opt_romtrap    (*(volatile int*)     (KMB+0x30u))   /* #65 ROM-trap enable - in the NC mailbox so JTAG toggles it COHERENTLY (was a cached static -> D-cache raced the poke, couldn't enable for testing) */
 #define opt_smartload  (*(volatile int*)     (KMB+0x34u))   /* SMART LOAD enable - MiSTer-style ARM byte-feeder: the ROM tape edge-loop is overridden in the fabric, the CPU spins on JR $ and demands each standard-ROM-loader byte via the TAPE_CTRL/TAPE_STATUS handshake (no pulses). NC mailbox so JTAG toggles it coherently, same as opt_romtrap. */
 #define g_dbg_ferate   (*(volatile uint32_t*)(KMB+0x38u))   /* DEBUG (NC): last FE-read count measured in a 0.5 s smart-classify window (JTAG-readable to tune the custom-loader threshold) */
@@ -1482,6 +1486,15 @@ static void render_browser_dn(void){
 }
 static void render_browser(void){ render_browser_dn(); }   /* single entry point - all call sites now draw DN */
 static void open_browser(void){
+    if (cicmp(g_cur_core, "ATLAS") != 0) {
+        /* We are in NES mode. Since NES has no OSD compositor, we must PCAP-reload
+           the ATLAS core to show the browser / menu, resetting back to Spectrum. */
+        opt_defmachine = 0; // default back to ZX 128K
+        apply_machine();
+        if (cicmp(g_cur_core, "ATLAS") != 0) {
+            return; // reload failed or ATLAS.BIT.BIN missing
+        }
+    }
     sel_scroll=0; last_scroll=0; scroll_started=0; opt_on=0;
     OSD_CTRL=(OSD_CTRL|2u)&~1u; osd_on=1; browser_on=1; osd_view=3;   /* DN browser on the colour layer (bit1); drop the 1bpp plane */
     render_browser();        /* INSTANT window before any SD I/O - a keypress always shows something */
@@ -1739,8 +1752,96 @@ static void load_sna(const uint8_t* d,int len){
    The composed state matches what the real loader would leave: IM1/EI, border 7, 48-ROM paged+locked,
    SP from CLEAR (stack empty at RAMTOP+1; a game that RETs into BASIC was custom anyway -> ineligible
    in practice because such loaders aren't plain BASIC). */
-static void load_snapshot(void){
-    char path[180]; int p=0;                                 /* curpath(<=79) + '/' + NAMELEN(96) + NUL */
+   static void load_nes_rom(void){
+   char path[180]; int p=0;
+   for(int i=0;curpath[i] && p<160;i++) path[p++]=curpath[i];
+   if(p && path[p-1]!='/') path[p++]='/';
+   for(int i=0;flist[bcursor][i] && p<179;i++) path[p++]=flist[bcursor][i];
+   path[p]=0;
+   { int q=0; for(; path[q] && q<191; q++) g_src_path[q]=path[q]; g_src_path[q]=0; }
+   if(!sd_mounted) return;
+   FIL f; UINT br=0;
+   FRESULT rr=f_open(&f,path,FA_READ);
+   if(rr!=FR_OK){ sd_drop_on_io_error(rr); return; }
+
+   uint8_t h[16];
+   rr=f_read(&f,h,16,&br);
+   if(rr!=FR_OK || br<16){ f_close(&f); sd_drop_on_io_error(rr); return; }
+
+   nes_hdr_t o;
+   if(nes_parse_header(h, &o)){
+       f_close(&f); return;
+   }
+
+   /* Check if the running core is already NES. If not, switch machine to NES and reload core.
+      This prevents redundant PCAP reloading of the FPGA if the core is already in the PL. */
+   if (opt_defmachine != 4 || cicmp(g_cur_core, "NES") != 0) {
+       opt_defmachine = 4;
+       apply_machine();
+       if (cicmp(g_cur_core, "NES") != 0) {
+           f_close(&f);
+           dn_status_msg("ERR: NO NES CORE ON SD");
+           return;
+       }
+   }
+
+   if(player_active()){
+       if(opt_launchsnd==0) player_suspend();
+   }
+   OSD_CTRL&=~3u; osd_on=0; browser_on=0; osd_view=0;
+   { int i=0; for(; path[i] && i<179; i++) g_app_path[i]=path[i]; g_app_path[i]=0; }
+   g_app_stopped=0;
+   halt_src &= ~2u; apply_music_halt();
+   update_banner();
+
+   /* Reset NES */
+   NES_LDCTL = 0x04;
+
+   NES_MAP0 = (uint32_t)(o.flags & 0xFFFFFFFFull);
+   NES_MAP1 = (uint32_t)(o.flags >> 32);
+
+   if(o.trainer){ f_lseek(&f, f_tell(&f) + 512); }
+
+   /* Load PRG */
+   NES_LDCTL = 0x09; /* PRG load + rewind */
+   uint32_t prg_rem = o.prg_bytes;
+   while(prg_rem > 0){
+       UINT want = prg_rem > (uint32_t)sizeof(snapbuf) ? (uint32_t)sizeof(snapbuf) : prg_rem;
+       rr=f_read(&f,snapbuf,want,&br);
+       if(rr!=FR_OK || br==0) break;
+       for(UINT i=0; i<br; i++) NES_LD = snapbuf[i];
+       prg_rem -= br;
+   }
+
+   /* Load CHR */
+   if(o.chr_bytes > 0){
+       NES_LDCTL = 0x0B; /* CHR load + rewind */
+       uint32_t chr_rem = o.chr_bytes;
+       while(chr_rem > 0){
+           UINT want = chr_rem > (uint32_t)sizeof(snapbuf) ? (uint32_t)sizeof(snapbuf) : chr_rem;
+           rr=f_read(&f,snapbuf,want,&br);
+           if(rr!=FR_OK || br==0) break;
+           for(UINT i=0; i<br; i++) NES_LD = snapbuf[i];
+           chr_rem -= br;
+       }
+   }
+
+   /* Finish */
+   NES_LDCTL = 0x00;
+   NES_LDCTL = 0x04; /* Final reset to start cleanly */
+   f_close(&f);
+   }
+
+   static void ensure_spectrum_core(void){
+   if (opt_defmachine >= 4) { // Currently in NES or other non-Spectrum core
+       opt_defmachine = (opt_defspec >= 0 && opt_defspec < 4) ? opt_defspec : 0;
+       apply_machine();
+   }
+   }
+
+   static void load_snapshot(void){
+   ensure_spectrum_core();
+   char path[180]; int p=0;                                 /* curpath(<=79) + '/' + NAMELEN(96) + NUL */
     for(int i=0;curpath[i] && p<160;i++) path[p++]=curpath[i];
     if(p && path[p-1]!='/') path[p++]='/';
     for(int i=0;flist[bcursor][i] && p<179;i++) path[p++]=flist[bcursor][i];
@@ -2731,6 +2832,7 @@ static void zx_tape_autostart(void){
     for(int _e=0;_e<3;_e++){ zx_tap_key(0x5A); tape_wait_ms(450); }
 }
 static void tape_start(void){
+    ensure_spectrum_core();
     /* ROM-trap (Model A: freeze T80 mid-M1 + inject) is RETIRED - architecturally dead for a real CPU
        (carry lives in the ALU latch, not writable via the register bus), it loaded nothing. It used to
        be gated first here; a stale opt_romtrap=1 (persisted from the old menu) then routed EVERY load to
@@ -3167,6 +3269,7 @@ static void wav_start(void){
       is_tape = opt_mp3tape ? 1 : (maxrun >= 200);   /* "MP3/WAV as tape" forces the tape path (dcd above is still computed for a clean DC seed) */
     }
     if(is_tape){                          /* --- WAV cassette: stream through the PULSE tract --- */
+        ensure_spectrum_core();
         player_stop(); playing_idx=-1; g_music_path[0]=0; halt_src &= ~2u; apply_music_halt();
         /* WARM START: the pilot-detect already read the first chunk into g_tapbuf -> reuse it as the
            streaming buffer; g_wtf is positioned right after it, so wt_sample just continues from there.
@@ -3527,6 +3630,7 @@ static void mp3_start(void){
     }   /* pilot found -> cassette; stop scanning right away (no long block) */
     }
     if(is_tape){                          /* --- MP3 cassette: PRE-DECODE to a pulse list, then replay --- */
+        ensure_spectrum_core();
         if(!opt_mp3tape){
             mp3_close(); if(!mp3_open(path)){ g_fs_err=0xA701u; return; }   /* only re-open if we consumed samples during auto-detect */
         }
@@ -3900,6 +4004,7 @@ static void cfg_set(const char* k, const char* v){
     else if(!cicmp(k,"launch_snd")) opt_launchsnd = !cicmp(v,"music")?1:0;
     else if(!cicmp(k,"boot_nav")) opt_bootnav = !cicmp(v,"no")?0:1;
     else if(!cicmp(k,"defmachine")){ opt_defmachine=0; for(int i=0;i<N_MACHINES;i++) if(!cicmp(v,MACHINE_TAG[i])){ opt_defmachine=i; break; } }   /* Step 15: default boot machine (by tag) */
+    else if(!cicmp(k,"defspectrum")){ opt_defspec=0; for(int i=0;i<4;i++) if(!cicmp(v,MACHINE_TAG[i])){ opt_defspec=i; break; } }
     else if(!cicmp(k,"scr_x")){ int d=0; for(const char*p=v;*p>='0'&&*p<='9';p++) d=d*10+(*p-'0'); if(d<0)d=0; if(d>640)d=640; opt_scr_x=d; }   /* GLOBAL */
     else if(!cicmp(k,"scr_y")){ int d=0; for(const char*p=v;*p>='0'&&*p<='9';p++) d=d*10+(*p-'0'); if(d<0)d=0; if(d>200)d=200; opt_scr_y=d; }   /* GLOBAL */
     else if(!cicmp(k,"fastload")){ int d=v[0]-'0'; if(d<0)d=0; if(d>2)d=2; opt_fastload=d; }
@@ -3987,6 +4092,7 @@ static int config_save(void){                  /* 1 = written OK, 0 = failed (ca
     p=appstr(o,p,"tape_snd=");     o[p++]=opt_tapesound?'1':'0'; o[p++]='\r'; o[p++]='\n';
     p=appstr(o,p,"tapemute=");     o[p++]=opt_tapemute?'1':'0'; o[p++]='\r'; o[p++]='\n';
     { int m=(opt_defmachine>=0&&opt_defmachine<N_MACHINES)?opt_defmachine:0; p=appstr(o,p,"defmachine="); p=appstr(o,p,MACHINE_TAG[m]); o[p++]='\r'; o[p++]='\n'; }  /* Step 15: default boot machine */
+    { int s=(opt_defspec>=0&&opt_defspec<4)?opt_defspec:0; p=appstr(o,p,"defspectrum="); p=appstr(o,p,MACHINE_TAG[s]); o[p++]='\r'; o[p++]='\n'; }  /* Default Spectrum machine */
     mp_store((opt_defmachine>=0&&opt_defmachine<N_MACHINES)?opt_defmachine:0);   /* flush live opt_* into g_mp[current] before writing ALL machines */
     for(int m=0;m<N_MACHINES;m++){ const char* tg=MACHINE_TAG[m]; char b[8];
         #define SAVEKV(nm,val) do{ p=appstr(o,p,tg); o[p++]='.'; p=appstr(o,p,nm "="); itoa_u((unsigned)(val),b); p=appstr(o,p,b); o[p++]='\r'; o[p++]='\n'; }while(0)
@@ -4125,7 +4231,10 @@ static void apply_machine(void){
         if(tgt && cicmp(tgt, g_cur_core) != 0){        /* incoming machine needs a different core than the one in the PL */
             char cp[64]; core_path(cp, tgt);
             rc = pl_reload(cp);                        /* 0 = OK: PL is now `tgt`, fabric re-initialised into opt_defmachine */
-            if(rc == 0) g_cur_core = tgt;
+            if(rc == 0) {
+                g_cur_core = tgt;
+                fabric_reinit_after_reload();
+            }
         }
         if(rc != 0){                                   /* same core, OR reload failed -> classic guarded MACHINE_CFG flip on the running core */
             IJ_CTRL = 1;                                                     /* HALT: gate the Z80+MMU before the mode flip */
@@ -6244,9 +6353,17 @@ static void fabric_reinit_after_reload(void){
     MACHINE_CFG = machine_cfg_word();                                /* latch model + 48K ULA phase while frozen */
     machine_reset();                                                 /* reset+wipe with the mode already latched */
     apply_halt();                                                    /* release per halt_src (normally 0) */
+    
+    /* Restore the OSD frame buffer base address to resolve the digital noise */
+    OSD_DDR_BASE = OSDC_ADDR;
+    
     apply_pint(); apply_paper(); apply_crop(); apply_scr();          /* re-push fabric-only live registers */
     apply_pos();  apply_dim();   apply_vol();
     apply_fast(); apply_tapesync(); apply_tape_snd(); apply_tapemute();
+
+    /* Restore diagnostic registers */
+    WARP_HOLD = 0;
+    SYNC_HOLD = 1024u;
 }
 static void apply_music_halt(void){      /* music STARTED over a game -> HALT. SET-ONLY: pausing / stopping music
                                             NEVER un-halts (owner: un-pause is MANUAL only). The music-HALT is cleared
@@ -6513,7 +6630,7 @@ void main(void){
     apply_tapesync();                 /* Step 15: SYNC LOADER (demand tape) from ini */
     machine_menu_sync();              /* Step 15: Machine submenu = current machine's param set */
     { uint32_t cv = REG_VERSION & 0xFFFFu;                 /* v0.15.144: identify the FLASHED core so apply_machine only PCAP-reloads on a real core change */
-      g_cur_core = (cv == 0x0059u) ? "MISTER48" : "ATLAS"; /* 0x0059 = mister48; 0x0060 atlas / 0x005A-5B hybrid -> treat as ATLAS */ }
+      g_cur_core = (cv == 0x0059u) ? "MISTER48" : (cv == 0xCE08u) ? "NES" : "ATLAS"; }
     apply_machine();                  /* Step 15: apply the saved default machine (Pentagon timing bit) at boot; v144: PCAP-reload core if the default machine needs a different one */
     apply_dim();                      /* push the loaded dimming level to OSD_OP */
     apply_vol();                      /* push the loaded volume level to VOL_REG */

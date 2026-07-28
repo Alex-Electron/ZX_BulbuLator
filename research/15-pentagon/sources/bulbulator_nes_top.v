@@ -12,7 +12,7 @@ module bulbulator_nes_top (
     inout  wire       ps2_clk, inout wire ps2_data,   // (reserved for the menu; unused in Round-1)
     output wire       led_lock, output wire led_heart
 );
-    localparam [31:0] BUILD_VERSION = 32'hB01BCE01;   // NES core id
+    localparam [31:0] BUILD_VERSION = 32'hB01BCE08;   // NES core id (CE08 = debug sticky bits synced @0xB8 [0]vram_ce [1]nt_wr [2]cpu_wr)
 
     //==== PS7: FCLK0 100 MHz + M_AXI_GP0 + S_AXI_HP0/HP1 ====
     wire [3:0] fclk;  wire [3:0] FCLKRESETN;
@@ -113,7 +113,12 @@ module bulbulator_nes_top (
     end
     wire aresetn = arstn;
     // NOTE: hp_aresetn / hp1_aresetn are DRIVEN BY the PS7 stub (SAXIHPx ARESETN outputs) - do NOT drive here.
-    wire core_resetn = arstn;
+    // core_resetn MUST also wait for the HP0 AXI slave to leave reset (hp_aresetn). Otherwise fb_wr_axi
+    // comes out of reset first and issues its first write while HP0 is still resetting -> that write hangs
+    // (no b_valid) forever and the writer stalls after 1 burst. (This gate is what the proven ZX top does.)
+    (* ASYNC_REG="TRUE" *) reg [1:0] hprstn_s = 2'b00;
+    always @(posedge fclk100) hprstn_s <= {hprstn_s[0], hp_aresetn};
+    wire core_resetn = arstn & hprstn_s[1];
     (* ASYNC_REG="TRUE" *) reg [1:0] pns = 2'b00;   // por synced to nesclk (for capture)
     always @(posedge nesclk) pns <= {pns[0], arstn};
     wire por_n = pns[1];
@@ -137,6 +142,8 @@ module bulbulator_nes_top (
     wire zx_romtrap_en, zx_romtrap_done_we;
     wire [10:0] zx_scr_raddr;
     wire [31:0] cap_geom_f;
+    wire [31:0] nes_dbg;    // bring-up debug -> axi_ctl memwr_cnt read @GP0+0xAC = {hpw, nes_act}
+    wire [31:0] nes_dbg2;   // bring-up debug2 -> axi_ctl kbd_diag read @GP0+0xB8 = {awv_cnt, capwr}
 
     axi_ctl #(.VERSION(BUILD_VERSION)) ctl (
         .aclk(fclk100), .aresetn(aresetn),
@@ -167,11 +174,11 @@ module bulbulator_nes_top (
         .ctl_ban_enable(zx_ban_en), .ctl_ban_we(zx_ban_we), .ctl_ban_waddr(zx_ban_waddr), .ctl_ban_wdata(zx_ban_wdata), .ctl_ban_pos(zx_ban_pos),
         .ctl_player_en(zx_player_en), .ctl_audio_we(zx_audio_we), .ctl_audio_data(zx_audio_data),
         .aud_full(1'b0), .aud_empty(1'b1), .aud_rdcount(7'd0),
-        .kbd_fifo_dout(8'd0), .kbd_fifo_empty(1'b1), .kbd_fifo_rd(zx_kbd_rd), .kbd_deadman_kick(zx_deadman),
+        .kbd_fifo_dout(kbd_fifo_dout), .kbd_fifo_empty(kbd_fifo_empty), .kbd_fifo_rd(zx_kbd_rd), .kbd_deadman_kick(zx_deadman),
         .halt_ack(1'b0), .ram_busy(1'b0), .reset_busy(1'b0), .ctl_reset(zx_reset),
-        .ctl_kbd_inject(zx_kbd_inj), .ctl_kbd_inject_we(zx_kbd_inj_we), .memwr_cnt(32'd0),
+        .ctl_kbd_inject(zx_kbd_inj), .ctl_kbd_inject_we(zx_kbd_inj_we), .memwr_cnt(nes_dbg),
         .ctl_kbd_tx_data(zx_kbd_tx), .ctl_kbd_tx_we(zx_kbd_tx_we),
-        .kbd_tx_busy(1'b0), .kbd_tx_ack(1'b0), .kbd_diag(32'd0),
+        .kbd_tx_busy(1'b0), .kbd_tx_ack(1'b0), .kbd_diag(nes_dbg2),
         .ctl_pentagon(zx_pent), .ctl_model48(zx_model48), .ctl_ula_late(zx_ula_late), .ctl_force_atlas(zx_force_atlas), .ctl_snow_off(zx_snow), .ctl_pent_int(zx_pent_int),
         .ctl_paper_h(zx_paper_h), .ctl_paper_v(zx_paper_v), .ctl_scr_pos(zx_scr_pos),
         .ctl_crop_a(zx_crop_a), .ctl_crop_b(zx_crop_b), .ctl_warp_hold(zx_warp_hold), .ctl_sync_hold(zx_sync_hold),
@@ -191,8 +198,10 @@ module bulbulator_nes_top (
         .ld_addr(ctl_nes_ld_addr), .ld_data(ctl_nes_ld_data),
         .joy1(ctl_joy[7:0]), .joy2(ctl_joy[23:16]),
         .color(nes_color), .cycle(nes_cycle), .scanline(nes_scanline),
-        .emphasis(), .sample(nes_sample), .apu_ce()
+        .emphasis(), .sample(nes_sample), .apu_ce(),
+        .mem_dbg(nes_mem_dbg)
     );
+    wire [31:0] nes_mem_dbg;   // {vram_ce_access_cnt, ciram_write_cnt} on nesclk (read approx via 0xB8)
     wire vid_r, vid_g, vid_b, vid_i, vid_hsync, vid_vsync, vid_blank, vid_wr_ce;
     nes_video nesvid (
         .clk(nesclk), .color(nes_color), .cycle(nes_cycle), .scanline(nes_scanline),
@@ -233,6 +242,34 @@ module bulbulator_nes_top (
         .w_data(hp_wdata), .w_strb(hp_wstrb), .w_last(hp_wlast), .w_valid(hp_wvalid), .w_ready(hp_wready),
         .b_valid(hp_bvalid), .b_ready(hp_bready), .frame_done(wr_done), .busy_o());
 
+    // ---- NES bring-up debug -> axi_ctl memwr_cnt read (GP0+0xAC) = {hpw[31:16], nes_act[15:0]} ----
+    // nes_act advances iff the PPU produces pixels (vid_wr_ce on nesclk) => core is running.
+    // hpw advances iff fb_wr_axi issues AXI-HP writes that HP0 accepts => write path reaches DDR.
+    reg [15:0] wrce_ctr = 16'd0;  reg wrce_tog = 1'b0;
+    always @(posedge nesclk) if (vid_wr_ce) begin
+        wrce_ctr <= wrce_ctr + 16'd1;
+        if (wrce_ctr[7:0] == 8'hFF) wrce_tog <= ~wrce_tog;
+    end
+    (* ASYNC_REG="TRUE" *) reg [2:0] wt_s = 3'd0;
+    always @(posedge fclk100) wt_s <= {wt_s[1:0], wrce_tog};
+    reg [15:0] nes_act = 16'd0;
+    always @(posedge fclk100) if (wt_s[2] ^ wt_s[1]) nes_act <= nes_act + 16'd1;
+    reg [15:0] hpw = 16'd0;
+    always @(posedge fclk100) if (hp_awvalid & hp_awready) hpw <= hpw + 16'd1;
+    assign nes_dbg = {hpw, nes_act};
+    // debug2: capwr = fb_capture emits to FIFO (nesclk); awv = fb_wr_axi requests aw (fclk100)
+    reg [15:0] capwr_ctr = 16'd0;
+    always @(posedge nesclk) if (cap_wr) capwr_ctr <= capwr_ctr + 16'd1;
+    (* ASYNC_REG="TRUE" *) reg [15:0] capwr_s1 = 16'd0, capwr_s2 = 16'd0;   // approx CDC (is-it-moving)
+    always @(posedge fclk100) begin capwr_s1 <= capwr_ctr; capwr_s2 <= capwr_s1; end
+    reg [15:0] awv_ctr = 16'd0;
+    always @(posedge fclk100) if (hp_awvalid) awv_ctr <= awv_ctr + 16'd1;
+    // sync nes_mem_dbg (nesclk) -> fclk100 for a reliable read at 0xB8. dbg[3:0] are STICKY bits (1-bit CDC = safe):
+    // [0]=vram_ce ever asserted, [1]=CPU ever wrote nametable(CIRAM), [2]=CPU ever wrote memory. [31:16]=ciram write count.
+    (* ASYNC_REG="TRUE" *) reg [31:0] memdbg_s1 = 32'd0, memdbg_s2 = 32'd0;
+    always @(posedge fclk100) begin memdbg_s1 <= nes_mem_dbg; memdbg_s2 <= memdbg_s1; end
+    assign nes_dbg2 = memdbg_s2;   // 0xB8
+
     wire [23:0] rgb24;  wire [10:0] cx, cy;  wire ld_live; wire [31:0] ld_underrun;
     fb_line_disp #(.SRC_W(256), .STRIDE(256), .CROP_W(256), .HMARGIN(0), .SX0(0),
         .CROP_H(240), .VMARGIN(0)) ddrdisp (
@@ -262,6 +299,37 @@ module bulbulator_nes_top (
     genvar gi; generate for (gi=0; gi<3; gi=gi+1) begin : tb
         OBUFDS obuf_d (.I(tmds[gi]), .O(TMDS_Data_p[gi]), .OB(TMDS_Data_n[gi]));
     end endgenerate
+
+    //=============================================================================================
+    // PS/2 keyboard receiver (Step 15 NES port)
+    // Runs on fclk100 using a 3.57 MHz clock enable to match the Sorgelig ps2 watchdog timing.
+    //=============================================================================================
+    reg [1:0] ps2c_s = 2'b11, ps2d_s = 2'b11;        // 2-FF sync of the async pins
+    always @(posedge fclk100) begin ps2c_s <= {ps2c_s[0], ps2_clk}; ps2d_s <= {ps2d_s[0], ps2_data}; end
+
+    reg [4:0] ce_div = 5'd0;
+    always @(posedge fclk100) ce_div <= (ce_div == 5'd27) ? 5'd0 : ce_div + 5'd1;
+    wire ce_3m5 = (ce_div == 5'd0);
+
+    wire       ps2_strb, ps2_make, ps2_perr;
+    wire [7:0] ps2_code;
+    ps2 ps2_i (
+        .clock(fclk100), .ce(ce_3m5),
+        .ps2Ck(ps2c_s[1]), .ps2D(ps2d_s[1]),
+        .strb(ps2_strb), .make(ps2_make), .code(ps2_code), .perr(ps2_perr)
+    );
+
+    wire [8:0] kbd_fifo_dout;
+    wire       kbd_fifo_empty;
+    async_fifo #(.DW(9), .AW(7)) kbd_fifo_i (
+        .wr_clk(fclk100),  .wr_rst_n(aresetn),  .wr_en(ps2_strb),
+        .din({ps2_make, ps2_code}), .full(),
+        .rd_clk(fclk100), .rd_rst_n(aresetn), .rd_en(zx_kbd_rd),
+        .dout(kbd_fifo_dout), .empty(kbd_fifo_empty), .rd_count()
+    );
+
+    assign ps2_clk  = 1'bz;
+    assign ps2_data = 1'bz;
 
     assign led_lock = arstn;
     reg [25:0] hb = 26'd0;  always @(posedge clk_pixel) hb <= hb + 26'd1;
