@@ -47,17 +47,17 @@ cp "$S6/clock_zx.v" "$S6/mem_zx.v" "$S6/kbd_buttons.v" "$S6/hdmi_wrap.sv" \
 # --- async FIFO + triple-buffer manager, unchanged since Step 8 ---
 cp "$S8/async_fifo.v" "$S8/fb_bufmgr3.v" "$B/"
 
-# --- per-line display chain, unchanged since Step 11 (osd_compositor is now step-local, below) ---
-cp "$S11/fb_line_disp.v" "$S11/fb_capture_rr.v" "$S11/fb_wr_axi.v" "$B/"
+# --- per-line display chain, unchanged since Step 11 (osd_compositor + fb_capture_rr are step-local, below) ---
+cp "$S11/fb_line_disp.v" "$S11/fb_wr_axi.v" "$B/"
 
-# --- AXI-RESET CDC + constraints, unchanged since Step 12 (build.tcl is now step-14-local, below) ---
-cp "$S12/inject_cdc.v" "$S12/bulbulator_ddr.xdc" "$B/"
+# --- AXI-RESET CDC, unchanged since Step 12 (build.tcl + the XDC are now step-local, below) ---
+cp "$S12/inject_cdc.v" "$B/"
 
 # --- Step 14 delta (from $HERE): a NEW osd_ddr_rd.v (ARGB DDR-RGB OSD line-reader on HP1) + the top
 #     wiring (HP1 + alpha compositor); axi_ctl OSD_DDR_BASE + DDR_OSD_EN + LOAD_CAPS + VERSION
-#     0xB01B0014; a step-local build.tcl (adds osd_ddr_rd.v to the read list). osd_compositor.v carried
+#     0xB01B0019; a step-local build.tcl (adds osd_ddr_rd.v + ps2_tx.v to the read list). osd_compositor.v carried
 #     from Step 13 (banner_compositor + settle-latch). ---
-cp "$HERE/axi_ctl.v" "$HERE/bulbulator_zx_ddr_top.v" "$HERE/osd_compositor.v" "$HERE/osd_ddr_rd.v" "$HERE/tape_player.v" "$HERE/build.tcl" "$B/"
+cp "$HERE/axi_ctl.v" "$HERE/bulbulator_zx_ddr_top.v" "$HERE/osd_compositor.v" "$HERE/osd_ddr_rd.v" "$HERE/tape_player.v" "$HERE/ps2_tx.v" "$HERE/fb_capture_rr.v" "$HERE/build.tcl" "$HERE/bulbulator_ddr.xdc" "$B/"
 
 ( cd "$B" && sh get_rom.sh >/dev/null )
 echo "Assembled into $B"

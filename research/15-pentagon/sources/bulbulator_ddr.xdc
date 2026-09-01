@@ -96,3 +96,28 @@ set_false_path -to [get_cells -hierarchical -filter {NAME =~ *osddr*v_s1_reg*}]
 # Step 12 AXI-RESET CDC (aclk <-> spclk): reset-request toggle sync + busy level sync (inject_cdc)
 set_false_path -to [get_cells -hierarchical -filter {NAME =~ *inj_i*rsync_reg*}]
 set_false_path -to [get_cells -hierarchical -filter {NAME =~ *inj_i*rb_sync_reg*}]
+
+# ---- Ethernet PHY IP101G (EMIO GMII) + 25 MHz ref (IP-KVM) ----
+set_property -dict { PACKAGE_PIN U14 IOSTANDARD LVCMOS33 } [get_ports GMII_rx_clk]
+set_property -dict { PACKAGE_PIN U15 IOSTANDARD LVCMOS33 } [get_ports GMII_tx_clk]
+set_property -dict { PACKAGE_PIN W16 IOSTANDARD LVCMOS33 } [get_ports GMII_rx_dv]
+set_property -dict { PACKAGE_PIN Y16 IOSTANDARD LVCMOS33 } [get_ports {GMII_rxd[0]}]
+set_property -dict { PACKAGE_PIN V16 IOSTANDARD LVCMOS33 } [get_ports {GMII_rxd[1]}]
+set_property -dict { PACKAGE_PIN V17 IOSTANDARD LVCMOS33 } [get_ports {GMII_rxd[2]}]
+set_property -dict { PACKAGE_PIN Y17 IOSTANDARD LVCMOS33 } [get_ports {GMII_rxd[3]}]
+set_property -dict { PACKAGE_PIN W19 IOSTANDARD LVCMOS33 } [get_ports GMII_tx_en]
+set_property -dict { PACKAGE_PIN W18 IOSTANDARD LVCMOS33 } [get_ports {GMII_txd[0]}]
+set_property -dict { PACKAGE_PIN Y18 IOSTANDARD LVCMOS33 } [get_ports {GMII_txd[1]}]
+set_property -dict { PACKAGE_PIN V18 IOSTANDARD LVCMOS33 } [get_ports {GMII_txd[2]}]
+set_property -dict { PACKAGE_PIN Y19 IOSTANDARD LVCMOS33 } [get_ports {GMII_txd[3]}]
+set_property -dict { PACKAGE_PIN W15 IOSTANDARD LVCMOS33 } [get_ports MDIO_mdc]
+set_property -dict { PACKAGE_PIN Y14 IOSTANDARD LVCMOS33 } [get_ports MDIO_mdio]
+set_property -dict { PACKAGE_PIN U18 IOSTANDARD LVCMOS33 } [get_ports clk_25m]
+# GMII clocks are external from PHY — declare async relative to fabric
+create_clock -period 40.000 -name gmii_rx_clk [get_ports GMII_rx_clk]
+create_clock -period 40.000 -name gmii_tx_clk [get_ports GMII_tx_clk]
+set_clock_groups -asynchronous -group [get_clocks gmii_rx_clk] -group [get_clocks gmii_tx_clk] -group [get_clocks fclk100]
+
+# GMII TX/RX clocks land on non-CC pins on EBAZ4205 — allow general routing
+set_property CLOCK_DEDICATED_ROUTE FALSE [get_nets {GMII_rx_clk_IBUF}]
+set_property CLOCK_DEDICATED_ROUTE FALSE [get_nets {GMII_tx_clk_IBUF}]

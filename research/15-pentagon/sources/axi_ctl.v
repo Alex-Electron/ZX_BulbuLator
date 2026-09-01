@@ -45,6 +45,15 @@
 //   0x94 OSD_DDR_BASE W  DDR byte address of the ARGB8888 OSD canvas (osd_ddr_rd reads it over HP1)
 //   (OSD_CTRL 0x48 bit1 = DDR_OSD_EN: enable the DDR true-colour OSD overlay; canvas position = OSD_POS 0x70)
 //   0xC0 LOAD_CAPS R  machine-agnostic loader capability mask (reserved; 0 until PULSE lands in 14.2)
+//   -- B0071: заливка ПЗУ машины с карты (машино-агностичный механизм) --
+//   0x154 ROM_LD     W   один байт ПЗУ по текущему адресу, затем адрес++
+//   0x158 ROM_LDCTL  W   bit0 = loading (машина держится в сбросе), bit3 = обнулить адрес
+//   0x15C ROM_LDADDR RW  адрес заливки {страница[15:14], смещение[13:0]}; чтение = {loading, адрес}
+//   0x144 ROM_LDCNT  R   сколько байт ФАКТИЧЕСКИ легло в BRAM с последнего rewind. Адрес - это
+//                        намерение, счётчик - факт: он растёт по тому же условию, по которому
+//                        пишется BRAM (we И loading), поэтому заливка с забытым loading видна.
+//   LOAD_CAPS бит4 = в этом ядре порт заливки ПЗУ ЕСТЬ (прошивка обязана сбрасывать кэш
+//                    возможностей при каждой смене ядра - иначе спросит порт у ядра без него)
 //
 // Purely aclk (FCLK0). The crossing into the Spectrum clock (HALT level, RAM write strobe, the
 // DIRSet pulse, the port-force pulses) lives in inject_cdc.v. The scancode FIFO crossing lives in
@@ -53,7 +62,12 @@
 module axi_ctl #(
     parameter [31:0] VERSION    = 32'hB01B0019,
     parameter [31:0] MACHINE_ID = 32'h00805A58,  // 'ZX' (0x5A58) + variant 0x80 (128K)
-    parameter [31:0] LOAD_CAPS  = 32'h00000001    // capability mask: bit0 = JOY_STATE @0x100 present (v0x4A)
+    parameter [31:0] LOAD_CAPS  = 32'h00000009    // bit0 = JOY_STATE @0x100 present (v0x4A);
+                                                  // bit3 = CE28/B0065: КАДР КЛАВИАТУРЫ СОБИРАЕТ ФАБРИКА
+                                                  //        (KBD_DATA бит10 = расширенная, префиксы E0/F0
+                                                  //        и байты-ответы устройства наружу не идут).
+                                                  //        ARM по этому биту выключает свою программную
+                                                  //        свёртку префиксов и не ищет ACK в потоке.
 )(
     input  wire        aclk,
     input  wire        aresetn,
@@ -94,6 +108,69 @@ module axi_ctl #(
     output reg         ctl_nes_loading,    // 1 while streaming ROM (core held in reset)
     output reg         ctl_nes_reset,      // 1-aclk reset_nes pulse
 `endif
+
+    // ---- B0075 ДИСКОВОД: мост подачи секторов (машино-агностичные слоты, смысл - у машины) ----
+    // 0x160 FDC_STAT  R : телеметрия контроллера (запрос сектора, LBA, состояние)
+    // 0x164 FDC_CTL   W : команда+уровни (см. beta_disk.v: [3:0] команда, [4] wp, [5] ready,
+    //                     [8:6] size_code, [9] layout, [31:12] размер образа)
+    // 0x168 FDC_DATA  W : байт сектора (адрес в буфере считает фабрика)
+    output reg  [31:0] ctl_fdc_ctl,
+    output reg         ctl_fdc_ctl_we,   // однотактовый строб
+    // General Sound: свой блок регистров (0x174 R / 0x178 W). Отдельный, а не биты в чужом
+    // слове - иначе устройства начнут мешать друг другу, чего владелец требует избегать.
+    input  wire [31:0] gs_stat2_in,    // 0x194 R: B0119 {потеряно БАЙТОВ[27:16], удержаний шины[11:0]}
+    input  wire [31:0] gs_stat3_in,    // 0x198 R: B0119 {сторож[31:30], тактов процессора,
+                                       //          проведённых в ожидании[19:0]}
+    input  wire [31:0] gs_stat_in,     // 0x174 R: {ovr7[31], ovr0[30], er7[28], ev7[27], ev0[26],
+                                       //           b7[22], b0[21], cmd[15:8], data[7:0]}
+    output reg  [31:0] ctl_gs_ctl,     // 0x178 W: B0107 ЗЕРКАЛО состояния эмулятора -
+                                       //   {en[31], b7[30], b0[29], эхо er7[28]/ev7[27]/ev0[26],
+                                       //    сброс липких переполнений[25], dout[7:0]}
+    output reg         ctl_gs_ctl_we,  // B0106: ТОГГЛ, а не импульс - переходит в домен машины
+    // B0107: пики ARM-ноги звука (0x17C R). Пик-метр 0x170 наполняет МАШИНА, а General Sound живёт
+    // на ARM и в те слоты не попадает - без своего прибора «музыку рабочей объявлять нельзя».
+    input  wire [31:0] aud_pk_in,      // 0x17C R: {пик ARM-ноги[23:16], пик итогового микса[7:0]},
+                                       //           отсчёт 0..127 = полная шкала (старший байт |PCM|)
+    // B0108: упругая очередь записей #B3 (машина -> карта). Читается ПО ОДНОМУ БАЙТУ с извлечением
+    // на чтении - тот же приём, что у клавиатурного FIFO (pop после того, как ARM защёлкнул голову).
+    // B0112 NEMO-IDE: 0x184 W управление и буфер, 0x188 R состояние трапа
+    output reg  [31:0] ctl_nemo,
+    output reg         ctl_nemo_we,      // ТОГГЛ в домен машины, как у General Sound
+    input  wire [31:0] nemo_stat_in, nemo_stat2_in,
+    // B0116 мышь Kempston: 0x190 W - координаты и кнопки от ARM (чтение того же адреса возвращает
+    // записанное: без обратного чтения нечем доказать по JTAG, что оболочка вообще шевелит мышь)
+    output reg  [31:0] ctl_kmouse,
+    output reg         ctl_kmouse_we,    // ТОГГЛ в домен машины, как у NEMO-IDE и General Sound
+    /* DivMMC: карта SD живёт в фабрике (дедлайн ответа у esxDOS 130.1 мс против 134 мс худшего
+       прохода нашего главного цикла), а том, CSD/CID, FAT и запись - здесь. Слов восемь:
+       0x19C управление и подтверждения, 0x1A0/0x1A4/0x1A8 буфер (указатель, запись, чтение),
+       0x1AC состояние, 0x1B0 адрес запрошенного сектора, 0x1B4 счётчики, 0x1B8 ёмкость карты. */
+    output reg  [31:0] ctl_dmmc,         // 0x19C W
+    output reg         ctl_dmmc_we,      // ТОГГЛ, флаг на два такта позже данных
+    output reg  [31:0] ctl_dmmc_cap,     // 0x1B8 W: ёмкость карты в секторах (0 = предел не задан)
+    output reg  [31:0] ctl_dmmc_bufa,    // 0x1A0 W: адрес в буфере, автоинкремент на 4
+    output reg         ctl_dmmc_bufa_we,
+    output reg  [31:0] ctl_dmmc_bufw,    // 0x1A4 W: четыре байта в буфер
+    output reg         ctl_dmmc_bufw_we,
+    output reg         ctl_dmmc_bufr_re, // 0x1A8 R: строб «слово забрали», ставится ПО ЗАВЕРШЕНИИ
+    input  wire [31:0] dmmc_bufa_in, dmmc_bufr_in, dmmc_stat_in, dmmc_lba_in, dmmc_dbg_in,
+    input  wire [7:0]  gs_rq_dout,     // 0x180 R: голова очереди
+    input  wire        gs_rq_empty,
+    input  wire [8:0]  gs_rq_cnt,      //          занятость (сколько байт лежит)
+    output reg         gs_rq_rd,       //          однотактовый импульс извлечения
+    output reg  [7:0]  ctl_fdc_data,
+    output reg         ctl_fdc_data_we,  // однотактовый строб
+    input  wire [31:0] fdc_stat_in,
+    input  wire [31:0] fdc_stat2_in,
+
+    // ---- ЗАГРУЗКА ПЗУ МАШИНЫ ARM-ом (машино-агностично, ВНЕ NES-ifdef - как QUIESCE) ----
+    // 0x154 ROM_LD    W: один байт по текущему адресу, затем адрес++
+    // 0x158 ROM_LDCTL W: bit0 = loading (уровень: машина держится в сбросе), bit3 = обнулить адрес
+    // 0x15C ROM_LDADDR RW: адрес загрузки целиком (для перехода на страницу и для СВЕРКИ после заливки)
+    output reg  [15:0] ctl_rom_ld_addr,    // {страница[1:0], смещение[13:0]}, автоинкремент
+    output reg  [7:0]  ctl_rom_ld_data,
+    output reg         ctl_rom_ld_we,      // однотактовый строб записи
+    output reg         ctl_rom_loading,    // 1 пока ARM льёт ПЗУ (машина в сбросе)
 
     // ---- control-plane interface (aclk domain) ----
     output reg         ctl_halt,
@@ -145,14 +222,19 @@ module axi_ctl #(
     output reg  [31:0] ctl_ban_pos,       // banner position {Y0[26:16],X0[10:0]} (0x90)
     output reg  [7:0]  ctl_vol,           // HDMI volume gain 0..255 (PCM sample * vol / 256); 0x74
     output reg         ctl_player_en,     // 0x78 bit0: ARM audio player active (mux player PCM -> HDMI)
+    output reg         ctl_aud_sum,       // 0x78 bit1: B0107 СУММИРОВАТЬ ARM-ногу с машиной, а не
+                                          //   скрещивать. Плеер машину ЗАМЕНЯЕТ (кроссфейд), а
+                                          //   General Sound - это ДОВЕСОК К машине: его выход обязан
+                                          //   складываться с AY, иначе включение GS глушит машину.
     output reg         ctl_audio_we,      // 1-aclk pulse: push ctl_audio_data into the audio FIFO (0x7C)
     output reg  [31:0] ctl_audio_data,    // {R[31:16], L[15:0]} signed-16 stereo sample
     input  wire        aud_full,          // audio FIFO status (read at 0x80)
     input  wire        aud_empty,
     input  wire [7:0]  aud_rdcount,
     // ---- keyboard scancode FIFO (control-plane tap; machine-agnostic) ----
-    input  wire [8:0]  kbd_fifo_dout,     // {make, code[7:0]} FWFT head
+    input  wire [9:0]  kbd_fifo_dout,   // CE28: [9]=расширенная, [8]=отпускание, [7:0]=код     // {make, code[7:0]} FWFT head
     input  wire        kbd_fifo_empty,
+    input  wire [31:0] ps2_diag_in,       // CE28: {resend, parity} от приёмника оболочки -> 0x13C
     output reg         kbd_fifo_rd,       // 1-aclk pop pulse (on a completed KBD_DATA read)
     output reg         kbd_deadman_kick,  // 1-aclk pulse (on a KBD_HB write)
     output reg  [8:0]  ctl_kbd_inject,    // 0xA8 W: {make[8], scancode[7:0]} - ARM injects a synthetic key into the core (bypasses the gate)
@@ -164,11 +246,39 @@ module axi_ctl #(
     output reg         ctl_ula_late,      // 0xBC MACHINE_CFG bit2: Sinclair ULA Late
     output reg         ctl_force_atlas,   // 0xBC MACHINE_CFG bit3
     output reg         ctl_snow_off,      // 0xBC MACHINE_CFG bit4: 1 = ULA snow OFF (clean); 0 = faithful 128 snow (default) - Atlas only, live
+    // v165/CE16: СЫРОЕ слово MACHINE_CFG наружу. Отдельные провода выше - ZX-семантика; но регистр
+    // МАШИННО-ЗАВИСИМ: ARM (machine_cfg_word) для NES кладёт туда region[1:0] | palette[5:4] | sprlimit[6].
+    // Ядрам, у которых своя раскладка, нужен весь word, а не ZX-имена. ZX-топы этот порт не подключают.
+    output reg  [31:0] ctl_mach_cfg,      // 0xBC MACHINE_CFG как есть (aclk)
+    output reg  [31:0] ctl_mem_cmd,       // 0x148: слово команды к памяти машины
+    output reg         ctl_mem_we,        // 0x148: строб (1 такт aclk)
+    input  wire [31:0] mem_stat_in,       // 0x14C: состояние от ddr_mem
+    input  wire [31:0] mach_dbg_in,       // 0x150: слот отладки машины (наполняет топ машины)
+    input  wire [31:0] rom_dbg_in,        // B0147 0x1BC: прибор трапа Beta Disk -
+                                          //   {взводов[31:24], снятий[23:16], адрес последнего взвода[15:0]}.
+                                          //   Счётчики НАСЫЩАЮТСЯ на 255: дельту после этого не мерить.
+    input  wire [31:0] aud_dbg_in,        // 0x170: B0088 пики звука по источникам (тоже от машины)
+    output reg         ctl_pal_we,        // 0x140: строб записи палитры (1 такт aclk)
+    output reg  [7:0]  ctl_pal_addr,
+    output reg  [23:0] ctl_pal_rgb,
     output reg  [31:0] ctl_pent_int,      // 0xC4 PENT_INT: {v[24:16], hc[8:0]} Pentagon INT position (default 239/326)
     output reg  [8:0]  ctl_paper_h,       // 0xC8 PAPER_H: h start of paper (left border) for live wider-border tuning
     output reg  [8:0]  ctl_paper_v,       // 0xCC PAPER_V: v start of paper (top border) for live tuning
     output reg  [31:0] ctl_joy,           // 0xC4 JOY_STATE: generic gamepad mask, 2 players (aclk, v0x4A)
-    output reg  [31:0] ctl_scr_pos,       // 0xD0 SCR_POS: {vmargin[15:0], hmargin[15:0]} whole-frame HDMI position (fb_line_disp, live)
+    output reg  [31:0] ctl_scr_pos,
+    output reg  [31:0] ctl_ula_tune,       // 0xD0 SCR_POS: {vmargin[15:0], hmargin[15:0]} whole-frame HDMI position (fb_line_disp, live)
+    // ---- 0x11C..0x138 DDR PROBE: аппаратный замер пути PL->память (ddr_probe.v). Машино-агностично:
+    //      это диагностика ОБОЛОЧКИ, а не машины, и она же дименсионирует будущий DDR-картридж. ----
+    output reg  [31:0] ctl_probe_base,    // 0x120 W: базовый адрес цели (DDR 0x0xxxxxxx или OCM 0xFFFC0000)
+    output reg  [31:0] ctl_probe_ctrl,    // 0x11C W: {mode[31:30], len_code[29:28], count[15:0]}
+    output reg         ctl_probe_start,   // 1-такт импульс на запись 0x11C
+    input  wire [31:0] probe_stat,        // 0x124 R
+    input  wire [31:0] probe_lat_min,     // 0x128 R
+    input  wire [31:0] probe_lat_max,     // 0x12C R
+    input  wire [31:0] probe_lat_sum,     // 0x130 R
+    input  wire [31:0] probe_cycles,      // 0x134 R
+    input  wire [31:0] probe_beats,       // 0x138 R
+    output reg  [31:0] ctl_scr_scale,     // 0x118 SCR_SCALE: {ymul[7:4]... } -> {28'x, ymul[7:4], xmul[3:0]} live integer upscale (per machine)
     output reg  [31:0] ctl_crop_a,        // 0xD4 CROP_A: {sy0[15:0], sx0[15:0]}   crop origin (trims left/top)
     output reg  [31:0] ctl_crop_b,        // 0xD8 CROP_B: {croph[15:0], cropw[15:0]} crop size (trims right/bottom)
     output reg  [31:0] ctl_warp_hold,     // 0xDC WARP_HOLD: fast-load continuous-warp idle-release timeout in CPU T-states (0 = hold until tape-run clears)
@@ -176,6 +286,8 @@ module axi_ctl #(
     input  wire        kbd_tx_busy,       // 0xB4 R bit0: PS/2 host TX in progress
     input  wire        kbd_tx_ack,        // 0xB4 R bit1: device ACK bit of the last send
     input  wire [31:0] kbd_diag,          // 0xB8 R: {resend_cnt[31:16], parity_err_cnt[15:0]}
+    output reg         ctl_quiesce,       // 0x114 W bit0: v158 QUIESCE PL DDR masters (safe PL reload)
+    input  wire        axi_idle,          // 1 = all PL DDR masters idle (STATUS bit3)
     input  wire [31:0] memwr_cnt,         // 0xAC R: core RAM-write counter (tape-load verification probe)
     input  wire        halt_ack,
     input  wire        ram_busy,
@@ -238,16 +350,102 @@ module axi_ctl #(
                IDX_ROMTRAP = 6'h38,                                          // 0xE0 ROMTRAP (W: bit0 en / bit1 done; R: bit0 rt_pending, [13:8] live 7FFD)
                IDX_REG0    = 6'h39, IDX_REG1 = 6'h3A, IDX_REG2 = 6'h3B,      // 0xE4/0xE8/0xEC REG0..REG2 (R-only 212-bit reg snapshot)
                IDX_REG3    = 6'h3C, IDX_REG4 = 6'h3D, IDX_REG5 = 6'h3E,      // 0xF0/0xF4/0xF8 REG3..REG5
-               IDX_REG6    = 6'h3F;                                          // 0xFC REG6 = {12'd0, reg_rd1[211:192]}
+               IDX_REG6    = 6'h3F,
+               IDX_ULATUNE = 7'h40;                                          // 0x100 ULA_TUNE (RW: live ULA 48K/128K timing tuning)
+    localparam IDX_PROBECTL = 7'h47, IDX_PROBEBASE= 7'h48, IDX_PROBESTAT= 7'h49,  // 0x11C/0x120/0x124
+               IDX_PROBEMIN = 7'h4A, IDX_PROBEMAX = 7'h4B, IDX_PROBESUM = 7'h4C,  // 0x128/0x12C/0x130
+               IDX_PROBECYC = 7'h4D, IDX_PROBEBEAT= 7'h4E;                        // 0x134/0x138
+    localparam IDX_SCRSCALE= 7'h46;                                   // 0x118 W: {ymul[7:4], xmul[3:0]} live integer upscale (per-machine screen scale)
+    localparam IDX_MEMCMD  = 7'h52;   // 0x148 W: доступ ARM к памяти машины в DDR (испытательный стенд
+                                      //          и загрузчик образов): [31]=1 запись/0 чтение,
+                                      //          [27:8]=адрес (20 бит = 1 МБ), [7:0]=данные
+    localparam IDX_MACHDBG = 7'h54;   // 0x150 R: слот отладки МАШИНЫ (её смысл - у машины).
+                                      // ZX/Пентагон: {req8, 2'd0, eff7[7:0], 2'd0, 7FFD[5:0], банк[5:0]}
+    localparam IDX_MEMSTAT = 7'h53;   // 0x14C R: [7:0] последний прочитанный байт, [8] занято,
+                                      //          [31:16] счётчик выполненных транзакций
+    localparam IDX_PALWR   = 7'h50;   // 0x140 W: палитра одним словом {addr[31:24], R[23:16], G[15:8], B[7:0]}
+                                      // Машина приносит свои цвета с собой: у C64 их 16 (VIC-II),
+                                      // у NES 64 (2C02), у Atari будет 128. Раньше таблица была
+                                      // вшита в общий с ZX файл, и это блокировало третью машину.
+    localparam IDX_PS2DIAG = 7'h4F;   // 0x13C R: {resend[31:16], parity[15:0]} - СВОЙ диаг PS/2 оболочки.
+                                      // 0xB8 KBD_DIAG остаётся машинно-зависимым (на NES там отладка
+                                      // памяти ядра) - логику ввода на нём строить нельзя, это уже
+                                      // стоило регрессии v186. Теперь есть машино-агностичный адрес.
+    localparam IDX_QUIESCE = 7'h45;                                   // 0x114 W: bit0 = v158 QUIESCE (shared by ALL cores, outside NES ifdef)                                          // 0xFC REG6 = {12'd0, reg_rd1[211:192]}
+    // B0071: заливка ПЗУ машины с карты. Тоже ВНЕ NES-ifdef - это машино-агностичный механизм
+    // (у ZX 4 страницы по 16КБ; у другой машины смысл страниц свой, порт тот же).
+    localparam IDX_ROMLD = 7'h55, IDX_ROMLDCTL = 7'h56, IDX_ROMLDADDR = 7'h57; // 0x154 / 0x158 / 0x15C
+    localparam IDX_FDCSTAT = 7'h58, IDX_FDCCTL = 7'h59, IDX_FDCDATA = 7'h5A, IDX_FDCST2 = 7'h5B; // 0x160/4/8/C
+    localparam IDX_ROMDBG  = 7'h6F;   // 0x1BC R: B0147 прибор трапа Beta Disk (см. rom_dbg_in)
+    localparam IDX_AUDDBG  = 7'h5C;   // 0x170 R: B0088 пики звука {SAA, AY2, AY1, SpecDrum, бипер}
+    localparam IDX_GSSTAT  = 7'h5D;   // 0x174 R: состояние General Sound
+    /* B0119 ПРИБОР ОБРАТНОГО ДАВЛЕНИЯ. Считаем ПОТЕРЯННЫЕ БАЙТЫ, а не эпизоды: эпизод не
+       говорит о размере ущерба, а именно его и надо знать. Отдельно - сколько раз и на
+       сколько тактов процессора пришлось придержать шину: это цена корректности, и она
+       обязана быть видна, иначе мы молча заплатим за неё скоростью машины. */
+    localparam IDX_GSST2   = 7'h65;   // 0x194 R
+    localparam IDX_GSST3   = 7'h66;   // 0x198 R
+    localparam IDX_GSCTL   = 7'h5E;   // 0x178 W: управление General Sound
+    localparam IDX_AUDPK   = 7'h5F;   // 0x17C R: B0107 пики ARM-ноги звука и итогового микса
+    localparam IDX_NEMOCTL = 7'h61;   // 0x184 W
+    /* B0114: флаг отдаём НА ДВА ТАКТА ПОЗЖЕ данных. Слово и его тоггл менялись одним фронтом,
+       и при плотных записях домен машины ловил СМЕСЬ БИТОВ двух соседних слов: адрес от одной
+       записи, данные от другой. Это наше же правило CDC, оплаченное памятью Пентагона. */
+    reg ctl_nemo_rq = 1'b0;
+    reg [1:0] ctl_nemo_dly = 2'b00;
+    localparam IDX_NEMOST  = 7'h62;   // 0x188 R
+    localparam IDX_NEMOST2 = 7'h63;   // 0x18C R: полный адрес LBA
+    localparam IDX_DMMCCTL = 7'h67, IDX_DMMCBUFA = 7'h68, IDX_DMMCBUFW = 7'h69,  // 0x19C/0x1A0/0x1A4
+               IDX_DMMCBUFR= 7'h6A, IDX_DMMCSTAT = 7'h6B, IDX_DMMCLBA  = 7'h6C,  // 0x1A8/0x1AC/0x1B0
+               IDX_DMMCDBG = 7'h6D, IDX_DMMCCAP  = 7'h6E;                        // 0x1B4/0x1B8
+    /* Тот же сдвиг флага на два такта, что у NEMO-IDE и мыши (B0114/B0116). У карты цена ошибки
+       выше: в слове едут подтверждение запроса и НОМЕР этого запроса, и смесь битов двух записей
+       означала бы подтверждение чужого сектора - то есть молча не тот блок в файле. */
+    reg ctl_dmmc_rq = 1'b0;
+    reg [1:0] ctl_dmmc_dly = 2'b00;
+    localparam IDX_KMOUSE  = 7'h64;   // 0x190 W/R: мышь Kempston {en[31], кнопки[18:16], Y[15:8], X[7:0]}
+    /* Тот же сдвиг флага на два такта, что и у NEMO (B0114): слово и его тоггл, изменённые
+       ОДНИМ фронтом, дают в домене машины СМЕСЬ БИТОВ двух соседних записей. У мыши
+       это особенно важно: координаты обновляются часто (десятки раз в секунду на разгоне),
+       а смешанные X и Y из разных отсчётов - это рывок курсора на полэкрана. */
+    reg ctl_km_rq = 1'b0;
+    reg [1:0] ctl_km_dly = 2'b00;
+    localparam IDX_GSRQ    = 7'h60;   // 0x180 R: B0108 очередь данных GS {занятость[24:16], пусто[8], байт[7:0]}
+    localparam IDX_ROMLDCNT = 7'h51;  // 0x144 R: сколько байт ФАКТИЧЕСКИ легло в BRAM с последнего rewind.
+                                      // Адрес (0x15C) - это НАМЕРЕНИЕ, а этот счётчик - ФАКТ: он растёт
+                                      // строго по тому же условию, по которому пишется BRAM.
 `ifdef NES_CORE
     localparam IDX_NESMAP0 = 7'h41, IDX_NESMAP1 = 7'h42, IDX_NESLD = 7'h43, IDX_NESLDCTL = 7'h44; // 0x104/8/C/0x110 NES: mapper_flags lo/hi, ROM load byte (auto-inc), load ctrl
 `endif
 
     reg [31:0] counter;
     reg [31:0] reg_scratch;
+    reg [31:0] rom_ld_cnt;              // B0071: фактически записанных байт ПЗУ (сбрасывается rewind-ом)
+    // Сторож заливки ПЗУ. `loading` держит МАШИНУ В СБРОСЕ, а снять его может только ARM: если ARM
+    // упал/сорвался посреди заливки, машина осталась бы в сбросе НАВСЕГДА - ни F11, ни RESET из меню
+    // этот сброс не снимают (они поднимают свои clr_active/rst_cnt, а не этот вход). Поэтому через
+    // ~167 мс без единой записи в ROM_LD флаг снимается сам. Заливка столько не молчит: файл читается
+    // с карты ДО подъёма loading, а между байтами идут доли микросекунды.
+    reg [23:0] rom_ld_wd;
+    always @(posedge aclk) begin
+        if (!aresetn)                                    rom_ld_wd <= 24'd0;
+        else if (ctl_rom_ld_we || !ctl_rom_loading)      rom_ld_wd <= 24'd0;
+        else                                             rom_ld_wd <= rom_ld_wd + 24'd1;
+    end
+    wire rom_ld_timeout = (rom_ld_wd == 24'hFFFFFF);
     reg [9:0]  osd_ptr;                 // running OSD-buffer word pointer (auto-inc, 1024 words)
     reg [8:0]  ban_ptr;                 // running banner-buffer word pointer (auto-inc, 512 words)
     always @(posedge aclk) counter <= aresetn ? counter + 32'd1 : 32'd0;
+    /* B0114: тоггл догоняет данные через два такта - см. комментарий у объявления */
+    always @(posedge aclk) begin
+        ctl_nemo_dly <= {ctl_nemo_dly[0], ctl_nemo_rq};
+        ctl_nemo_we  <= ctl_nemo_dly[1];
+        ctl_km_dly   <= {ctl_km_dly[0], ctl_km_rq};      // B0116: тот же сдвиг у мыши
+        ctl_kmouse_we<= ctl_km_dly[1];
+        ctl_dmmc_dly <= {ctl_dmmc_dly[0], ctl_dmmc_rq};  // DivMMC: то же правило
+        ctl_dmmc_we  <= ctl_dmmc_dly[1];
+    end
+
 
     //---------------------------------------------------------------------------------------------
     // Write channel.
@@ -259,6 +457,9 @@ module axi_ctl #(
 
     always @(posedge aclk) begin
         ctl_ram_we       <= 1'b0;       // default: one-cycle pulses
+        ctl_mem_we       <= 1'b0;       // CE30: строб доступа к памяти - тоже одноцикловый
+        ctl_pal_we       <= 1'b0;       // CE29: строб палитры - тоже одноцикловый, и ОБЯЗАН жить
+                                        // в этом же блоке: сброс в чужом always даёт второй драйвер
         ctl_dir_commit   <= 1'b0;
         ctl_port_commit  <= 1'b0;
         ctl_reset        <= 1'b0;
@@ -269,9 +470,25 @@ module axi_ctl #(
         kbd_deadman_kick <= 1'b0;
         ctl_kbd_inject_we <= 1'b0;
         ctl_kbd_tx_we    <= 1'b0;
+        ctl_probe_start <= 1'b0;      // 1-такт импульс (как остальные we)
         ctl_romtrap_done_we <= 1'b0;
+        ctl_fdc_ctl_we <= 1'b0; ctl_fdc_data_we <= 1'b0;                   // B0075: однотактовые стробы
+        /* B0106: у GS это НЕ строб, а тоггл - здесь его не сбрасываем. Однотактовый импульс
+           терялся при переходе 100 МГц -> 56 МГц, и подтверждения пропадали через раз. */
+        ctl_rom_ld_we <= 1'b0;                                            // B0071: строб заливки ПЗУ
+        ctl_dmmc_bufa_we <= 1'b0; ctl_dmmc_bufw_we <= 1'b0;                // DivMMC: буфер карты
+        // Инкремент адреса и счётчик фактов ОБА загейтены по loading - тем же условием, по которому
+        // BRAM реально пишется (топ гейтит строб как rom_ld_we & rom_loading). Иначе заливка без
+        // поднятого loading прогоняла бы адрес до конца, и сверка «залилось N байт» дала бы PASS при
+        // НУЛЕ записанных байт - то есть соврала бы ровно там, где её и завели.
+        if (ctl_rom_ld_we && ctl_rom_loading) begin
+            ctl_rom_ld_addr <= ctl_rom_ld_addr + 16'd1;                   // адрес растёт ПОСЛЕ записи
+            rom_ld_cnt      <= rom_ld_cnt + 32'd1;                        // ФАКТ записи в BRAM
+        end
+        if (ctl_rom_loading && rom_ld_timeout) ctl_rom_loading <= 1'b0;   // сторож: не морозить машину
 `ifdef NES_CORE
         ctl_nes_ld_we <= 1'b0; ctl_nes_reset <= 1'b0;   // 1-aclk strobes default low
+        if (ctl_nes_ld_we) ctl_nes_ld_addr <= ctl_nes_ld_addr + 22'd1;
 `endif
         if (!aresetn) begin
             wstate <= W_IDLE; s_awready <= 1'b0; s_wready <= 1'b0; s_bvalid <= 1'b0;
@@ -285,24 +502,39 @@ module axi_ctl #(
             ctl_ban_enable <= 1'b0; ban_ptr <= 9'd0; ctl_ban_waddr <= 9'd0; ctl_ban_wdata <= 32'd0;
             ctl_ban_pos <= 32'h02800200;// default {Y0=640, X0=512}: bottom-centre strip, clear of the OSD
             ctl_vol <= 8'd255;          // default full volume (unity gain)
-            ctl_player_en <= 1'b0; ctl_audio_data <= 32'd0;
+            ctl_player_en <= 1'b0; ctl_aud_sum <= 1'b0; ctl_audio_data <= 32'd0;
             ctl_osd_ddr_base <= 32'd0; ctl_ddr_osd_en <= 1'b0;
             ctl_ddr_osd_pos <= 32'h00A80180;// default {Y0=168, X0=384}: centre the 512x384 canvas in 1280x720
             ctl_tape_run <= 1'b0; ctl_tape_earmux <= 1'b0; ctl_tape_mute <= 1'b0; ctl_tape_fmode <= 2'd0; ctl_tape_sync <= 1'b0; ctl_tape_more <= 1'b0; ctl_tape_data <= 32'd0;
             kbd_deadman_kick <= 1'b0;
             ctl_kbd_inject <= 9'd0;
             ctl_kbd_tx_data <= 8'd0;
-            ctl_pentagon <= 1'b0; ctl_model48 <= 1'b0; ctl_ula_late <= 1'b0; ctl_snow_off <= 1'b0;
+            ctl_pentagon <= 1'b0; ctl_model48 <= 1'b0; ctl_ula_late <= 1'b0; ctl_snow_off <= 1'b0; ctl_quiesce <= 1'b0;
+            ctl_mach_cfg <= 32'd0;
+            ctl_pal_we <= 1'b0; ctl_pal_addr <= 8'd0; ctl_pal_rgb <= 24'd0;
+            ctl_mem_we <= 1'b0; ctl_mem_cmd <= 32'd0;
             ctl_pent_int <= 32'h012B013E;   // owner-tuned Pentagon INT default: v=299 (0x12B), hc=318 (0x13E) -> boot shows correct, no post-config jump
             ctl_paper_h  <= 9'd0;
             ctl_paper_v  <= 9'd60;          // owner-tuned Pentagon paper defaults (match ARM baked -> no boot jump)
-            ctl_scr_pos  <= 32'h003A0100;   // default vmargin=58 (0x3A), hmargin=256 (0x100)
+            ctl_scr_pos  <= 32'h003A0100;
+            ctl_ula_tune <= 32'd0;   // default vmargin=58 (0x3A), hmargin=256 (0x100)
+            ctl_probe_base  <= 32'h0F000000;   // безопасное окно DDR по умолчанию (вне кадра и вне FS_BUF)
+            ctl_probe_ctrl  <= 32'h00000100;
+            ctl_probe_start <= 1'b0;
+            ctl_scr_scale<= 32'h00000022;   // default {ymul=2, xmul=2} = the historical XSH/YSH=1 (x2/x2)
             ctl_joy <= 32'd0;               // v0x4A: joystick released at reset
             ctl_crop_a   <= 32'h00000000;   // default sy0=0, sx0=0 (no crop)
             ctl_crop_b   <= 32'h012E0180;   // default croph=302 (0x12E), cropw=384 (0x180)
             ctl_warp_hold<= 32'h00200000;   // fast-load: hold continuous warp through ~2.1M idle CPU T-states before releasing (generous backstop; ARM clearing tape-run is the primary release)
             ctl_sync_hold<= 32'h00004000;   // SYNC loader: release the demand-tape hold after ~16384 idle CPU T-states of sustained quiet (a genuine inter-block pause; JTAG-tunable at 0x1C)
             ctl_romtrap_en <= 1'b0;         // Step 15: ROM-trap disabled at reset
+            ctl_rom_ld_addr <= 16'd0; ctl_rom_ld_data <= 8'd0; ctl_rom_loading <= 1'b0;  // B0071
+            rom_ld_cnt <= 32'd0;
+            ctl_fdc_ctl <= 32'd0; ctl_fdc_data <= 8'd0;
+            ctl_gs_ctl  <= 32'd0; ctl_nemo <= 32'd0;
+            ctl_dmmc <= 32'd0; ctl_dmmc_cap <= 32'd0;      // карта не вставлена, предел не задан
+            ctl_dmmc_bufa <= 32'd0; ctl_dmmc_bufw <= 32'd0;
+            ctl_kmouse  <= 32'd0;            // B0116: мышь выключена, пока оболочка не разрешила
 `ifdef NES_CORE
             ctl_nes_mapper <= 64'd0; ctl_nes_ld_addr <= 22'd0; ctl_nes_ld_data <= 8'd0;
             ctl_nes_ld_sel <= 1'b0; ctl_nes_loading <= 1'b0;
@@ -328,27 +560,55 @@ module axi_ctl #(
                         end
                         IDX_SCRATCH: reg_scratch <= s_wdata;
                         IDX_MACHCFG: begin
+                            ctl_mach_cfg <= s_wdata;   // v165/CE16: весь word для не-ZX ядер
                             ctl_pentagon <= s_wdata[0];
                             ctl_model48  <= s_wdata[1];
                             ctl_ula_late <= s_wdata[2];
                     ctl_force_atlas <= s_wdata[3];
                             ctl_snow_off <= s_wdata[4];
                         end
+                        IDX_MEMCMD: begin ctl_mem_cmd <= s_wdata; ctl_mem_we <= 1'b1; end
+                        IDX_PALWR: begin                            // CE29/B0066: палитра машины
+                            ctl_pal_addr <= s_wdata[31:24];
+                            ctl_pal_rgb  <= s_wdata[23:0];
+                            ctl_pal_we   <= 1'b1;
+                        end
                         IDX_PENTINT: ctl_pent_int <= s_wdata;      // Step 15: Pentagon INT position tuner
                         IDX_PAPERH:  ctl_paper_h  <= s_wdata[8:0]; // Step 15: live paper h offset (left border)
                         IDX_PAPERV:  ctl_paper_v  <= s_wdata[8:0]; // Step 15: live paper v offset (top border)
-                        IDX_SCRPOS:  ctl_scr_pos  <= s_wdata;      // Step 15: live whole-frame HDMI position
+                        IDX_SCRPOS:  ctl_scr_pos  <= s_wdata;
+                        IDX_ULATUNE: ctl_ula_tune <= s_wdata;      // Step 15: live whole-frame HDMI position
+                        IDX_SCRSCALE:ctl_scr_scale<= s_wdata;
+                        IDX_PROBEBASE: ctl_probe_base <= s_wdata;
+                        IDX_PROBECTL:  begin ctl_probe_ctrl <= s_wdata; ctl_probe_start <= 1'b1; end      // CE21: live integer upscale {ymul,xmul} (per machine)
                         IDX_JOY:     ctl_joy <= s_wdata;         // v0x4A JOY_STATE
                         IDX_CROPA:   ctl_crop_a   <= s_wdata;      // Step 15: live crop origin {sy0, sx0}
                         IDX_CROPB:   ctl_crop_b   <= s_wdata;      // Step 15: live crop size {croph, cropw}
                         IDX_WARPHOLD:ctl_warp_hold <= s_wdata;      // fast-load: continuous-warp idle-release timeout (CPU T-states; 0 = hold until tape-run clears)
                         IDX_SYNCHOLD:ctl_sync_hold <= s_wdata;      // SYNC loader: hysteretic-hold sustained-quiet release threshold (CPU T-states)
-                        IDX_ROMTRAP: begin ctl_romtrap_en <= s_wdata[0]; if (s_wdata[1]) ctl_romtrap_done_we <= 1'b1; end  // Step 15: bit0 enable, bit1 = ARM handled the trap
+                        IDX_ROMTRAP: begin ctl_romtrap_en <= s_wdata[0]; if (s_wdata[1]) ctl_romtrap_done_we <= 1'b1; end
+                        IDX_QUIESCE: ctl_quiesce <= s_wdata[0];       // v158 QUIESCE for safe PL reload  // Step 15: bit0 enable, bit1 = ARM handled the trap
+                        // B0071: заливка ПЗУ. Байт пишется по ТЕКУЩЕМУ адресу, инкремент - в блоке
+                        // дефолтов выше (такт после строба), ровно как у картриджа NES.
+                        IDX_ROMLD:    begin ctl_rom_ld_data <= s_wdata[7:0]; ctl_rom_ld_we <= 1'b1; end
+                        IDX_ROMLDCTL: begin ctl_rom_loading <= s_wdata[0];
+                                            if (s_wdata[3]) begin ctl_rom_ld_addr <= 16'd0;
+                                                                  rom_ld_cnt <= 32'd0; end end  // bit3 = в начало
+                        IDX_ROMLDADDR: ctl_rom_ld_addr <= s_wdata[15:0];  // переход на страницу
+                        IDX_FDCCTL:  begin ctl_fdc_ctl  <= s_wdata;      ctl_fdc_ctl_we  <= 1'b1; end
+                        IDX_FDCDATA: begin ctl_fdc_data <= s_wdata[7:0]; ctl_fdc_data_we <= 1'b1; end
+                        IDX_GSCTL:   begin ctl_gs_ctl   <= s_wdata;      ctl_gs_ctl_we   <= ~ctl_gs_ctl_we; end
+                        IDX_NEMOCTL: begin ctl_nemo     <= s_wdata;      ctl_nemo_rq     <= ~ctl_nemo_rq; end
+                        IDX_KMOUSE:  begin ctl_kmouse   <= s_wdata;      ctl_km_rq       <= ~ctl_km_rq;   end
+                        IDX_DMMCCTL: begin ctl_dmmc     <= s_wdata;      ctl_dmmc_rq     <= ~ctl_dmmc_rq; end
+                        IDX_DMMCCAP:       ctl_dmmc_cap <= s_wdata;
+                        IDX_DMMCBUFA:begin ctl_dmmc_bufa<= s_wdata;      ctl_dmmc_bufa_we<= 1'b1; end
+                        IDX_DMMCBUFW:begin ctl_dmmc_bufw<= s_wdata;      ctl_dmmc_bufw_we<= 1'b1; end
 `ifdef NES_CORE
                         IDX_NESMAP0: ctl_nes_mapper[31:0]  <= s_wdata;
                         IDX_NESMAP1: ctl_nes_mapper[63:32] <= s_wdata;
                         IDX_NESLD:   begin ctl_nes_ld_data <= s_wdata[7:0]; ctl_nes_ld_we <= 1'b1;
-                                           ctl_nes_ld_addr <= ctl_nes_ld_addr + 22'd1; end   // write byte @ current addr, then advance
+                                            end   // write byte @ current addr, then advance
                         IDX_NESLDCTL:begin ctl_nes_loading <= s_wdata[0]; ctl_nes_ld_sel <= s_wdata[1];
                                            if (s_wdata[2]) ctl_nes_reset   <= 1'b1;           // bit2 = pulse reset_nes
                                            if (s_wdata[3]) ctl_nes_ld_addr <= 22'd0; end      // bit3 = rewind load address
@@ -372,7 +632,7 @@ module axi_ctl #(
                         IDX_OSDOP:   ctl_osd_op     <= s_wdata[7:0];
                         IDX_OSDPOS:  ctl_osd_pos    <= s_wdata;
                         IDX_VOL:     ctl_vol        <= s_wdata[7:0];
-                        IDX_ACTL:    ctl_player_en  <= s_wdata[0];
+                        IDX_ACTL:    begin ctl_player_en <= s_wdata[0]; ctl_aud_sum <= s_wdata[1]; end   // B0107 бит1 = суммировать, а не скрещивать
                         IDX_AFIFO:   begin ctl_audio_data <= s_wdata; ctl_audio_we <= 1'b1; end
                         IDX_OSDADDR: osd_ptr        <= s_wdata[9:0];
                         IDX_OSDDATA: begin
@@ -418,13 +678,18 @@ module axi_ctl #(
     reg [11:0] arid_q;
     reg [6:0]  aridx_q;   // v0x4A: 7-bit index
     reg        r_win;                  // current read targets the screen-mirror window (araddr[15]=1)
+    reg        rd_was_empty;           // B0110: признак «пусто», ушедший В ЭТИ ЖЕ данные
 
     always @(posedge aclk) begin
         kbd_fifo_rd <= 1'b0;           // default: one-cycle pop pulse (set on a completed KBD_DATA read)
+        gs_rq_rd    <= 1'b0;           // B0108: то же для очереди данных General Sound
+        ctl_dmmc_bufr_re <= 1'b0;      // DivMMC: то же для буфера карты
         if (!aresetn) begin
             rstate <= R_IDLE; s_arready <= 1'b0; s_rvalid <= 1'b0;
             s_rresp <= 2'b00; s_rlast <= 1'b0; s_rdata <= 32'd0; s_rid <= 12'd0;
-            kbd_fifo_rd <= 1'b0; ctl_scr_raddr <= 11'd0; r_win <= 1'b0;
+            kbd_fifo_rd <= 1'b0; gs_rq_rd <= 1'b0; ctl_dmmc_bufr_re <= 1'b0;
+            ctl_scr_raddr <= 11'd0; r_win <= 1'b0;
+            rd_was_empty <= 1'b1;
         end else case (rstate)
             R_IDLE: begin
                 s_rvalid <= 1'b0; s_arready <= 1'b1;
@@ -443,7 +708,7 @@ module axi_ctl #(
                 else case (aridx_q)
                     IDX_VERSION: s_rdata <= VERSION;
                     IDX_CONTROL: s_rdata <= {31'd0, ctl_halt};
-                    IDX_STATUS:  s_rdata <= {29'd0, reset_busy, ram_busy, halt_ack};  // bit2 reset_busy, bit1 ram_busy, bit0 halt_ack
+                    IDX_STATUS:  s_rdata <= {28'd0, axi_idle, reset_busy, ram_busy, halt_ack};   // bit3 = v158 axi_idle (quiesce done)  // bit2 reset_busy, bit1 ram_busy, bit0 halt_ack
                     IDX_COUNTER: s_rdata <= counter;
                     IDX_RAMADDR: s_rdata <= {15'd0, ctl_ram_addr};
                     IDX_SCRATCH: s_rdata <= reg_scratch;
@@ -457,7 +722,29 @@ module axi_ctl #(
                     IDX_VOL:     s_rdata <= {24'd0, ctl_vol};
                     IDX_ASTAT:   s_rdata <= {22'd0, aud_rdcount, aud_full, aud_empty};
                     IDX_OSDADDR: s_rdata <= {22'd0, osd_ptr};
-                    IDX_KBDDATA: s_rdata <= {22'd0, kbd_fifo_dout[8], kbd_fifo_empty, kbd_fifo_dout[7:0]};
+                    IDX_KBDDATA: begin s_rdata <= {21'd0, kbd_fifo_dout[9], kbd_fifo_dout[8], kbd_fifo_empty, kbd_fifo_dout[7:0]};
+                                       rd_was_empty <= kbd_fifo_empty; end   // B0110: см. извлечение ниже
+                    IDX_PS2DIAG: s_rdata <= ps2_diag_in;
+                    IDX_MEMSTAT: s_rdata <= mem_stat_in;
+                    IDX_MACHDBG: s_rdata <= mach_dbg_in;
+                    IDX_ROMDBG:  s_rdata <= rom_dbg_in;
+                    IDX_AUDDBG:  s_rdata <= aud_dbg_in;   // B0088
+                    IDX_GSSTAT:  s_rdata <= gs_stat_in;   // General Sound
+                    IDX_GSST2:   s_rdata <= gs_stat2_in;  // B0119 потери и удержания
+                    IDX_GSST3:   s_rdata <= gs_stat3_in;  // B0119 сторож и цена удержаний
+                    IDX_AUDPK:   s_rdata <= aud_pk_in;    // B0107 пик-метр ARM-ноги
+                    IDX_NEMOST:  s_rdata <= nemo_stat_in;      // B0112
+                    IDX_NEMOST2: s_rdata <= nemo_stat2_in;     // B0113
+                    IDX_KMOUSE:  s_rdata <= ctl_kmouse;        // B0116: обратное чтение слова мыши
+                    IDX_DMMCCTL: s_rdata <= ctl_dmmc;          // обратное чтение: чем оболочка рулит картой
+                    IDX_DMMCCAP: s_rdata <= ctl_dmmc_cap;
+                    IDX_DMMCBUFA:s_rdata <= dmmc_bufa_in;      // ЖИВОЙ указатель, а не записанный
+                    IDX_DMMCBUFR:s_rdata <= dmmc_bufr_in;
+                    IDX_DMMCSTAT:s_rdata <= dmmc_stat_in;
+                    IDX_DMMCLBA: s_rdata <= dmmc_lba_in;
+                    IDX_DMMCDBG: s_rdata <= dmmc_dbg_in;
+                    IDX_GSRQ:    begin s_rdata <= {7'd0, gs_rq_cnt, 7'd0, gs_rq_empty, gs_rq_dout};
+                                       rd_was_empty <= gs_rq_empty; end      // B0110: см. извлечение ниже
                     IDX_KBDSTAT: s_rdata <= {31'd0, kbd_fifo_empty};
                     IDX_MACHID:  s_rdata <= MACHINE_ID;
                     IDX_VGEOM:   s_rdata <= cap_geom;
@@ -468,14 +755,29 @@ module axi_ctl #(
                     IDX_MEMWR:   s_rdata <= memwr_cnt;
                     IDX_KBDTXST: s_rdata <= {30'd0, kbd_tx_ack, kbd_tx_busy};
                     IDX_KBDDIAG: s_rdata <= kbd_diag;
+                    IDX_PROBESTAT: s_rdata <= probe_stat;
+                    IDX_PROBEMIN:  s_rdata <= probe_lat_min;
+                    IDX_PROBEMAX:  s_rdata <= probe_lat_max;
+                    IDX_PROBESUM:  s_rdata <= probe_lat_sum;
+                    IDX_PROBECYC:  s_rdata <= probe_cycles;
+                    IDX_PROBEBEAT: s_rdata <= probe_beats;
                     IDX_LOADCAPS:s_rdata <= LOAD_CAPS;
+                    // B0071: обратное чтение адреса заливки ПЗУ. Без него нельзя доказать, что
+                    // залилось ровно N байт (у картриджа NES этого нет, и это его недостаток).
+                    IDX_ROMLDADDR: s_rdata <= {15'd0, ctl_rom_loading, ctl_rom_ld_addr};
+                    IDX_ROMLDCNT:  s_rdata <= rom_ld_cnt;   // ФАКТ: сколько байт легло в BRAM
+                    IDX_FDCSTAT:   s_rdata <= fdc_stat_in;  // B0075: телеметрия дисковода
+                    IDX_FDCST2:    s_rdata <= fdc_stat2_in; // B0077: команда/дорожка/сектор от TR-DOS
                     IDX_JOY:     s_rdata <= ctl_joy;
                     IDX_PAPERH:  s_rdata <= {23'd0, ctl_paper_h};
                     IDX_PAPERV:  s_rdata <= {23'd0, ctl_paper_v};
                     IDX_WARPHOLD:s_rdata <= ctl_warp_hold;
                     IDX_SYNCHOLD:s_rdata <= ctl_sync_hold;
                     IDX_ROMTRAP: s_rdata <= {sync_diag_in, 2'd0, p7ffd_s1_in, 7'd0, rt_pending_a_in};  // bit0 pending, [13:8] 7FFD, [31:16] SYNC diag
-                    IDX_MACHCFG: s_rdata <= {27'd0, ctl_snow_off, ctl_force_atlas, ctl_ula_late, ctl_model48, ctl_pentagon}; // 0xBC readback: bit0 Pentagon, bit1 48K, bit2 ULA Late, bit3 force_atlas, bit4 snow_off
+                    // B0071: отдаём ЦЕЛОЕ слово, а не пять защёлок. Раньше читались только биты 0..4,
+                    // поэтому записанный хостом бит (бит8 = трап TR-DOS, бит6 = sprlimit у NES) читался
+                    // как ноль - и приборная проверка «включился ли трап» была невозможна в принципе.
+                    IDX_MACHCFG: s_rdata <= ctl_mach_cfg;  // 0xBC: bit0 Pentagon, bit1 48K, bit2 ULA Late, bit3 force_atlas, bit4 snow_off, bit8 TR-DOS trap
                     // ROM-trap owns REG0..REG6 only while enabled. With it off, expose passive
                     // tape diagnostics and the B0048 IN-FE trace without consuming another GP0 address.
                     IDX_REG0:    s_rdata <= ctl_romtrap_en ? reg_rd1_in[ 31:  0] : tape_diag_count;
@@ -490,7 +792,20 @@ module axi_ctl #(
                 s_rvalid <= 1'b1;
                 if (s_rvalid && s_rready) begin
                     s_rvalid <= 1'b0; s_rlast <= 1'b0; rstate <= R_IDLE;
-                    if (!r_win && aridx_q == IDX_KBDDATA) kbd_fifo_rd <= 1'b1;   // pop AFTER the ARM latched the head
+                    /* 🥇 B0110: ИЗВЛЕКАТЬ ТОЛЬКО ТО, ЧТО ОБОЛОЧКА ДЕЙСТВИТЕЛЬНО ПОЛУЧИЛА. Импульс
+                       извлечения ставится по ЗАВЕРШЕНИЮ чтения, а данные (вместе с признаком «пусто»)
+                       защёлкнуты РАНЬШЕ. Если байт пришёл в это окно, оболочка видела «пусто» и
+                       уходила, а FIFO его уже вытолкнул - байт исчезал бесследно. На потоке модуля
+                       это дало 71 одиночную потерю на 22 КБ в случайных местах (замерено сверкой
+                       принятого потока с файлом), и модуль после такой заливки не играл. Теперь
+                       извлечение гейтится тем же признаком, который ушёл в данные. Та же болезнь
+                       была и у клавиатурного FIFO - «пропала клавиша» без всяких следов. */
+                    if (!r_win && aridx_q == IDX_KBDDATA && !rd_was_empty) kbd_fifo_rd <= 1'b1;
+                    if (!r_win && aridx_q == IDX_GSRQ    && !rd_was_empty) gs_rq_rd    <= 1'b1;
+                    /* Указатель буфера карты двигаем ТОЖЕ по завершении чтения, а не при его
+                       начале: иначе слово, которое оболочка не успела забрать, было бы пропущено
+                       - ровно болезнь B0110, только вместо байта звука пропал бы байт сектора. */
+                    if (!r_win && aridx_q == IDX_DMMCBUFR) ctl_dmmc_bufr_re <= 1'b1;
                 end
             end
             default: rstate <= R_IDLE;

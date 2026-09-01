@@ -12,7 +12,7 @@ module bulbulator_nes_top (
     inout  wire       ps2_clk, inout wire ps2_data,   // (reserved for the menu; unused in Round-1)
     output wire       led_lock, output wire led_heart
 );
-    localparam [31:0] BUILD_VERSION = 32'hB01BCE08;   // NES core id (CE08 = debug sticky bits synced @0xB8 [0]vram_ce [1]nt_wr [2]cpu_wr)
+    localparam [31:0] BUILD_VERSION = 32'hB01BCE09;   // NES core id (CE09 = FIX: add 2KB internal CPU RAM, decode cpumem_addr[21])
 
     //==== PS7: FCLK0 100 MHz + M_AXI_GP0 + S_AXI_HP0/HP1 ====
     wire [3:0] fclk;  wire [3:0] FCLKRESETN;

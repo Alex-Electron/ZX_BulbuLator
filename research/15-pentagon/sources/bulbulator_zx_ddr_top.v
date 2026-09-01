@@ -1,25 +1,16 @@
 `timescale 1ns/1ps
 //-------------------------------------------------------------------------------------------------
-// bulbulator_zx_top.v
+// bulbulator_zx_ddr_top.v - Atlas ZX Spectrum on the EBAZ4205, MACHINE SIDE ONLY.
 // Contact: lavrinovich.alex@gmail.com
 //-------------------------------------------------------------------------------------------------
-// Atlas ZX Spectrum 128K core on the EBAZ4205 (Xilinx Zynq xc7z010clg400-1) with HDMI video +
-// audio (720p50) AND a PS->PL control plane: the ARM, over M_AXI_GP0, can HALT the Z80 and write
-// Spectrum RAM (axi_ctl + inject_cdc). Stage-1 / Milestone 2 of putting the idle ARM to work.
+// B0062: the whole machine-agnostic shell (PS7/AXI, HDMI clocks+output, DDR framebuffer chain,
+// OSD layers, PS/2 RX+TX, scancode FIFO, ARM music FIFO, master volume, QUIESCE, axi_ctl) moved
+// into control_plane.v - ONE instance a top cannot half-carry. Everything left in this file is
+// the ZX machine: clock_zx, the Atlas core + mem_zx, HALT/inject CDC, tape/warp/SYNC/ROM-trap
+// machinery, the keyboard-gate matrix adapter, the screen mirror, and the ZX leg of the audio
+// mix. NemoBus (the expansion connector) belongs HERE when it lands - it is ZX hardware.
 //
-// Clock domains:
-//   * fclk100   100 MHz from PS7 FCLK0  -> source for both PLLs AND the AXI slave (aclk).
-//   * clk_pixel 74.25 MHz  (HDMI pixel) -> hdmi core + framebuffer read.
-//   * clk_ser   371.25 MHz (HDMI x5)    -> TMDS serializer.
-//   * clk_audio ~48 kHz                 -> HDMI audio sample.
-//   * spclk     ~56.7 MHz (Spectrum)    -> core + mem + keyboard + framebuffer write + inject_cdc.
-//
-// Control plane (NEW): axi_ctl is a small AXI3 slave on the GP0 master (0x4000_0000). inject_cdc
-// crosses its HALT level + RAM-write strobe into the Spectrum clock domain. HALT is implemented
-// WITHOUT touching the Atlas core: the two 3.5 MHz CPU clock-enables (pe3M5/ne3M5) are gated off
-// at the core's input, which freezes the Z80 + the MMU (so memWr/memA/vmmA2 hold) while video
-// (pe7M0/ne7M0) and HDMI audio keep running. While halted, the ARM is muxed onto the memory bus
-// (memWr/memA/memQ/vmmA2) so it can poke RAM - including the displayed screen shadow.
+// Clock domains: fclk100 (shell/aclk), spclk ~56.7 MHz (machine), clk_pixel/clk_audio (shell out).
 //-------------------------------------------------------------------------------------------------
 module bulbulator_zx_ddr_top
 (
@@ -34,211 +25,184 @@ module bulbulator_zx_ddr_top
     inout  wire       ps2_data,       // H20 (DATA2-08), PS/2 keyboard data   (Step 15: bidirectional; RX unchanged, TX drives low)
 
     output wire       led_lock,       // D18: Spectrum MMCM locked
-    output wire       led_heart       // H18: heartbeat (alive indicator)
+    output wire       led_heart,      // H18: heartbeat (alive indicator)
+    // Ethernet PHY на ногах ПЛИС - провода от GEM0 через EMIO (см. control_plane.v)
+    output wire [3:0] eth_txd,
+    output wire       eth_tx_en,
+    input  wire       eth_tx_clk,
+    input  wire [3:0] eth_rxd,
+    input  wire       eth_rx_dv,
+    input  wire       eth_rx_clk,
+    output wire       eth_mdc,
+    inout  wire       eth_mdio,
+    output wire       eth_ref_clk
 );
-    //=============================================================================================
-    // PS7: FCLK0 (100 MHz) + M_AXI_GP0 master. (GP0 ports per the Vivado 2023.1 unisim PS7.v;
-    // AXI3 = 32b data / 12b ID / 4b LEN. FCLKRESETN is a [3:0] bus.)
-    //=============================================================================================
-    wire [3:0] fclk;
-    wire [3:0] FCLKRESETN;
-
-    wire [31:0] gp0_awaddr;  wire [11:0] gp0_awid;  wire [3:0] gp0_awlen;
-    wire        gp0_awvalid; wire        gp0_awready;
-    wire [31:0] gp0_wdata;   wire [3:0]  gp0_wstrb; wire        gp0_wlast;
-    wire        gp0_wvalid;  wire        gp0_wready;
-    wire [11:0] gp0_bid;     wire [1:0]  gp0_bresp; wire        gp0_bvalid; wire gp0_bready;
-    wire [31:0] gp0_araddr;  wire [11:0] gp0_arid;  wire [3:0] gp0_arlen;
-    wire        gp0_arvalid; wire        gp0_arready;
-    wire [31:0] gp0_rdata;   wire [11:0] gp0_rid;   wire [1:0] gp0_rresp;
-    wire        gp0_rlast;   wire        gp0_rvalid; wire       gp0_rready;
-
-    // S_AXI_HP0: read (DDR-framebuffer loader) + write (capture writer). ACLK = fclk100.
-    wire        hp_aresetn;
-    wire [31:0] hp_araddr;  wire [5:0] hp_arid; wire [3:0] hp_arlen; wire [2:0] hp_arsize;
-    wire [1:0]  hp_arburst; wire [3:0] hp_arcache; wire [2:0] hp_arprot; wire [1:0] hp_arlock; wire [3:0] hp_arqos;
-    wire        hp_arvalid, hp_arready;
-    wire [63:0] hp_rdata;   wire [5:0] hp_rid; wire [1:0] hp_rresp; wire hp_rlast, hp_rvalid, hp_rready;
-    wire [31:0] hp_awaddr;  wire [5:0] hp_awid; wire [3:0] hp_awlen; wire [2:0] hp_awsize;
-    wire [1:0]  hp_awburst; wire [3:0] hp_awcache; wire [2:0] hp_awprot; wire [1:0] hp_awlock; wire [3:0] hp_awqos;
-    wire        hp_awvalid, hp_awready;
-    wire [63:0] hp_wdata;   wire [7:0] hp_wstrb; wire hp_wlast, hp_wvalid, hp_wready;
-    wire        hp_bvalid, hp_bready;
-
-    // S_AXI_HP1: read-only (DDR-RGB OSD line reader on its OWN port -> no contention with video on HP0).
-    wire        hp1_aresetn;
-    wire [31:0] hp1_araddr;  wire [5:0] hp1_arid; wire [3:0] hp1_arlen; wire [2:0] hp1_arsize;
-    wire [1:0]  hp1_arburst; wire [3:0] hp1_arcache; wire [2:0] hp1_arprot; wire [1:0] hp1_arlock; wire [3:0] hp1_arqos;
-    wire        hp1_arvalid, hp1_arready;
-    wire [63:0] hp1_rdata;   wire [5:0] hp1_rid; wire [1:0] hp1_rresp; wire hp1_rlast, hp1_rvalid, hp1_rready;
-
-    wire fclk100;
-    BUFG bufg100 (.I(fclk[0]), .O(fclk100));
-
-    (* DONT_TOUCH = "true" *) PS7 ps7_stub (
-        .FCLKCLK        (fclk),
-        .FCLKRESETN     (FCLKRESETN),
-        .MAXIGP0ACLK    (fclk100),
-        .MAXIGP0AWADDR  (gp0_awaddr),  .MAXIGP0AWID   (gp0_awid),    .MAXIGP0AWLEN  (gp0_awlen),
-        .MAXIGP0AWVALID (gp0_awvalid), .MAXIGP0AWREADY(gp0_awready),
-        .MAXIGP0WDATA   (gp0_wdata),   .MAXIGP0WSTRB  (gp0_wstrb),   .MAXIGP0WLAST  (gp0_wlast),
-        .MAXIGP0WVALID  (gp0_wvalid),  .MAXIGP0WREADY (gp0_wready),
-        .MAXIGP0BID     (gp0_bid),     .MAXIGP0BRESP  (gp0_bresp),   .MAXIGP0BVALID (gp0_bvalid),
-        .MAXIGP0BREADY  (gp0_bready),
-        .MAXIGP0ARADDR  (gp0_araddr),  .MAXIGP0ARID   (gp0_arid),    .MAXIGP0ARLEN  (gp0_arlen),
-        .MAXIGP0ARVALID (gp0_arvalid), .MAXIGP0ARREADY(gp0_arready),
-        .MAXIGP0RDATA   (gp0_rdata),   .MAXIGP0RID    (gp0_rid),     .MAXIGP0RRESP  (gp0_rresp),
-        .MAXIGP0RLAST   (gp0_rlast),   .MAXIGP0RVALID (gp0_rvalid),  .MAXIGP0RREADY (gp0_rready),
-        // ---- S_AXI_HP0 : read (loader) + write (capture writer) ----
-        .SAXIHP0ACLK(fclk100), .SAXIHP0ARESETN(hp_aresetn),
-        .SAXIHP0ARADDR(hp_araddr), .SAXIHP0ARID(hp_arid), .SAXIHP0ARLEN(hp_arlen),
-        .SAXIHP0ARSIZE(hp_arsize[1:0]), .SAXIHP0ARBURST(hp_arburst), .SAXIHP0ARCACHE(hp_arcache),
-        .SAXIHP0ARPROT(hp_arprot), .SAXIHP0ARLOCK(hp_arlock), .SAXIHP0ARQOS(hp_arqos),
-        .SAXIHP0ARVALID(hp_arvalid), .SAXIHP0ARREADY(hp_arready),
-        .SAXIHP0RDATA(hp_rdata), .SAXIHP0RID(hp_rid), .SAXIHP0RRESP(hp_rresp),
-        .SAXIHP0RLAST(hp_rlast), .SAXIHP0RVALID(hp_rvalid), .SAXIHP0RREADY(hp_rready),
-        .SAXIHP0RDISSUECAP1EN(1'b0),
-        .SAXIHP0AWADDR(hp_awaddr), .SAXIHP0AWID(hp_awid), .SAXIHP0AWLEN(hp_awlen),
-        .SAXIHP0AWSIZE(hp_awsize[1:0]), .SAXIHP0AWBURST(hp_awburst), .SAXIHP0AWCACHE(hp_awcache),
-        .SAXIHP0AWPROT(hp_awprot), .SAXIHP0AWLOCK(hp_awlock), .SAXIHP0AWQOS(hp_awqos),
-        .SAXIHP0AWVALID(hp_awvalid), .SAXIHP0AWREADY(hp_awready),
-        .SAXIHP0WDATA(hp_wdata), .SAXIHP0WID(6'd0), .SAXIHP0WSTRB(hp_wstrb), .SAXIHP0WLAST(hp_wlast),
-        .SAXIHP0WVALID(hp_wvalid), .SAXIHP0WREADY(hp_wready), .SAXIHP0WRISSUECAP1EN(1'b0),
-        .SAXIHP0BVALID(hp_bvalid), .SAXIHP0BREADY(hp_bready),
-        // ---- S_AXI_HP1 : read-only (DDR-RGB OSD line reader) ----
-        .SAXIHP1ACLK(fclk100), .SAXIHP1ARESETN(hp1_aresetn),
-        .SAXIHP1ARADDR(hp1_araddr), .SAXIHP1ARID(hp1_arid), .SAXIHP1ARLEN(hp1_arlen),
-        .SAXIHP1ARSIZE(hp1_arsize[1:0]), .SAXIHP1ARBURST(hp1_arburst), .SAXIHP1ARCACHE(hp1_arcache),
-        .SAXIHP1ARPROT(hp1_arprot), .SAXIHP1ARLOCK(hp1_arlock), .SAXIHP1ARQOS(hp1_arqos),
-        .SAXIHP1ARVALID(hp1_arvalid), .SAXIHP1ARREADY(hp1_arready),
-        .SAXIHP1RDATA(hp1_rdata), .SAXIHP1RID(hp1_rid), .SAXIHP1RRESP(hp1_rresp),
-        .SAXIHP1RLAST(hp1_rlast), .SAXIHP1RVALID(hp1_rvalid), .SAXIHP1RREADY(hp1_rready),
-        .SAXIHP1RDISSUECAP1EN(1'b0),
-        // HP1 write channel unused (OSD reads only) - tie the request-valids off
-        .SAXIHP1AWVALID(1'b0), .SAXIHP1WVALID(1'b0), .SAXIHP1BREADY(1'b0),
-        .SAXIHP1WRISSUECAP1EN(1'b0)
-    );
 
     //=============================================================================================
-    // HDMI clocks: 100 -> 74.25 (pixel) + 371.25 (serial x5). VCO 742.5 (M=37.125, D=5).
+    // Machine-agnostic shell (control_plane): PS7+AXI, HDMI, framebuffer, OSD, PS/2, audio, QUIESCE.
+    // Wires below carry the ORIGINAL net names so every retained ZX block is byte-identical.
     //=============================================================================================
-    wire clk_pix_raw, clk_ser_raw, fb, locked;
-    MMCME2_BASE #(
-        .CLKIN1_PERIOD(10.000),
-        .CLKFBOUT_MULT_F(37.125), .DIVCLK_DIVIDE(5),
-        .CLKOUT0_DIVIDE_F(10.000),   // 742.5 / 10  = 74.25 MHz
-        .CLKOUT1_DIVIDE(2)           // 742.5 / 2   = 371.25 MHz
-    ) mmcm (
-        .CLKIN1(fclk100), .CLKFBIN(fb), .CLKFBOUT(fb),
-        .CLKOUT0(clk_pix_raw), .CLKOUT1(clk_ser_raw),
-        .CLKOUT2(), .CLKOUT3(), .CLKOUT4(), .CLKOUT5(),
-        .CLKOUT0B(), .CLKOUT1B(), .CLKOUT2B(), .CLKOUT3B(), .CLKFBOUTB(),
-        .RST(1'b0), .PWRDWN(1'b0), .LOCKED(locked)
-    );
-    wire clk_pixel, clk_ser;
-    BUFG b0 (.I(clk_pix_raw), .O(clk_pixel));
-    BUFG b1 (.I(clk_ser_raw), .O(clk_ser));
-    wire hdmi_reset = ~locked;
-
-    //=============================================================================================
-    // 48 kHz audio clock: 74.25 MHz / 1547 = 47996 Hz   (verbatim from Step-5)
-    //=============================================================================================
-    reg [10:0] adiv = 11'd0;
-    reg clk_audio_r = 1'b0;
-    always @(posedge clk_pixel) begin
-        adiv <= (adiv >= 11'd1546) ? 11'd0 : adiv + 11'd1;
-        clk_audio_r <= (adiv < 11'd773);
-    end
-
+    wire        fclk100, clk_pixel, clk_audio_r, aresetn, core_resetn_unused;
+    wire        ctl_halt;
+    wire        ctl_ram_we;
+    wire [16:0] ctl_ram_waddr;
+    wire [7:0]  ctl_ram_data;
+    wire [211:0] ctl_dir;
+    wire [5:0]  ctl_7ffd;
+    wire [2:0]  ctl_border;
+    wire        ctl_dir_commit, ctl_port_commit, ctl_reset;
+    wire        ctl_osd_enable, ctl_ddr_osd_en;
+    wire        ctl_tape_run, ctl_tape_earmux, ctl_tape_mute, ctl_tape_sync, ctl_tape_more, ctl_tape_we;
+    wire [1:0]  ctl_tape_fmode;
+    wire [31:0] ctl_tape_data;
+    wire [8:0]  ctl_kbd_inject;
+    wire        ctl_kbd_inject_we, kbd_deadman_kick;
+    wire        ctl_pentagon, ctl_model48, ctl_ula_late, ctl_force_atlas, ctl_snow_off;
+    // ПЕНТАГОН 1024: полный номер банка приходит ИЗ ЯДРА (там защёлка расширенных бит и порт
+    // EFF7), ожидание - из мастера памяти оболочки. У MiSTer-48 (своя ULA, машина 48К без
+    // страничности вообще) и у мёртвого гибрида этих портов нет: банк = младшие три бита адреса,
+    // ожидания не бывает.
+    // ОБЪЯВЛЕНИЕ здесь, ПРИСВОЕНИЕ - ниже, рядом с mem_zx: memA_core объявлен только там, а
+    // ссылка на него отсюда молча создала бы однобитный неявный провод (в файле нет
+    // `default_nettype none`) и индексация [16:14] упала бы на синтезе.
+    wire [5:0]  ram_bank_core;
+`ifdef MISTER48_CORE
+    wire [7:0]  eff7_core   = 8'd0;
+    wire        zx_mem_wait = 1'b0;
+    wire        trdos_core  = 1'b0;   // B0071: у чужого ядра трапа TR-DOS нет
+    wire [1:0]  rom_page_core = 2'd0;
+    wire [31:0] rom_dbg_core  = 32'd0;    // B0147: прибора трапа у чужого ядра тоже нет
+    wire        page3_seen_core = 1'b0;
+`elsif HYBRID_CORE
+    wire [7:0]  eff7_core   = 8'd0;
+    wire        zx_mem_wait = 1'b0;
+    wire        trdos_core  = 1'b0;
+    wire [1:0]  rom_page_core = 2'd0;
+    wire [31:0] rom_dbg_core  = 32'd0;    // B0147
+    wire        page3_seen_core = 1'b0;
+`else
+    wire [7:0]  eff7_core;
+    wire        zx_mem_wait;
+    wire        trdos_core;           // B0071: живая защёлка DOS из memory.v
+    wire [1:0]  rom_page_core;        // B0071: живая страница ПЗУ
+    wire [31:0] rom_dbg_core;         // B0147: {взводов трапа, снятий, адрес последнего взвода}
+    wire        page3_seen_core;      // B0147: липко - слот 3 был в окне
+`endif
+    wire [19:0] zxddr_addr;  wire [7:0] zxddr_wdata, zxddr_rdata;  wire zxddr_rd, zxddr_wr;
+    wire [31:0] zx_mach_dbg;
+    wire [31:0] zx_aud_dbg;   // B0088: пики звука из машины -> 0x170
+    /* B0071: страничность ПЗУ и способности - ПО ЦЕЛИ. У чужих ядер (mister48, hybrid) своя
+       страничность ПЗУ, поэтому им остаётся прежняя пара страниц (индекс memA[14:0], те же 8
+       плиток BRAM) и бит4 LOAD_CAPS не поднимается. Мало того, у них страницы 2/3 АЛИАСИЛИСЬ БЫ
+       поверх живых 0/1, поэтому заливка там запрещена ЖЕЛЕЗОМ (rom_ld_en), а не советом в
+       LOAD_CAPS: совет прошивка может проигнорировать или прочитать из устаревшего кэша. */
+`ifdef MISTER48_CORE
+    localparam integer  ROM_PAGES_SEL = 2;
+    localparam [31:0]   LOAD_CAPS_SEL = 32'h00000009;
+`elsif HYBRID_CORE
+    localparam integer  ROM_PAGES_SEL = 2;
+    localparam [31:0]   LOAD_CAPS_SEL = 32'h00000009;
+`else
+    localparam integer  ROM_PAGES_SEL = 4;
+    localparam [31:0]   LOAD_CAPS_SEL = 32'h000001F9;   // + бит8 = в этом ядре ЕСТЬ карта DivMMC
+                                                        //   (0x19C..0x1B8). Кэш возможностей прошивка
+                                                        //   ОБЯЗАНА сбрасывать при смене ядра, иначе
+                                                        //   покажет владельцу карту там, где её нет.
+                                                        // + бит4 = порт заливки ПЗУ (0x154/0x158/0x15C),
+                                                        // + бит5 = ядро принимает запись регистров ATA
+                                                        //   от ARM (B0115): на ядре без него прошивке
+                                                        //   нечем выставить сигнатуру после 0x90,
+                                                        // + бит6 = есть мышь Kempston (B0116, порт 0x190).
+                                                        //   Без этого бита прошивке пришлось бы ГАДАТЬ,
+                                                        //   есть ли в ядре порты мыши, и она показывала бы
+                                                        //   владельцу живую опцию на ядре, где её нет.
+                                                        // + бит7 = DRQ ведёт ФАБРИКА (B0117): она снимает
+                                                        //   его по факту вычерпывания блока и держит BSY
+                                                        //   между блоками. Бит нужен прошивке, чтобы
+                                                        //   ЗНАТЬ, куда можно класть служебную метку
+                                                        //   «блок последний» (бит1 слова состояния): на
+                                                        //   старом ядре тот же бит уехал бы прямо в
+                                                        //   регистр состояния машины.
+                                                        //   Кэш возможностей сбрасывать при смене ядра!
+`endif
+    wire rom_ld_en = (ROM_PAGES_SEL == 4);   // константа: у цели с 2 страницами заливки ПЗУ нет вовсе
+    // B0071: шина заливки ПЗУ от ARM (живёт в fclk100 - том же домене, что порт B BRAM ПЗУ,
+    // поэтому строб записи не нуждается в CDC) + слово MACHINE_CFG, из которого машина берёт
+    // бит8 = «трап входа в TR-DOS разрешён».
+    // B0075 дисковод: мост подачи секторов между ARM и контроллером внутри ядра
+    wire [31:0] fdc_ctl_a;  wire fdc_ctl_we_a;
+    wire [31:0] gs_ctl_a;   wire gs_ctl_we_a;   // General Sound: 0x178 W
+    wire [31:0] gs_stat_w;                      // General Sound: 0x174 R
+    /* B0108/B0118 УПРУГАЯ ОЧЕРЕДЬ ЗАПИСЕЙ #B3. Живёт здесь, потому что здесь есть ОБА
+       такта: пишет её машина (spclk 56 МГц), вычерпывает оболочка (fclk100).
+       B0119: глубина 64 и резерв 8 мест. Раньше было 128 с резервом 32 - под записи, которые
+       гость делает БЕЗ опроса флага. Теперь таких записей не бывает вовсе: шина держит машину
+       прямо в цикле записи (gs_flow.v), то есть за порог очередь может уйти ровно на один байт,
+       уже принятый. Резерв стал платой ни за что, а место в кристалле у нас кончилось буквально:
+       первая сборка B0119 НЕ РАЗМЕСТИЛАСЬ - не хватило 16 слайсов из 4400. Глубина же теперь
+       только ПЛАВНОСТЬ: 48 полезных байт по 4.7 мкс = 0.22 мс свободного хода между
+       удержаниями. Историческая справка о том, зачем её вообще наращивали:
+       корректность теперь держит НЕ глубина, а обратное давление (см. gs_wq_fifo.v и main.v),
+       поэтому глубина - это только ПЛАВНОСТЬ (96 полезных байт по 4.7 мкс = 0.45 мс без
+       единого ожидания), а за неё можно торговаться. И пришлось: глубина 256 собралась на 91.28 %
+       LUT и ПРОВАЛИЛА тайминг ПИКСЕЛЬНОГО домена (WNS -0.081 нс на буферах OSD) - ровно так
+       же, как в B0108. Повторять ту же ошибку незачем: байт терялся не из-за мелкой очереди, а
+       из-за молчания о занятости. Память - распределённая (LUTRAM): блочной взять негде,
+       BRAM заняты все 60 из 60. */
+    wire [31:0] nemo_ctl_a;  wire nemo_ctl_we_a;  wire [31:0] nemo_stat_w, nemo_stat2_w;   // B0112 NEMO-IDE
+    // DivMMC: карта SD (0x19C..0x1B8). Сама она стоит НИЖЕ, у выводов uSD ядра.
+    wire [31:0] dmmc_ctl_a, dmmc_cap_a, dmmc_bufa_a, dmmc_bufw_a;
+    wire        dmmc_ctl_we_a, dmmc_bufa_we_a, dmmc_bufw_we_a, dmmc_bufr_re_a;
+    wire [31:0] dmmc_bufa_q_w, dmmc_bufr_q_w, dmmc_stat_w, dmmc_lba_w, dmmc_dbg_w;
+    wire        sd_cs_n_w, sd_ck_w, sd_mosi_w, sd_miso_w;
+    wire [31:0] km_ctl_a;    wire km_ctl_we_a;                                             // B0116 мышь Kempston
+    wire [7:0]  gs_wq_din_sp;  wire gs_wq_we_sp, gs_wq_full_sp, gs_wq_afull_sp, gs_wq_drain_sp;
+    wire [31:0] gs_stat2_w, gs_stat3_w;          // B0119: прибор обратного давления (0x194/0x198)
+    wire [7:0]  gs_rq_dout;    wire gs_rq_empty, gs_rq_rd;
+    /* Занятость очереди наружу отдаётся девятью битами (протокол регистра 0x180 не трогаем),
+       а сама очередь стала мельче - расширяем ЯВНО. Узкий выход, воткнутый в широкий провод,
+       оставил бы старшие разряды неподключёнными, и прошивка читала бы в них мусор. */
+    wire [6:0]  gs_rq_cnt_n;   wire [8:0] gs_rq_cnt = {2'd0, gs_rq_cnt_n};
+    wire [7:0]  fdc_data_a; wire fdc_data_we_a;
+    wire [31:0] fdc_stat_w, fdc_stat2_w;
+    wire [15:0] rom_ld_addr_a;
+    wire [7:0]  rom_ld_data_a;
+    wire        rom_ld_we_a, rom_loading_a;
+    wire [31:0] mach_cfg_w;
+    wire [31:0] ctl_pent_int;
+    wire [31:0] ctl_ula_tune;
+    wire [8:0]  ctl_paper_h, ctl_paper_v;
+    wire [31:0] ctl_joy;
+    wire [31:0] ctl_warp_hold, ctl_sync_hold;
+    wire        ps2_strb, ps2_make;
+    wire [7:0]  ps2_code;
+    wire        ps2tx_busy;
+    wire [31:0] cp_ps2_diag;
+    wire [31:0] player_pcm;
+    wire [8:0]  pgain, mgn;
+    wire        halt_ack, ram_busy, reset_busy_aclk;
     //=============================================================================================
     // Spectrum master clock (~56.7 MHz) + clock enables from clock_zx.
     //=============================================================================================
     wire spclk;
+    gs_wq_fifo #(.DW(8), .AW(6), .HDR(8), .LO(16)) gs_wq_i (
+        .wr_clk(spclk),   .wr_rst_n(aresetn), .wr_en(gs_wq_we_sp), .din(gs_wq_din_sp),
+        .full(gs_wq_full_sp), .afull(gs_wq_afull_sp), .wr_count(), .drain_w(gs_wq_drain_sp),
+        .rd_clk(fclk100), .rd_rst_n(aresetn), .rd_en(gs_rq_rd),
+        .dout(gs_rq_dout), .empty(gs_rq_empty), .rd_count(gs_rq_cnt_n)
+    );
     wire sp_lock;
     wire pe7M0, ne7M0, pe3M5, ne3M5;
     wire vid_blank, vid_hsync, vid_vsync, vid_r, vid_g, vid_b, vid_i;
     wire warp_active;                                       // full whole-core 4x warp (WAV AUTO policy; defined below)
     wire warp_safe2_active;                                 // B0047 diagnostic whole-core 2x route for explicit fmode=2
+    wire tape_streaming;                                    // лента РЕАЛЬНО движется (присваивается ниже, рядом с tape_advance)
     wire warp_ack;                                          // clock_zx has actually adopted the requested non-native schedule
     clock_zx clock_zx_i (
         .fclk100(fclk100), .warp(warp_active), .warp2(warp_safe2_active), .clock(spclk), .power(sp_lock),
         .warp_ack(warp_ack),
         .ne14M(), .pe7M0(pe7M0), .ne7M0(ne7M0), .pe3M5(pe3M5), .ne3M5(ne3M5)
     );
-
-    //=============================================================================================
-    // PS/2 keyboard (real keys) + Ctrl+Alt+Del / Ctrl+Alt+Ins reset hotkeys. Spectrum domain,
-    // pe3M5 enable (like kbd_buttons). The core's ps2.v decodes the 11-bit frames; the 0xE0
-    // extended prefix is harmlessly ignored, so Del(0x71)/Ins(0x70) base codes are seen.
-    //=============================================================================================
-    reg [1:0] ps2c_s = 2'b11, ps2d_s = 2'b11;        // 2-FF sync of the async pins
-    always @(posedge spclk) begin ps2c_s <= {ps2c_s[0], ps2_clk}; ps2d_s <= {ps2d_s[0], ps2_data}; end
-
-    wire       ps2_strb, ps2_make, ps2_perr;
-    wire [7:0] ps2_code;
-    ps2 ps2_i (
-        .clock(spclk), .ce(pe3M5),
-        .ps2Ck(ps2c_s[1]), .ps2D(ps2d_s[1]),
-        .strb(ps2_strb), .make(ps2_make), .code(ps2_code), .perr(ps2_perr)
-    );
-
-    //---- Step 15: PS/2 HOST TX (LEDs / typematic / resend). ARM writes KBD_TX (0xB0). The write strobe
-    //     is CDC'd fclk100->spclk (toggle + 3-FF + edge; the KBD_INJECT idiom) and ps2_tx runs the whole
-    //     host->device handshake hardware-timed. CLK/DATA are now inout open-drain: drive low or release
-    //     to Hi-Z (the board's 4k7 pull-up returns them high). RX is paused while ps2tx_busy so the bits
-    //     WE drive are not mis-decoded as incoming frames. ----
-    wire [7:0] ctl_kbd_tx_data;   wire ctl_kbd_tx_we;
-    reg  ktx_tog_a = 1'b0;
-    always @(posedge fclk100) if (ctl_kbd_tx_we) ktx_tog_a <= ~ktx_tog_a;
-    (* ASYNC_REG="TRUE" *) reg [2:0] ktx_sync = 3'd0;
-    always @(posedge spclk) ktx_sync <= {ktx_sync[1:0], ktx_tog_a};
-    wire ktx_pulse = ktx_sync[2] ^ ktx_sync[1];
-    (* ASYNC_REG="TRUE" *) reg [7:0] ktx_d0 = 8'd0, ktx_d1 = 8'd0;
-    always @(posedge spclk) begin ktx_d0 <= ctl_kbd_tx_data; ktx_d1 <= ktx_d0; end
-
-    wire ps2c_low, ps2d_low, ps2tx_busy, ps2tx_done, ps2tx_ack;
-    // AUTO-RESEND: a parity/framing error (ps2_perr) asks the keyboard to resend the last byte (0xFE)
-    // as soon as the TX is free -> the lost make/break is recovered (fixes the occasional dropped key).
-    // An ARM send (ktx_pulse: LEDs) wins a tie; the resend then fires on the next free cycle.
-    reg  resend_req = 1'b0;
-    // AUTO-RESEND DISABLED (stability): it fired on the keyboard's power-up/BAT frames right after a
-    // reconfig and disrupted the device (dead-until-power-cycle). parity errors are still COUNTED
-    // (KBD_DIAG) so we can measure them. To be re-enabled behind a post-reset startup grace + a robust
-    // guard so it never touches the device before it is up.
-    wire resend_launch = 1'b0;
-    always @(posedge spclk or negedge aresetn) begin
-        if (!aresetn)                            resend_req <= 1'b0;
-        else if (pe3M5 && ps2_perr && ~ps2tx_busy) resend_req <= 1'b1;   // ONLY a real keyboard frame - never our own TX bits (else self-resend loop)
-        else if (resend_launch)                  resend_req <= 1'b0;
-    end
-    wire       tx_start = ktx_pulse | resend_launch;
-    wire [7:0] tx_byte  = ktx_pulse ? ktx_d1 : 8'hFE;
-    ps2_tx ps2tx_i (
-        .clk(spclk), .rst_n(aresetn),
-        .start(tx_start), .tx_data(tx_byte),
-        .ps2c_in(ps2c_s[1]), .ps2d_in(ps2d_s[1]),
-        .clk_low(ps2c_low), .data_low(ps2d_low),
-        .busy(ps2tx_busy), .done(ps2tx_done), .ackok(ps2tx_ack)
-    );
-    // Diagnostic counters (KBD_DIAG 0xB8): how often frames drop, and how often we recover them.
-    reg [15:0] perr_cnt = 16'd0, resend_cnt = 16'd0;
-    always @(posedge spclk or negedge aresetn) begin
-        if (!aresetn) begin perr_cnt <= 16'd0; resend_cnt <= 16'd0; end
-        else begin
-            if (pe3M5 && ps2_perr && ~ps2tx_busy && perr_cnt != 16'hFFFF) perr_cnt   <= perr_cnt   + 16'd1;
-            if (resend_launch                     && resend_cnt != 16'hFFFF) resend_cnt <= resend_cnt + 16'd1;
-        end
-    end
-    (* ASYNC_REG="TRUE" *) reg [31:0] diag_s0 = 32'd0, diag_s1 = 32'd0;
-    always @(posedge fclk100) begin diag_s0 <= {resend_cnt, perr_cnt}; diag_s1 <= diag_s0; end
-    wire [31:0] kbd_diag_aclk = diag_s1;
-    assign ps2_clk  = ps2c_low ? 1'b0 : 1'bz;   // open-drain: pull low or release (Hi-Z)
-    assign ps2_data = ps2d_low ? 1'b0 : 1'bz;
-    (* ASYNC_REG="TRUE" *) reg [1:0] txbusy_s = 2'd0, txack_s = 2'd0;   // TX status -> aclk for KBD_TXSTAT (0xB4)
-    always @(posedge fclk100) begin txbusy_s <= {txbusy_s[0], ps2tx_busy}; txack_s <= {txack_s[0], ps2tx_ack}; end
-    wire kbd_tx_busy_aclk = txbusy_s[1];
-    wire kbd_tx_ack_aclk  = txack_s[1];
-
     // Pause key = E1 14 77 (make) / E1 F0 14 F0 77 (break) is ARM-owned (intercepted from the always-
     // tap FIFO). Suppress its whole byte run from the Z80 matrix AND the hotkey latches, so a resume
     // can never leak Symbol-Shift (0x14) into the core or stick a reset-combo flag. Anchor on 0xE1
@@ -250,6 +214,16 @@ module bulbulator_zx_ddr_top
     end
     wire pause_byte = (ps2_code == 8'hE1) | (pse != 3'd0);
 
+    // Keep the E0 prefix until the following data byte (and across an intervening F0 on break).
+    // The old matrix path discarded this information, so the physical cursor keys and NumPad
+    // 8/2/4/6 were indistinguishable.  We need the distinction when NumLock gives the keypad to
+    // Kempston: suppress the non-extended keypad byte, but keep the real E0 cursor key in the matrix.
+    reg ps2_e0 = 1'b0;
+    always @(posedge spclk) if (pe3M5 && ps2_strb && ~ps2tx_busy) begin
+        if      (ps2_code == 8'hE0) ps2_e0 <= 1'b1;
+        else if (ps2_code != 8'hF0) ps2_e0 <= 1'b0;
+    end
+
     // Held state of the hotkey keys (make=0 => pressed). Qualified by ~pause_byte (Pause never touches
     // a combo flag); belt-and-suspenders: ANY 0xF0 break frame clears ALL latches, so no key can leave
     // ctrl_h/alt_h/del_h permanently stuck and silently arm Ctrl+Alt+Del. Normal press/release still
@@ -260,14 +234,27 @@ module bulbulator_zx_ddr_top
         else case (ps2_code)
             8'h14: ctrl_h <= ~ps2_make;   // Ctrl (also Symbol Shift in the matrix)
             8'h11: alt_h  <= ~ps2_make;   // Alt
-            8'h71: del_h  <= ~ps2_make;   // Delete
-            8'h70: ins_h  <= ~ps2_make;   // Insert
+            8'h71: if (ps2_e0) del_h <= ~ps2_make;   // E0 71 = Delete; bare 71 = NumPad dot
+            8'h70: if (ps2_e0) ins_h <= ~ps2_make;   // E0 70 = Insert; bare 70 = NumPad zero
             8'h78: f11_h  <= ~ps2_make;   // F11
             default: ;
         endcase
     end
     wire soft_combo = ctrl_h & alt_h & del_h;        // Ctrl+Alt+Del -> soft reset
-    wire nmi_combo  = ctrl_h & alt_h & ins_h;        // Ctrl+Alt+Ins -> NMI (Magic / freezer)
+    /* B0136 (просьба владельца 14.08): NMI вешается на ПРОСТОЙ Ins, без Ctrl+Alt. Причина простая -
+       это главная кнопка при работе с esxDOS, ею открывают NMI-браузер поверх чего угодно, и тянуть
+       ради неё аккорд неудобно. Прежний аккорд оставлен: он ничего не стоит и у кого-то в пальцах.
+       ⚠ Плата за это: Ins больше не доедет до машины как обычная клавиша. Софта, которому нужен
+       именно Ins на Спектруме, не бывает (на ZX-клавиатуре такой клавиши нет вовсе), но если
+       понадобится - это станет опцией машины, а не откатом. */
+    /* B0139 (просьба владельца 14.08): «клавиша Ins не должна передаваться и в навигатор, и в машину
+       при открытом навигаторе, только в навигатор». Верно: NMI собирается ЗДЕСЬ, в фабрике, а
+       фабрика про открытую оболочку не знает - клавиатурный гейт подавляет PS/2 только по пути в
+       ядро (ps2_to_core), до аккордов он не доходит. Поэтому Ins открывал NMI-браузер esxDOS прямо
+       поверх навигатора, где той же клавишей помечают файлы.
+       Гейтится ТОЛЬКО голый Ins. Явный аккорд Ctrl+Alt+Ins оставлен работать всегда: случайно его
+       в навигаторе не наберёшь, а «магическая кнопка» поверх оболочки иногда нужна намеренно. */
+    wire nmi_combo  = (ins_h & ~gate_on) | (ctrl_h & alt_h & ins_h);   // Ins / Ctrl+Alt+Ins -> NMI
     wire hard_combo = f11_h;                          // F11          -> hard / cold reset (RAM wipe)
 
     // NMI: one short pulse on the Ctrl+Alt+Ins press edge -> the core's nmi input.
@@ -279,7 +266,6 @@ module bulbulator_zx_ddr_top
         else if (nmi_cnt != 5'd0) nmi_cnt <= nmi_cnt - 5'd1;
     end
     wire nmi_pulse = (nmi_cnt != 5'd0);
-
     //=============================================================================================
     // Power-on reset in the Spectrum domain (ACTIVE-LOW).
     //=============================================================================================
@@ -298,6 +284,99 @@ module bulbulator_zx_ddr_top
             por_n <= 1'b1;
         end
     end
+
+    // B0071: уровни от ARM в такт машины. `rom_loading` ДЕРЖИТ ПРОЦЕССОР В СБРОСЕ на всё время
+    // заливки ПЗУ - иначе Z80 исполнял бы полузаписанное ПЗУ. У картриджа NES это закрыто ровно
+    // так же (loading входит в core_reset, а строб записи ещё и загейтен по loading), и одного
+    // HALT-а здесь НЕДОСТАТОЧНО: он гасит только такты, состояние процессора сохраняется и после
+    // снятия HALT он продолжил бы с подменённого под ним ПЗУ.
+    (* ASYNC_REG="TRUE" *) reg [1:0] svcnmi_s = 2'b00;   // B0101: магическая кнопка (бит13)
+    (* ASYNC_REG="TRUE" *) reg [1:0] romld_s = 2'b00, trdosen_s = 2'b00, svcrom_s = 2'b00,
+                                     bdialways_s = 2'b00;
+    // B0146: бит25 = под TR-DOS страница ПЗУ выбирается парой {DOS, 7FFD[4]} (вход в файловый
+    // менеджер сервисной страницы). Биты 0..6 заняты у NES, 8..24 и 26 - у нас; 25 был единственной
+    // дыркой внутри блока страничности/DivMMC, поэтому 27..31 остаются целым диапазоном.
+    (* ASYNC_REG="TRUE" *) reg [1:0] dossvc_s = 2'b00;
+    // B0087: режим SAA1099 на порте #FF - 2 бита, поэтому свой пара-регистровый конвейер.
+    (* ASYNC_REG="TRUE" *) reg [1:0] saamode_s0 = 2'b00, saamode_s1 = 2'b00;
+    // B0154: бит27 = ВЕРНУТЬ старую фазу окна контеншена ПОРТОВ (на такт раньше эталона).
+    // Умолчание 0 = фаза настоящей машины (CONTP из ulatest3 на живом 48K: занято с 14339).
+    // Зачем опция: сдвиг окна портов меняет тайминги ЛЮБОГО софта, который лупит IN/OUT в
+    // растре, - если после B0154 какая-то демка поедет, бит27 возвращает поведение B0153
+    // без пересборки ядра. Подробности у входа `io_cont_early` в atlas_core/main.v.
+    (* ASYNC_REG="TRUE" *) reg [1:0] iocont_s = 2'b00;
+    // B0120: маска недостающих старших бит банка - 3 бита, тот же двухступенчатый конвейер.
+    (* ASYNC_REG="TRUE" *) reg [2:0] ramnb_s0 = 3'b000, ramnb_s1 = 3'b000;
+    always @(posedge spclk) begin
+        romld_s   <= {romld_s[0],   rom_loading_a & rom_ld_en};
+        svcrom_s  <= {svcrom_s[0],  mach_cfg_w[9]};   // MACHINE_CFG бит9 = сервисная страница ПЗУ
+        svcnmi_s  <= {svcnmi_s[0],  mach_cfg_w[13]};  // B0101 бит13 = магическая кнопка (по NMI)
+        trdosen_s <= {trdosen_s[0], mach_cfg_w[8]};   // MACHINE_CFG бит8 = разрешить трап TR-DOS.
+        bdialways_s <= {bdialways_s[0], mach_cfg_w[10]}; // B0079: временный upstream-like BDI A/B
+        dossvc_s  <= {dossvc_s[0],  mach_cfg_w[25]}; // B0146 бит25 = пара {DOS, 7FFD[4]} выбирает страницу
+        iocont_s  <= {iocont_s[0],  mach_cfg_w[27]}; // B0154 бит27 = окно контеншена ПОРТОВ как до B0154 (на такт раньше эталона); умолчание 0 = фаза настоящей машины
+        saamode_s0  <= mach_cfg_w[12:11];             // B0087: SAA1099 0 AUTO / 1 ON / 2 OFF
+        saamode_s1  <= saamode_s0;
+        ramnb_s0    <= mach_cfg_w[16:14];             // B0120: 000 = 1024К (по умолчанию), 111 = 128К
+        ramnb_s1    <= ramnb_s0;
+                                                     // Не бит5: биты 0..6 этого слова у NES заняты
+                                                     // (region, palette[5:4], sprlimit), и при отказе
+                                                     // смены ядра ZX получил бы чужой бит.
+    end
+    wire rom_loading_sp = romld_s[1];
+    wire trdos_en_sp    = trdosen_s[1];
+    wire svcrom_sp      = svcrom_s[1];
+    wire svc_nmi_en_sp  = svcnmi_s[1];   // B0101: страница вставляется по NMI, снимается по RETN
+    wire dos_svc_en_sp  = dossvc_s[1];   // B0146: под TR-DOS сброс 7FFD[4] вставляет СЕРВИСНУЮ страницу
+    // General Sound: бит включения приходит из домена AXI - синхронизируем двумя триггерами.
+    // Само слово управления и строб в синхронизации не нуждаются: их защёлкивает ловушка по стробу.
+    (* ASYNC_REG="TRUE" *) reg [1:0] gsen_s = 2'b00;
+    always @(posedge spclk) gsen_s <= {gsen_s[0], gs_ctl_a[31]};
+    wire gs_en_sp = gsen_s[1];
+    /* DivMMC включён (MACHINE_CFG бит17). Бит машино-агностичного слова, поэтому синхронизируем
+       так же, как остальные: два триггера. Биты 0..6 этого слова у NES заняты - брать их нельзя. */
+    (* ASYNC_REG="TRUE" *) reg [1:0] dmen_s = 2'b00;
+    always @(posedge spclk) dmen_s <= {dmen_s[0], mach_cfg_w[17]};
+    wire divmmc_en_sp = dmen_s[1];
+    /* B0138 Z-CONTROLLER - MACHINE_CFG бит19. Отдельный бит, а не режим DivMMC: у Sizif они тоже
+       независимы, карта одна и конфликта нет. Автомаппер ПЗУ при этом остаётся ТОЛЬКО у DivMMC -
+       у Z-Controller своего ПЗУ нет вовсе, это два голых порта SPI. */
+    (* ASYNC_REG="TRUE" *) reg [1:0] zcen_s = 2'b00;
+    always @(posedge spclk) zcen_s <= {zcen_s[0], mach_cfg_w[19]};
+    wire zc_en_sp = zcen_s[1];
+    (* ASYNC_REG="TRUE" *) reg [1:0] zcturbo_s = 2'b00;
+    always @(posedge spclk) zcturbo_s <= {zcturbo_s[0], mach_cfg_w[20]};
+    wire zc_turbo_sp = zcturbo_s[1];
+    /* B0132 ОПЦИИ DivMMC. Таблица - DIVMMC_PLAN.md §3.2. Синхронизируем тем же приёмом, что и бит17:
+       слово MACHINE_CFG пишет ARM, машина живёт в своём домене.
+       ⚠ Бит 18 и dm_opt[0] ПРОТИВОПОЛОЖНЫ: в слове 1 = «гейт входов включён» (как Sizif/Next),
+       а в модуле dm_opt[0]=1 гейт СНИМАЕТ (см. memory.v:270). Отсюда инверсия. */
+    (* ASYNC_REG="TRUE" *) reg [1:0] dmgate_s = 2'b00, dmwp_s = 2'b00, dmnmi_s = 2'b00, dmprato_s = 2'b00;
+    (* ASYNC_REG="TRUE" *) reg [1:0] dmtap0_s = 2'b00, dmtap1_s = 2'b00;
+    always @(posedge spclk) begin
+        dmgate_s  <= {dmgate_s[0],  mach_cfg_w[18]};   // 1 = гейт входов по вставленному 48 BASIC
+        dmwp_s    <= {dmwp_s[0],    mach_cfg_w[23]};   // 1 = защита записи MAPRAM (спека)
+        dmnmi_s   <= {dmnmi_s[0],   mach_cfg_w[24]};   // 1 = вход 0x0066 отдан esxDOS
+        dmprato_s <= {dmprato_s[0], mach_cfg_w[26]};   // 1 = выход из MAPRAM по моду Prato
+        dmtap0_s  <= {dmtap0_s[0],  mach_cfg_w[21]};   // 22:21 ловушки ленты: 00 авто, 01 esxDOS, 10 наши
+        dmtap1_s  <= {dmtap1_s[0],  mach_cfg_w[22]};
+    end
+    /* 🥇 B0134 ПОРЯДОК РАЗРЯДОВ. В конкатенации {a,b,c,d} слева направо идут [3],[2],[1],[0], а в
+       первой редакции комментарии стояли [3],[1],[2],[0] - и два бита физически поменялись местами.
+       Цена: `hook_nmi` (вход 0x0066, то есть ВЫЗОВ NMI-БРАУЗЕРА esxDOS) питался от бита защиты
+       записи и был ВЫКЛЮЧЕН, а защита записи MAPRAM наоборот снята. Оба дефекта тихие: браузер
+       просто не открывался, а защита просто не работала. */
+    wire [3:0] dm_opt_sp = { dmprato_s[1],   // [3] мод Prato: %11xxxxxx снимает MAPRAM
+                             dmnmi_s[1],     // [2] вход 0x0066 отдан DivMMC (NMI-браузер)
+                             ~dmwp_s[1],     // [1] инвертирован: 1 = БЕЗ защиты записи (поведение MiSTer)
+                             ~dmgate_s[1] }; // [0] 1 = гейт входов СНЯТ
+    /* Ловушки ленты 04C6/0562: наш SMART-загрузчик и .tapein esxDOS живут на одних адресах.
+       10 = держим их себе. 00 (авто) и 01 = отдаём esxDOS, потому что в режиме DivMMC лентой
+       по решению владельца рулит esxDOS. */
+    wire dm_pagein_off_sp = (~dmtap0_s[1]) & dmtap1_s[1];
+    wire bdi_always_sp  = bdialways_s[1];
+    wire [1:0] saa_mode_sp = saamode_s1;
+    wire [2:0] ram_nobit_sp = ramnb_s1;
 
     // Cold-reset RAM wipe (F11): freeze the Z80, sweep-write 0 to all 128KB RAM (and the
     // screen shadow), then reset the core - a true power-on cold boot. Soft reset (Ctrl+Alt+Del)
@@ -336,52 +415,26 @@ module bulbulator_zx_ddr_top
             core_rst_n <= 1'b1;
         end
     end
-    wire sp_reset_n = por_n & core_rst_n;            // to the core: power-on OR a hotkey reset
-    wire reset_busy_sp = clr_active | (rst_cnt != 18'd0);   // RESET/wipe in progress -> ARM STATUS bit2
+    wire sp_reset_n = por_n & core_rst_n & ~rom_loading_sp;  // power-on / hotkey reset / ЗАЛИВКА ПЗУ
+    // B0071: удержание сброса на время заливки ПЗУ ОБЯЗАНО быть видно в STATUS бит2. Иначе
+    // machine_reset() из ARM дожидается «сброс завершён», оболочка считает машину живой, а она стоит -
+    // ровно та картина «чёрный слой машины при живом OSD», которую нечем объяснить с хоста.
+    wire reset_busy_sp = clr_active | (rst_cnt != 18'd0) | rom_loading_sp;   // -> ARM STATUS bit2
     // NemoBus / expansion bus: sp_reset_n IS the master reset. Route it (active-low /RESET) to the
     // expansion-connector pin when that bus is physically wired (one XDC line) so an attached board
     // resets on every load / F11 / AXI-RESET, like a real Spectrum edge-connector /RESET.
 
-    //=============================================================================================
-    // AXI control plane: aclk = fclk100. Power-on reset for the slave.
-    //=============================================================================================
-    reg [3:0] axi_por = 4'h0;
-    reg       aresetn = 1'b0;
-    always @(posedge fclk100) begin
-        if (axi_por != 4'hF) begin axi_por <= axi_por + 4'h1; aresetn <= 1'b0; end
-        else                                                  aresetn <= 1'b1;
-    end
-
-    // axi_ctl (aclk) <-> inject_cdc <-> Spectrum domain
-    wire        ctl_halt;
-    wire        ctl_ram_we;
-    wire [16:0] ctl_ram_addr;
-    wire [16:0] ctl_ram_waddr;
-    wire [7:0]  ctl_ram_data;
-    wire        halt_ack, ram_busy, reset_busy_aclk;
-    wire        ctl_reset, arm_reset_sp;
+    // axi_ctl (в оболочке) <-> inject_cdc <-> Spectrum domain
     wire        cpu_halt_sp;
     wire        arm_memWr;
     wire [18:0] arm_memA;
     wire [7:0]  arm_memQ;
     wire [13:0] arm_vmmA2;
-    wire [211:0] ctl_dir, cpu_dir_sp, cpu_reg_sp;
-    wire [5:0]   ctl_7ffd, port7ffd_sp;
-    wire [2:0]   ctl_border, border_sp;
-    wire         ctl_dir_commit, ctl_port_commit;
+    wire [211:0] cpu_dir_sp, cpu_reg_sp;
+    wire [5:0]   port7ffd_sp;
+    wire [2:0]   border_sp;
     wire         dir_set_sp, force_7ffd_sp, force_border_sp;
-    wire         ctl_osd_enable, ctl_osd_we;     // OSD overlay control (aclk)
-    wire [9:0]   ctl_osd_waddr;
-    wire [23:0]  ctl_osd_bg;
-    wire [7:0]   ctl_osd_op;
-    wire [31:0]  ctl_osd_pos;
-    wire [31:0]  ctl_osd_ddr_base;                // DDR-RGB OSD canvas base (0x94)
-    wire [31:0]  ctl_ddr_osd_pos;                 // DDR-RGB OSD canvas position (0x98, independent of the 1bpp OSD_POS)
-    wire         ctl_tape_run, ctl_tape_earmux, ctl_tape_mute, ctl_tape_we;  // Step 14.2 tape station
-    wire [1:0]   ctl_tape_fmode;                         // 0x9C [4:3]: fast-load mode 0=off 1=FAST(8x CPU-only) 2=SAFE(4x whole-core)
-    wire         ctl_tape_sync;                          // 0x9C bit5: SYNC LOADER (demand tape - freeze between blocks until CPU samples)
-    wire         ctl_tape_more;                          // 0x9C bit6: tape_more_data - ARM still delivering; keep a tail FIFO underrun CPU-frozen (protects the tail against the last-block sampling_active decay)
-    wire [31:0]  ctl_tape_data;
+    wire         arm_reset_sp;
     wire         tape_full, tape_playing, tape_ear, tape_playing_a;
     wire         tape_eot_now;       // true final EOT: last descriptor ended and ARM producer is done
     wire         tape_eot_safe;      // B0046 applies local EOT exit only to explicit SAFE4
@@ -395,47 +448,11 @@ module bulbulator_zx_ddr_top
     reg [31:0] tape_diag_hash_a0=32'd0,  tape_diag_hash_a1=32'd0;
     reg [31:0] tape_diag_gaps_a0=32'd0,  tape_diag_gaps_a1=32'd0;
     reg [31:0] tape_diag_res_a0=32'd0,   tape_diag_res_a1=32'd0;
-    reg [31:0] fe_trace_count_a0=32'd0, fe_trace_count_a1=32'd0;
-    reg [31:0] fe_trace_hash_a0=32'd0,  fe_trace_hash_a1=32'd0;
-    reg [31:0] fe_trace_last_a0=32'd0,  fe_trace_last_a1=32'd0;
     always @(posedge fclk100) begin
         tape_diag_count_a0 <= tape_diag_count_sp; tape_diag_count_a1 <= tape_diag_count_a0;
         tape_diag_hash_a0  <= tape_diag_hash_sp;  tape_diag_hash_a1  <= tape_diag_hash_a0;
         tape_diag_gaps_a0  <= tape_diag_gaps_sp;  tape_diag_gaps_a1  <= tape_diag_gaps_a0;
         tape_diag_res_a0   <= tape_diag_resumes_sp; tape_diag_res_a1 <= tape_diag_res_a0;
-    end
-    wire         ctl_ddr_osd_en;                  // DDR-RGB OSD enable (OSD_CTRL bit1)
-    wire         ctl_ban_enable, ctl_ban_we;     // independent banner overlay control (aclk)
-    wire [8:0]   ctl_ban_waddr;
-    wire [31:0]  ctl_ban_wdata;
-    wire [31:0]  ctl_ban_pos;
-    wire [7:0]   ctl_vol;
-    wire         ctl_pentagon, ctl_model48, ctl_ula_late; // 0xBC MACHINE_CFG: bit0 Pentagon, bit1 48K, bit2 Sinclair ULA Late
-    wire [31:0]  ctl_pent_int;                  // 0xC4 PENT_INT: {v[24:16], hc[8:0]} INT-position tuner (aclk)
-    wire [8:0]   ctl_paper_h, ctl_paper_v;      // live paper offsets from ARM menu (0xC8/0xCC)
-    wire [31:0]  ctl_joy;                       // 0xC4 JOY_STATE (aclk): [15:0] p1, [31:16] p2 (v0x4A)
-    wire [31:0]  ctl_scr_pos;                   // live whole-frame HDMI position {vmargin[15:0], hmargin[15:0]} (0xD0)
-    wire [31:0]  ctl_crop_a, ctl_crop_b;        // live crop {sy0,sx0} (0xD4) / {croph,cropw} (0xD8)
-    wire [31:0]  ctl_warp_hold;                 // 0xDC WARP_HOLD: fast-load continuous-warp idle-release timeout (CPU T-states; 0 = hold until tape-run clears) (aclk)
-    wire [31:0]  ctl_sync_hold;                 // 0x1C SYNC_HOLD: SYNC-loader hysteretic-hold sustained-quiet release threshold (CPU T-states) (aclk)
-    wire         ctl_player_en, ctl_audio_we;   // machine-agnostic ARM audio player (mux + FIFO push)
-    wire [31:0]  ctl_audio_data;
-    wire         aud_full, aud_empty;
-    wire [7:0]   aud_rdcount;
-    wire [31:0]  aud_dout;
-    wire [31:0]  ctl_osd_wdata;
-    wire [8:0]   kbd_fifo_dout;                  // keyboard scancode FIFO head {make,code} (aclk read)
-    wire         kbd_fifo_empty, kbd_fifo_rd, kbd_deadman_kick;
-    wire [8:0]   ctl_kbd_inject;                  // ARM key inject {make,code} (0xA8), aclk
-    wire         ctl_kbd_inject_we;               // 1-aclk pulse on a KBD_INJECT write
-
-    wire [31:0] cap_geom_sp;
-    // cap_geom is a multi-bit bus crossing spclk->fclk100; a plain 2-FF can bit-skew on the once-per-
-    // frame update. 3-FF it and latch only a settled value (two equal samples), like the OSD position.
-    reg [31:0] cap_geom_s1=32'd0, cap_geom_s2=32'd0, cap_geom_s3=32'd0, cap_geom_f=32'd0;
-    always @(posedge fclk100) begin
-        cap_geom_s1<=cap_geom_sp; cap_geom_s2<=cap_geom_s1; cap_geom_s3<=cap_geom_s2;
-        if (cap_geom_s2==cap_geom_s3) cap_geom_f<=cap_geom_s2;
     end
     // BulbuLator screen-mirror readback nets (MUST precede the axi_ctl instance that connects them)
     wire [10:0] scr_bram_raddr;   // mirror BRAM word address, driven by axi_ctl on a 0x8000+ read
@@ -452,65 +469,267 @@ module bulbulator_zx_ddr_top
         int_dbg1_a0 <= int_dbg1_core; int_dbg1_a1 <= int_dbg1_a0;
         int_dbg2_a0 <= int_dbg2_core; int_dbg2_a1 <= int_dbg2_a0;
     end
+    reg [31:0] fe_trace_count_a0=32'd0, fe_trace_count_a1=32'd0;
+    reg [31:0] fe_trace_hash_a0=32'd0,  fe_trace_hash_a1=32'd0;
+    reg [31:0] fe_trace_last_a0=32'd0,  fe_trace_last_a1=32'd0;
 `ifdef HYBRID_CORE
-    localparam [31:0] BUILD_VERSION = 32'hB01B005A; // dynamic MiSTer-native48 + Atlas-128/Pentagon
+    localparam [31:0] BUILD_VERSION = 32'hB01B0150; // гибрид, сборка 20.08: связи карты убраны
+                                                    // под ifndef, ветвь снова синтезируется.
+                                                    // Прежде здесь стоял B005B и не поднимался.
 `elsif MISTER48_CORE
-    localparam [31:0] BUILD_VERSION = 32'hB01B0059; // MiSTer native48: phase-safe CPU-only FAST8 + tape tied to actual CPU T-state
+    localparam [31:0] BUILD_VERSION = 32'hB01B0150; // MiSTer-48, сборка 20.08. Прежде здесь стоял
+                                                    // B0059: ядро пересобиралось, а НОМЕР нет, и
+                                                    // машина рапортовала шестидесятой сборкой -
+                                                    // владелец это и увидел. Каждая ветвь держит
+                                                    // СВОЮ константу: поднимать ту, что собираешь.
 `elsif MISTER_T80_AB
     localparam [31:0] BUILD_VERSION = 32'hB01B0054; // CPU-only A/B: MiSTer T80pa v0250, Atlas ULA unchanged
 `else
-    localparam [31:0] BUILD_VERSION = 32'hB01B0053;
+//  localparam [31:0] BUILD_VERSION = 32'hB01B0086; // BDI floppy activity icon bottom-right HDMI (outside machine window).
+//  localparam [31:0] BUILD_VERSION = 32'hB01B0087; // НАСТОЯЩИЙ SAA1099 (в битстриме была
+//  localparam [31:0] BUILD_VERSION = 32'hB01B0088; // SAA1099 получает РОВНО 8 МГц (был 8.0952 =
+//  localparam [31:0] BUILD_VERSION = 32'hB01B0089; // ЗАПИСЬ НА ДИСКЕТУ: буфер контроллера стал
+    localparam [31:0] BUILD_VERSION = 32'hB01B0156;  // B0155 (01.09): (1) pap_tap=9 для Sinclair 48K/128K (сведение бумаги и бордюра для SHOCK ч.2 без швов, на Пентагоне 0); (2) умолчание I/O-контеншена = vduC (выравнивание верхнего бордюра esh2_48).
+//  localparam [31:0] BUILD_VERSION = 32'hB01B0154;  // B0154 (31.08): ФАЗЫ 48K СВЕДЕНЫ С НАСТОЯЩЕЙ МАШИНОЙ. Плавающая шина отдаётся на такт позже (READP из ulatest3 на живом 48K: данные на 14340..14343, у нас были 14339..14342) и окно контеншена ПОРТОВ - тоже на такт позже (CONTP: занято с 14339, у нас с 14338). Порог stime остался 14335, как у машины: у ветви памяти строб падает на T1, у ветви портов IORQ только на T2, поэтому окна у них РАЗНЫЕ. Старая фаза портов возвращается битом27 MACHINE_CFG. Плюс экономия логики в T80: bq 3 бита, MEMPTR прерванной INxR/OTxR через уже имеющийся вычитатель PC-1.
+//  localparam [31:0] BUILD_VERSION = 32'hB01B0153;  // B0153 (31.08): флаги ПРЕРВАННОЙ блочной команды (лишний M-цикл повтора на 5 T): YF<-PC.13, XF<-PC.11 у всех, плюс HF/PF от B и MEMPTR=PC+1 у INxR/OTxR (David Banks 2018). Закрывает 089 LDIR->NOP', 090 LDDR->NOP', 102 INIR->NOP', 103 INDR->NOP' в z80full 1.2a (было 4 из 160).
+//  localparam [31:0] BUILD_VERSION = 32'hB01B0152;  // B0152 (31.08): Q-флаг доведён по z80ccf - SET/RES больше не ставят Q (флагов не трогают), LDI/LDD/LDIR/LDDR и CPI/CPD - ставят. На плате B0151 z80ccf валил ровно 071..080 (SET/RES) и 081..084 (LDI/LDD/LDIR/LDDR), остальные 134 OK.
+//  localparam [31:0] BUILD_VERSION = 32'hB01B0151;  // B0151 (28.08): Q-флаг Zilog для SCF/CCF в форке t80_bulb/T80.vhd (XF/YF = A | (F & ~Q); z80full RAXOFT валил 001 SCF / 002 CCF по CRC, стенд sim/timing/t80 даёт $29/$29/$81/$38). Только Atlas: MiSTer-48 и гибрид читают mister_t80.
+//  localparam [31:0] BUILD_VERSION = 32'hB01B0150;  // B0146: под взведённой защёлкой TR-DOS страница ПЗУ выбирается парой {DOS, 7FFD[4]} за битом25 MACHINE_CFG: сброс 7FFD[4] вставляет СЕРВИСНУЮ страницу (вход в файловый менеджер BIOS настоящих пентагонов: FATALL, Proteus). При снятом бите - бит-в-бит B0145.
+//  localparam [31:0] BUILD_VERSION = 32'hB01B0145;  // B0145: CMD12 всегда получает R1b (одна точка исполнения), выборка SPI по фронту, стандартный режим 3.5 МГц оживлён. B0139: голый Ins не уходит в машину при открытом навигаторе (см. nmi_combo). Плюс B0138: Z-Controller (#77/#57) на общем движке.
+//  localparam [31:0] BUILD_VERSION = 32'hB01B0137;  // B0137: порты карты живут только при включённом DivMMC.
+//  localparam [31:0] BUILD_VERSION = 32'hB01B0136;  // B0136: NMI на простой Ins.
+//  localparam [31:0] BUILD_VERSION = 32'hB01B0135;  // B0135: карта DivMMC переживает сброс машины.
+//  localparam [31:0] BUILD_VERSION = 32'hB01B0134;  // B0134: порядок разрядов dm_opt - вход 0x0066
+                                                    // (NMI-браузер esxDOS) был выключен.
+//  localparam [31:0] BUILD_VERSION = 32'hB01B0133;  // B0133: состояние автомаппера выведено в DMMC_STAT.
+//  localparam [31:0] BUILD_VERSION = 32'hB01B0132;  // B0132: DivMMC ОЖИЛ (был .mapper(1'b0)),
+                                                    // rom_trap разведён с автомаппером, мышь сужена
+                                                    // до трёх канонических портов, разгрузка
+                                                    // fb_capture_rr, videoEnableLoad = h_rel[3].
+//  localparam [31:0] BUILD_VERSION = 32'hB01B0130;  // B0130: ТРИ МИНЫ СТРАНИЧНОСТИ (memory.v).
+                                                    // 1) OUT (#E3),#80 подменял окно ПЗУ на ЖИВОЙ
+                                                    // машине: защёлка #E3 и бит CONMEM действовали
+                                                    // в обход mapper, хотя DivMMC у нас нет (топ
+                                                    // передаёт .mapper(1'b0)). 0x0000 уезжал на
+                                                    // страницу ПЗУ 1, 0x2000 - в мёртвый esx-регион
+                                                    // с РАЗРЕШЁННОЙ записью, mapRam липкий.
+                                                    // 2) OUT (#E3),#E4 писал ЕЩЁ И в EFF7 (у #E3 и
+                                                    // #E7 линия A3 = 0) и выбивал Пентагон из
+                                                    // мегабайтного режима - добавлен шестой терм
+                                                    // A4, ЗАГЕЙТОВАННЫЙ mapper: при выключенном
+                                                    // DivMMC дешифрация прежняя байт-в-байт.
+                                                    // 3) !m1 в защёлку #E3 НЕ добавлен: у T80 m1
+                                                    // активен НУЛЁМ, терм убил бы порт совсем.
+    // (было B0129) // B0121: тонкий бордюр Пентагона (video.v)
+    // (было B0120) // ОБЪЁМ ОЗУ опцией (MACHINE_CFG [15:14]):
+                                                    // старшие биты 7FFD игнорируются, а НЕ блокируют
+                                                    // страничность - иначе софт, пишущий 7FFD=0x20,
+                                                    // замораживает окно (Wild Player). // // GS: бит7 порта #BB значит РОВНО «у карты
+                                                    // есть байт» (было ИЛИ с «очередь полна» - два
+                                                    // смысла на одном бите, и плеер читал наше
+                                                    // «занято» как «пришёл ответ»). Обратное
+                                                    // давление ушло в ТАКТЫ ОЖИДАНИЯ на шине со
+                                                    // сторожем 148 мс; прибор считает потерянные
+                                                    // БАЙТЫ и цену удержаний (0x194/0x198).
+//  localparam [31:0] BUILD_VERSION = 32'hB01B0118; // GS: ОБРАТНОЕ ДАВЛЕНИЕ на потоке #B3.
+                                                    // «Занято» (бит7 в #BB) поднимается по
+                                                    // верхнему порогу (96 из 128, резерв 32 под
+                                                    // записи без опроса флага), а не по полноте:
+                                                    // гость ждёт сам, и байт больше не теряется.
+//  localparam [31:0] BUILD_VERSION = 32'hB01B0117; // NEMO-IDE: DRQ снимает ФАБРИКА по факту
+                                                    // вычерпывания блока (было - словом состояния
+                                                    // от ARM, и в эту щель машина успевала
+                                                    // прочитать начало старого буфера: 105 и 87
+                                                    // битых байт в двух прогонах). Между блоками
+                                                    // машина видит BSY. LOAD_CAPS бит7.
+//  localparam [31:0] BUILD_VERSION = 32'hB01B0116; // Мышь Kempston (#FADF/#FBDF/#FFDF):
+                                                    // порты в фабрике, координаты считает ARM
+                                                    // по цифровой клавиатуре. LOAD_CAPS бит6.
+//  localparam [31:0] BUILD_VERSION = 32'hB01B0115; // NEMO-IDE: ARM пишет регистры ATA (сигнатура
+                                                    // после 0x90 и геометрия 0x91), в stat2 вместо
+                                                    // дубля LBA0 - счётчик секторов.
+//  localparam [31:0] BUILD_VERSION = 32'hB01B0114; // NEMO-IDE: поля слова состояния выровнены,
+                                                    // наружу полный LBA и признак slave.
+//  localparam [31:0] BUILD_VERSION = 32'hB01B0112; // NEMO-IDE: трап портов в машине, регистры
+                                                    // 0x184/0x188, «диск» на ARM. Выключен, пока
+                                                    // оболочка не поднимет бит разрешения.
+//  localparam [31:0] BUILD_VERSION = 32'hB01B0111; // READ TRACK (0xE): дорожка синтезируется
+                                                    // пофазно, данные секторов идут штатной
+                                                    // выборкой. Без неё быстрый загрузчик
+                                                    // Z-Player говорил UNKNOWN DISK FORMAT.
+//  localparam [31:0] BUILD_VERSION = 32'hB01B0110; // Извлечение из FIFO гейтится тем же признаком
+                                                    // «пусто», который ушёл в данные: байт, пришедший
+                                                    // в окно между защёлкиванием и импульсом, пропадал
+                                                    // бесследно (71 потеря на 22 КБ потока модуля).
+                                                    // Болезнь общая с клавиатурным FIFO.
+//  localparam [31:0] BUILD_VERSION = 32'hB01B0109; // GS: упругая очередь записей #B3 (32 байта) -
+                                                    // X-Player пишет байт на границе страницы БЕЗ
+                                                    // опроса флага (~7 мкс), и каждый 256-й терялся.
+                                                    // Плюс всё из B0107 (см. ниже).
+//  localparam [31:0] BUILD_VERSION = 32'hB01B0108; // то же, но очередь 256 и точный пик-метр:
+                                                    // ПРОВАЛИЛ setup пиксельного домена (-0.223 нс),
+                                                    // на плату не ставился.
+//  localparam [31:0] BUILD_VERSION = 32'hB01B0107; // GS: флаг ОДИН, хозяин - карта. Фабрика
+                                                    // ЗЕРКАЛИТ состояние эмулятора (было: снимала
+                                                    // флаг за него, и софт вис на ожидании). Плюс
+                                                    // суммирование ARM-ноги с машиной (0x78 бит1)
+                                                    // и свой пик-метр 0x17C.
+//  localparam [31:0] BUILD_VERSION = 32'hB01B0106; // Подтверждение GS переходит ТОГГЛОМ:
+                                                    // импульс терялся между доменами.
+//  localparam [31:0] BUILD_VERSION = 32'hB01B0105; // Ловушка портов General Sound: #BB и #B3,
+                                                    // свой блок регистров 0x174 / 0x178.
+//  localparam [31:0] BUILD_VERSION = 32'hB01B0104; // Полярность make исправлена: гейт подавляет
+                                                    // навигатора: зажатая клавиша не действует.
+//  localparam [31:0] BUILD_VERSION = 32'hB01B0102; // Гейт OSD больше не блокирует ОТПУСКАНИЯ:
+                                                    // клавиша не может залипнуть в машине.
+//  localparam [31:0] BUILD_VERSION = 32'hB01B0101; // МАГИЧЕСКАЯ КНОПКА: сервисная страница
+                                                    // ПЗУ по NMI, снятие по RETN (бит13).
+//  localparam [31:0] BUILD_VERSION = 32'hB01B0100; // Диапазон записи сбрасывается и по
+                                                    // началу подачи блока - закрыта
+                                                    // многосекторная запись.
+//  localparam [31:0] BUILD_VERSION = 32'hB01B0099; // Force Interrupt: бит I3 поднимает
+                                                    // INTRQ (TR-DOS 5.03 на повторном CAT).
+//  localparam [31:0] BUILD_VERSION = 32'hB01B0098; // БЫСТРЫЙ ДИСКОВОД: оборот 10 мс
+                                                    // вместо 200, темп байта 4.6 мкс вместо 32,
+                                                    // + снятие фантомных запросов к хосту.
+//  localparam [31:0] BUILD_VERSION = 32'hB01B0097; // ЗАПИСЬ: фабрика сообщает ДИАПАЗОН
+                                                    // записанных машиной байт - ARM собирает
+                                                    // сектор из файла, а не из буфера.
+//  localparam [31:0] BUILD_VERSION = 32'hB01B0096; // В кольцо вернулись дорожка и
+                                                    // сектор последней команды.
+//  localparam [31:0] BUILD_VERSION = 32'hB01B0095; // ЗАПИСЬ: устранено расхождение с
+                                                    // эталоном MiSTer - номер сектора для
+                                                    // Read Address теперь задаёт процессор.
+//  localparam [31:0] BUILD_VERSION = 32'hB01B0094; // ЗАПИСЬ ПО ПОСТРОЕНИЮ: своя
+                                                    // исходящая память сектора в обвязке +
+                                                    // настоящий провод записи процессора.
+//  localparam [31:0] BUILD_VERSION = 32'hB01B0093; // Замер АДРЕСОВ буфера:
+                                                    // {sd_block, byte_addr} в слово вычитывания.
+//  localparam [31:0] BUILD_VERSION = 32'hB01B0092; // Замер записи: счётчик срабатываний
+                                                    // wren_b (запись процессора в буфер) плюс
+                                                    // buff_wr в кольце. Факт вместо рассуждения.
+//  localparam [31:0] BUILD_VERSION = 32'hB01B0091; // Ethernet процессора НАСКВОЗЬ к ногам PHY:
+                                                    // GEM0 через EMIO проводами (MII + MDIO +
+                                                    // опорные 25 МГц на U18). Логики почти нет:
+                                                    // 2 тактовых буфера и 2 триггера делителя.
+//  localparam [31:0] BUILD_VERSION = 32'hB01B0090; // Кольцо BDI инструментировано под разбор
+        // ЗАПИСИ: в word1 вместо дорожки/сектора идёт состояние контроллера
+        // {data_length[10:0], DRQ, BUSY, lost_data, write_fault, write_data}, а повторные записи
+        // в #FF больше не вытесняют историю команды из 12 слотов (не больше двух на команду).
+        // читаемым хостом (провод sd_buff_din раньше выбрасывался). FDC_CTL бит11 = режим
+        // вычитывания: строб FDC_DATA шагает адресом не записывая, FDC_STAT2 отдаёт
+        // {адрес[8:0], байт[7:0]} вместо отладочного кольца.
+        // +20.3 цента, замерено в xsim; арифметика чипа при этом верна) + машинно-агностичный
+        // слот 0x170 AUD_DBG: пики по источникам {SAA, AY2, AY1, SpecDrum, бипер}.
+        // заглушка saa.v, перекрывавшая saa1099.sv) + арбитраж порта #FF между SAA и Beta Disk
+        // по ЖИВОЙ активности дисковода, опция машины MACHINE_CFG [12:11] AUTO/ON/OFF
+        // + селект чипа TurboSound как в эталоне (#F8..#FF, а не по одному биту d[4]).
 `endif
-    axi_ctl #(.VERSION(BUILD_VERSION)) ctl (
-        .aclk(fclk100), .aresetn(aresetn),
-        .s_awid(gp0_awid), .s_awaddr(gp0_awaddr), .s_awlen(gp0_awlen),
-        .s_awvalid(gp0_awvalid), .s_awready(gp0_awready),
-        .s_wdata(gp0_wdata), .s_wstrb(gp0_wstrb), .s_wlast(gp0_wlast),
-        .s_wvalid(gp0_wvalid), .s_wready(gp0_wready),
-        .s_bid(gp0_bid), .s_bresp(gp0_bresp), .s_bvalid(gp0_bvalid), .s_bready(gp0_bready),
-        .s_arid(gp0_arid), .s_araddr(gp0_araddr), .s_arlen(gp0_arlen),
-        .s_arvalid(gp0_arvalid), .s_arready(gp0_arready),
-        .s_rid(gp0_rid), .s_rdata(gp0_rdata), .s_rresp(gp0_rresp),
-        .s_rlast(gp0_rlast), .s_rvalid(gp0_rvalid), .s_rready(gp0_rready),
-        .ctl_halt(ctl_halt), .ctl_ram_we(ctl_ram_we),
-        .ctl_ram_addr(ctl_ram_addr), .ctl_ram_waddr(ctl_ram_waddr), .ctl_ram_data(ctl_ram_data),
-        .ctl_dir(ctl_dir), .ctl_7ffd(ctl_7ffd), .ctl_border(ctl_border),
-        .ctl_dir_commit(ctl_dir_commit), .ctl_port_commit(ctl_port_commit),
-        .ctl_osd_enable(ctl_osd_enable), .ctl_osd_we(ctl_osd_we),
-        .ctl_osd_waddr(ctl_osd_waddr), .ctl_osd_wdata(ctl_osd_wdata), .ctl_osd_bg(ctl_osd_bg), .ctl_osd_op(ctl_osd_op), .ctl_osd_pos(ctl_osd_pos), .ctl_vol(ctl_vol),
-        .ctl_osd_ddr_base(ctl_osd_ddr_base), .ctl_ddr_osd_en(ctl_ddr_osd_en), .ctl_ddr_osd_pos(ctl_ddr_osd_pos),
-        .ctl_tape_run(ctl_tape_run), .ctl_tape_earmux(ctl_tape_earmux), .ctl_tape_mute(ctl_tape_mute), .ctl_tape_fmode(ctl_tape_fmode), .ctl_tape_sync(ctl_tape_sync), .ctl_tape_more(ctl_tape_more),
-        .ctl_tape_we(ctl_tape_we), .ctl_tape_data(ctl_tape_data), .tape_full(tape_full), .tape_playing(tape_playing_a),
-        .tape_diag_count(tape_diag_count_a1), .tape_diag_hash(tape_diag_hash_a1),
-        .tape_diag_gaps(tape_diag_gaps_a1), .tape_diag_resumes(tape_diag_res_a1),
-        // B0053 diagnostic bit: REG4..REG6 are temporarily the 48K INT/ULA sweep trace.
-        .fe_trace_count(int_dbg0_a1), .fe_trace_hash(int_dbg1_a1), .fe_trace_last(int_dbg2_a1),
-        .ctl_ban_enable(ctl_ban_enable), .ctl_ban_we(ctl_ban_we),
-        .ctl_ban_waddr(ctl_ban_waddr), .ctl_ban_wdata(ctl_ban_wdata), .ctl_ban_pos(ctl_ban_pos),
-        .ctl_player_en(ctl_player_en), .ctl_audio_we(ctl_audio_we), .ctl_audio_data(ctl_audio_data),
-        .aud_full(aud_full), .aud_empty(aud_empty), .aud_rdcount(aud_rdcount),
-        .kbd_fifo_dout(kbd_fifo_dout), .kbd_fifo_empty(kbd_fifo_empty),
-        .kbd_fifo_rd(kbd_fifo_rd), .kbd_deadman_kick(kbd_deadman_kick),
-        .halt_ack(halt_ack), .ram_busy(ram_busy), .reset_busy(reset_busy_aclk),
-        .ctl_reset(ctl_reset),
-        .ctl_kbd_inject(ctl_kbd_inject), .ctl_kbd_inject_we(ctl_kbd_inject_we), .memwr_cnt(memwr_sync),
-        .ctl_kbd_tx_data(ctl_kbd_tx_data), .ctl_kbd_tx_we(ctl_kbd_tx_we),
-        .kbd_tx_busy(kbd_tx_busy_aclk), .kbd_tx_ack(kbd_tx_ack_aclk), .kbd_diag(kbd_diag_aclk),
-        .ctl_pentagon(ctl_pentagon), .ctl_model48(ctl_model48), .ctl_ula_late(ctl_ula_late), .ctl_pent_int(ctl_pent_int),
-        .ctl_joy(ctl_joy),
-        .ctl_paper_h(ctl_paper_h), .ctl_paper_v(ctl_paper_v), .ctl_scr_pos(ctl_scr_pos),
-        .ctl_crop_a(ctl_crop_a), .ctl_crop_b(ctl_crop_b),
-        .ctl_warp_hold(ctl_warp_hold),
-        .ctl_sync_hold(ctl_sync_hold),
-        .cap_geom(cap_geom_f),
-        // ---- Step 15 ROM-trap ----
-        .ctl_romtrap_en(ctl_romtrap_en), .ctl_romtrap_done_we(ctl_romtrap_done_we),
-        .rt_pending_a_in(rt_pending_a), .p7ffd_s1_in(p7ffd_s1), .reg_rd1_in(reg_rd1),
-        .sync_diag_in(sync_diag_a),
-        // ---- BulbuLator screen-mirror readback (AXI-GP window @ 0x40008000, off the DDR path) ----
-        .ctl_scr_raddr(scr_bram_raddr), .scr_rdata(scr_rdata_r)
-    );
 
+    /* CE29/B0066: ИДЕНТИЧНОСТЬ ЯДРА отдельно от версии сборки. Схема слова:
+       [15:0] семейство ASCII ('ZX'=0x5A58, 'NE'=0x4E45, будущий 'C6'=0x4336),
+       [23:16] вариант (0x80 = 128K, 0x48 = 48K, 0x4D = MiSTer-48, 0x50 = Пентагон),
+       [31:24] резерв. Прошивка спрашивает МАШИНУ, кто она (0x60), а VERSION снова означает версию. */
+`ifdef MISTER48_CORE
+    localparam [31:0] MACH_ID = 32'h004D5A58;   // 'ZX' + вариант 'M' (MiSTer-48)
+`else
+    localparam [31:0] MACH_ID = 32'h00805A58;   // 'ZX' + вариант 128K (Atlas; 48K/Пентагон - тот же бит)
+`endif
+    control_plane #(
+        .VERSION(BUILD_VERSION), .MACHINE_ID(MACH_ID), .LOAD_CAPS_P(LOAD_CAPS_SEL),
+        .POR_BITS(4), .WAIT_HDMI_LOCK(0),          // the legacy ZX POR shape, byte-identical
+        .CAP_W(384), .CAP_H(302), .CAP_BPP(4), .CAP_LEADIN_AUTO(0),
+        .WR_WORDS(7248),                            // 384*302/16 words per frame
+        .KICK_CORE_VSYNC(0),                        // buffer swap on the HDMI vblank (proven ZX path)
+        .SRC_W(384), .STRIDE(384), .CROP_W(384), .CROP_H(302), .HMARGIN(256), .VMARGIN(58), .SX0(0),
+        .SRC_BPP(4), .WSH(4), .LBPP(2), .FBURSTS(3),
+        .LIVE_CROP(1),                              // CROP_A/B registers trim the ZX window
+        .AUDIO_DC_BLOCK(1),                         // the ZX post-volume HPF
+        .PS2_INT_CE(0),                             // keyboard decoded on spclk/pe3M5 (matrix feed)
+        .PS2TX_INHIBIT(8000), .PS2TX_TIMEOUT(500000)
+    ) shell (
+        .eth_txd(eth_txd), .eth_tx_en(eth_tx_en), .eth_tx_clk(eth_tx_clk),
+        .eth_rxd(eth_rxd), .eth_rx_dv(eth_rx_dv), .eth_rx_clk(eth_rx_clk),
+        .eth_mdc(eth_mdc), .eth_mdio(eth_mdio), .eth_ref_clk(eth_ref_clk),
+        .TMDS_Clk_p(TMDS_Clk_p), .TMDS_Clk_n(TMDS_Clk_n),
+        .TMDS_Data_p(TMDS_Data_p), .TMDS_Data_n(TMDS_Data_n),
+        .ps2_clk(ps2_clk), .ps2_data(ps2_data),
+        .led_heart(led_heart),
+        .fclk100_o(fclk100), .clk_pixel_o(clk_pixel), .clk_audio_o(clk_audio_r),
+        .aresetn_o(aresetn), .core_resetn_o(core_resetn_unused),
+        .ext_lock_i(1'b1),
+        // machine video (spclk domain)
+        .cap_clk_i(spclk), .cap_rstn_i(por_n), .cap_ce_i(pe7M0),
+        .cap_hsync_i(vid_hsync), .cap_vsync_i(vid_vsync), .cap_blank_i(vid_blank),
+        .cap_r_i(vid_r), .cap_g_i(vid_g), .cap_b_i(vid_b), .cap_i_i(vid_i),
+        .cap_pix8_i(8'd0),
+        // machine audio (the ZX leg + crossfade + tape click, computed below)
+        .aud_src_l_i(src_left), .aud_src_r_i(src_right),
+        .player_pcm_o(player_pcm), .player_gain_o(pgain), .machine_gain_o(mgn),
+        // PS/2 decoded on the machine clock (feeds the Z80 matrix through the gate below)
+        .kclk_i(spclk), .kce_i(pe3M5),
+        .ps2_strb_o(ps2_strb), .ps2_make_o(ps2_make), .ps2_code_o(ps2_code),
+        // B0070: расширенные банки Пентагона 1024 ходят в PS DDR через этот мастер. Запросы -
+        // в такте машины (spclk), ответ возвращается вместе с ожиданием, которое гасит процессор.
+        .mem_mclk_i(spclk), .mem_addr_i(zxddr_addr), .mem_wdata_i(zxddr_wdata),
+        .mem_rd_i(zxddr_rd), .mem_wr_i(zxddr_wr),
+        .mem_rdata_o(zxddr_rdata), .mem_wait_o(zx_mem_wait),
+        .mach_dbg_i(zx_mach_dbg),
+        .rom_dbg_i (rom_dbg_core),        // B0147 -> 0x1BC ROM_DBG
+        .aud_dbg_i (zx_aud_dbg),
+        .ps2tx_busy_o(ps2tx_busy), .ps2_diag_o(cp_ps2_diag),
+        .ctl_quiesce_o(), .mach_axi_idle_i(1'b1),
+        .wr_accept_cnt_o(), .cap_fifo_ov_o(), .ld_live_o(),
+        // machine registers
+        .ctl_halt_o(ctl_halt), .ctl_ram_we_o(ctl_ram_we),
+        .ctl_ram_addr_o(), .ctl_ram_waddr_o(ctl_ram_waddr), .ctl_ram_data_o(ctl_ram_data),
+        .ctl_dir_o(ctl_dir), .ctl_7ffd_o(ctl_7ffd), .ctl_border_o(ctl_border),
+        .ctl_dir_commit_o(ctl_dir_commit), .ctl_port_commit_o(ctl_port_commit), .ctl_reset_o(ctl_reset),
+        .ctl_osd_enable_o(ctl_osd_enable), .ctl_ddr_osd_en_o(ctl_ddr_osd_en),
+        .ctl_tape_run_o(ctl_tape_run), .ctl_tape_earmux_o(ctl_tape_earmux), .ctl_tape_mute_o(ctl_tape_mute),
+        .ctl_tape_fmode_o(ctl_tape_fmode), .ctl_tape_sync_o(ctl_tape_sync), .ctl_tape_more_o(ctl_tape_more),
+        .ctl_tape_we_o(ctl_tape_we), .ctl_tape_data_o(ctl_tape_data),
+        .ctl_kbd_inject_o(ctl_kbd_inject), .ctl_kbd_inject_we_o(ctl_kbd_inject_we),
+        .kbd_deadman_kick_o(kbd_deadman_kick),
+        .ctl_pentagon_o(ctl_pentagon), .ctl_model48_o(ctl_model48), .ctl_ula_late_o(ctl_ula_late),
+        .ctl_force_atlas_o(ctl_force_atlas), .ctl_snow_off_o(ctl_snow_off),
+        .ctl_mach_cfg_o(mach_cfg_w), .ctl_pent_int_o(ctl_pent_int),   // B0071: бит5 = трап TR-DOS
+        // B0071: заливка ПЗУ машины с карты (0x154/0x158/0x15C)
+        .ctl_fdc_ctl_o(fdc_ctl_a), .ctl_fdc_ctl_we_o(fdc_ctl_we_a),
+        .ctl_fdc_data_o(fdc_data_a), .ctl_fdc_data_we_o(fdc_data_we_a), .fdc_stat_i(fdc_stat_w),
+        .ctl_gs_ctl_o(gs_ctl_a), .ctl_gs_ctl_we_o(gs_ctl_we_a), .gs_stat_i(gs_stat_w),   // General Sound
+        .gs_stat2_i(gs_stat2_w), .gs_stat3_i(gs_stat3_w),   // B0119: прибор обратного давления
+        .ctl_nemo_o(nemo_ctl_a), .ctl_nemo_we_o(nemo_ctl_we_a), .nemo_stat_i(nemo_stat_w), .nemo_stat2_i(nemo_stat2_w),
+        .ctl_dmmc_o(dmmc_ctl_a), .ctl_dmmc_we_o(dmmc_ctl_we_a), .ctl_dmmc_cap_o(dmmc_cap_a),
+        .ctl_dmmc_bufa_o(dmmc_bufa_a), .ctl_dmmc_bufa_we_o(dmmc_bufa_we_a),
+        .ctl_dmmc_bufw_o(dmmc_bufw_a), .ctl_dmmc_bufw_we_o(dmmc_bufw_we_a),
+        .ctl_dmmc_bufr_re_o(dmmc_bufr_re_a),
+        .dmmc_bufa_i(dmmc_bufa_q_w), .dmmc_bufr_i(dmmc_bufr_q_w), .dmmc_stat_i(dmmc_stat_w),
+        .dmmc_lba_i(dmmc_lba_w), .dmmc_dbg_i(dmmc_dbg_w),
+        .ctl_kmouse_o(km_ctl_a), .ctl_kmouse_we_o(km_ctl_we_a),   // B0116 мышь Kempston (0x190)
+        .gs_rq_dout_i(gs_rq_dout), .gs_rq_empty_i(gs_rq_empty), .gs_rq_cnt_i(gs_rq_cnt),
+        .gs_rq_rd_o(gs_rq_rd),                  // B0108: очередь данных GS (0x180)
+        .fdc_stat2_i(fdc_stat2_w),
+        .ctl_rom_ld_addr_o(rom_ld_addr_a), .ctl_rom_ld_data_o(rom_ld_data_a),
+        .ctl_rom_ld_we_o(rom_ld_we_a), .ctl_rom_loading_o(rom_loading_a),
+        .ctl_paper_h_o(ctl_paper_h), .ctl_paper_v_o(ctl_paper_v),
+        .ctl_joy_o(ctl_joy),
+        .ctl_warp_hold_o(ctl_warp_hold), .ctl_sync_hold_o(ctl_sync_hold),
+        .ctl_romtrap_en_o(ctl_romtrap_en), .ctl_romtrap_done_we_o(ctl_romtrap_done_we),
+        .ctl_scr_raddr_o(scr_bram_raddr),
+        // machine status
+        .scr_rdata_i(scr_rdata_r),
+        .tape_full_i(tape_full), .tape_playing_i(tape_playing_a),
+        .tape_diag_count_i(tape_diag_count_a1), .tape_diag_hash_i(tape_diag_hash_a1),
+        .tape_diag_gaps_i(tape_diag_gaps_a1), .tape_diag_resumes_i(tape_diag_res_a1),
+        // B0053 diagnostic bit: REG4..REG6 are temporarily the 48K INT/ULA sweep trace.
+        .fe_trace_count_i(int_dbg0_a1), .fe_trace_hash_i(int_dbg1_a1), .fe_trace_last_i(int_dbg2_a1),
+        .halt_ack_i(halt_ack), .ram_busy_i(ram_busy), .reset_busy_i(reset_busy_aclk),
+        .rt_pending_a_i(rt_pending_a), .p7ffd_s1_i(p7ffd_s1), .reg_rd1_i(reg_rd1),
+        .sync_diag_i(sync_diag_a),
+        .memwr_cnt_i(memwr_sync),
+        .kbd_diag_i(cp_ps2_diag)                    // the PS/2 {resend,perr} counters, looped back
+    );
     inject_cdc inj_i (
         .aclk(fclk100), .aresetn(aresetn), .spclk(spclk),
         .ctl_halt(ctl_halt), .ctl_ram_we(ctl_ram_we),
@@ -526,7 +745,6 @@ module bulbulator_zx_ddr_top
         .ctl_reset(ctl_reset), .arm_reset_sp(arm_reset_sp),
         .reset_busy_sp(reset_busy_sp), .reset_busy(reset_busy_aclk)
     );
-
     // HALT = gate the two 3.5 MHz CPU clock-enables into the core (no Atlas-core edit).
     // ---- FAST LOAD: two selectable modes (owner), active only while a tape is running (never in-game):
     //   FAST (mode 1) = CPU-only 8x (28.35 MHz, T80pa ceiling CLK/2). Fastest; works for most loaders
@@ -612,8 +830,37 @@ module bulbulator_zx_ddr_top
     // (no tape) is NEVER warped.
     wire warp_fmode     = (fm_s1 == 2'd1) | (fm_s1 == 2'd2) | (fm_s1 == 2'd3); // FAST(1), SAFE(2), WAV AUTO(3)
     wire warp_guard     = trun_s[1] & warp_fmode;                          // tape running AND a warp mode chosen
-    wire load_confirmed = warp_guard & sampling_active;                    // detector fired -> we are inside a loader
-    wire load_activity  = tape_edge | smp_edge;                            // a tape transition OR an FE read = still loading
+    // 🥇 ВАРП ОТПУСКАЕТСЯ, КОГДА ЛЕНТА МОЛЧИТ (B0128; жалоба владельца 12.08 на SHOCK.TAP).
+    //
+    // Симптом: демка с порционной загрузкой просит нажать пробел, чтобы продолжить, и вместо
+    // продолжения выходит BREAK - у владельца получалось раз из десяти и только очень быстрым
+    // тычком. Виноват был не пробел и не матрица, а варп, который не отпускался ВСЮ демо-часть.
+    //
+    // Разбор самой демки (SHOCK.TAP, ESI'92, стандартный загрузчик ПЗУ, 20 блоков). Часть отдаёт
+    // управление по пробелу мгновенно - `LD A,$7F / IN A,($FE) / RRA / JP C,.. / IM 1 / EI / RET`,
+    // ни одного такта на отпускание. Весь запас владельца - это то, что успевает сделать машина
+    // между отпусканием и первым чтением BREAK внутри LD-EDGE-1: в shock.0 два раза HALT и два раза
+    // полная очистка экрана (LDIR по 6911 байт = ~41 мс каждая), потом BASIC c четырьмя VAL, STR$ и
+    // печатью строки. На живой машине это около 120 мс - нормальный человеческий тычок проходит.
+    //
+    // У нас этот запас складывался ВОСЬМЕРО, потому что процессор всё это время шёл на 8x. Почему
+    // варп не отпускался: сторож простоя перевзводился по `smp_edge` - ЛЮБОМУ чтению порта FE. А
+    // демо-часть опрашивает пробел раз в кадр (~70000 тактов) при пороге отпускания 0x200000
+    // (~2.1 млн тактов, 0xDC WARP_HOLD), то есть перевзводила сторож вечно. Детектор ЗАХВАТА при
+    // этом давно поумнел (плотный цикл ИЛИ корреляция с краями ленты), а сторож ОТПУСКАНИЯ остался
+    // грубым - и умный детектор решал только, когда варп включить, а выключить не давал никогда.
+    //
+    // Правило теперь одно на оба конца: чтение FE считается признаком загрузки, только если оно
+    // идёт следом за краем ленты (`corr_read`, тот же критерий, что уже у захвата). Во время
+    // загрузки каждое чтение таково по построению - для лент не меняется НИЧЕГО; при замершей
+    // ленте (SYNC держит поток между блоками) краёв нет вовсе, и варп честно уходит по сторожу.
+    //
+    // И захват тоже требует живой ленты: `smp_tight` сам по себе ловил бы демку, которая крутит
+    // пробел в плотном цикле, - тогда варп включился бы вообще без ленты. `tape_alive` = край был
+    // не дальше 4095 тактов назад (~1.2 мс); на любой настоящей ленте это всегда правда.
+    wire tape_alive     = (edge_age < 12'hFFF);                            // край ленты был недавно (12'hFFF = счётчик насыщен = краёв нет)
+    wire load_confirmed = warp_guard & sampling_active & tape_alive;       // detector fired -> we are inside a loader
+    wire load_activity  = tape_edge | corr_read;                           // край ленты ИЛИ чтение FE ВСЛЕД за краем = всё ещё грузимся
     // FAST is CPU-only: ULA/INT remain at their native clock.  Standard ROM
     // blocks can be separated by a 0/1-ms recorded pause, which is eight times
     // shorter in wall time while FAST is active.  Critical Mass then consumes an
@@ -682,7 +929,36 @@ module bulbulator_zx_ddr_top
     // descriptors or EAR routing.
     assign warp_safe2_active = 1'b0;
     assign warp_active = ((fm_s1 == 2'd2) | ((fm_s1 == 2'd3) & wav_auto_safe)) & warp_latch;
-    wire cpuwarp_req   = ((fm_s1 == 2'd1) | ((fm_s1 == 2'd3) & ~wav_auto_pending & ~wav_auto_safe)) & warp_latch;
+    // 🥇 ПОКА ЖДЁМ СЛЕДУЮЩИЙ БЛОК - МАШИНА ИДЁТ В РОДНОМ ТЕМПЕ (B0129, идея владельца).
+    //
+    // `warp_latch` отвечает на вопрос «мы внутри загрузки» и обязан держаться ЧЕРЕЗ паузы: гейт по
+    // мгновенному окну детектора когда-то давал дребезг 8x<->1x ПОСРЕДИ блока, один бит читался мимо,
+    // и загрузка вешалась примерно в половине попыток. Поэтому латч не трогаем.
+    //
+    // Но у нас есть точный ответ на ДРУГОЙ вопрос - «лента прямо сейчас движется»: это тот самый
+    // предикат, которым гейтится `tape_advance`. При демандовой ленте (SYNC) между блоками поток
+    // заморожен: `sync_state` стоит в SYNC_WAIT с уже взведённым дескриптором пилота, `sync_hold`
+    // снят - и машина в это время не грузится, а работает своим кодом. Разгонять её там незачем.
+    //
+    // Что это чинит: у демок с порционной загрузкой окно на ОТПУСКАНИЕ пробела перестаёт сжиматься.
+    // На SHOCK.TAP между частями лежит ~120 мс (два HALT и две очистки экрана LDIR по 6911 байт в
+    // shock.0 плюс BASIC); под 8x оставалось ~30 мс, и пробел, которым владелец продолжал демку,
+    // ещё был нажат, когда ПЗУ начинало читать BREAK тем же полурядом. Сторож простоя (правка ниже
+    // по `corr_read`) отпускал варп только через 600 мс тишины - здесь же отпускание МГНОВЕННОЕ и
+    // детерминированное, потому что момент конца блока мы ЗНАЕМ, а не угадываем.
+    //
+    // Почему это безопасно: `sync_hold` меняется ТОЛЬКО на границе блока (`tape_block_start`), внутри
+    // блока SYNC_ACTIVE держит его поднятым - «never truncate a started block». То есть скорость
+    // меняется ровно тогда, когда лента заведомо стоит, а не между двумя чтениями бита. Плюс сама
+    // смена уже защёлкивается на границе такта (`if (ne_sel) cpuw_active <= cpuwarp_req`).
+    //
+    // Область действия узкая и намеренно: только процессорный FAST (fmode=1) на ПОМЕЧЕННЫХ
+    // стандартных блоках ПЗУ. Турбо и кастомные загрузчики идут с `tape_sync_rom`=0 или в
+    // SYNC_CUSTOM - у них `tape_streaming` всегда 1, поведение не меняется. Целоядерные режимы
+    // (fmode 2/3, только через JTAG) НЕ трогаем: у них смена темпа тянет за собой ULA и видеотакт,
+    // там есть рукопожатие `warp_ack`, и дёргать его на каждой границе блока незачем.
+    wire cpuwarp_req   = ((fm_s1 == 2'd1) | ((fm_s1 == 2'd3) & ~wav_auto_pending & ~wav_auto_safe)) & warp_latch
+                         & tape_streaming;
     // DEMAND TAPE (option SYNC LOADER): the ARM marks standard-ROM pulses with descriptor bit30.
     // Recorded pauses and all turbo/custom pulses are unmarked and always replay continuously.  At the
     // first marked pilot pulse we wait for the core's exact passive PC=0x056B fetch; arbitrary port-FE
@@ -886,7 +1162,6 @@ module bulbulator_zx_ddr_top
 
     wire pe3M5_core = pe_sel & ~cpu_halt_sp & ~rt_halt & ~cpu_starve & ~clr_active;
     wire ne3M5_core = ne_sel & ~cpu_halt_sp & ~rt_halt & ~cpu_starve & ~clr_active;
-
     //=============================================================================================
     // Keyboard gate (control-plane scancode tap -> ARM).
     // Lines (a)-(d) below are MACHINE-AGNOSTIC: the ARM always sees every scancode through this FIFO
@@ -930,18 +1205,8 @@ module bulbulator_zx_ddr_top
     end
     wire gate_on = osd_en_sp & ~deadman_expired;
 
-    // (d) Scancode FIFO: ALWAYS-TAP. wr_en = ps2_strb & pe3M5 -> exactly one capture per frame
-    //     (ps2_strb stays high across a whole pe3M5 period). Both rst_n = aresetn (power-on only,
-    //     never re-asserts on a hotkey or MMCM relock) so the two FIFO sides always reset together
-    //     and the FIFO is immune to ZX-side resets - the ARM owns the keys. Overflow (.full unused)
-    //     is silently dropped: safe, the ARM drains far faster (MHz) than PS/2 fills (~10 keys/s).
-    async_fifo #(.DW(9), .AW(7)) kbd_fifo_i (   /* 128 deep (was 32): a heavy main-loop iteration (MP3 decode / big redraw) delays the key read; a deeper FIFO absorbs the backlog so no MAKE is dropped -> no "first press ignored" */
-        .wr_clk(spclk),  .wr_rst_n(aresetn),  .wr_en(ps2_strb & pe3M5 & ~ps2tx_busy),
-        .din({ps2_make, ps2_code}), .full(),
-        .rd_clk(fclk100), .rd_rst_n(aresetn), .rd_en(kbd_fifo_rd),
-        .dout(kbd_fifo_dout), .empty(kbd_fifo_empty), .rd_count()
-    );
-
+    // (d) The always-tap scancode FIFO lives in control_plane (write side = this machine's kclk/kce,
+    //     read side = the ARM). Here only the MATRIX SUPPRESSION below remains - the ZX adapter.
     //=============================================================================================
     // Tape input: synchronise the async ear_in pin into the Spectrum domain (2 FF).
     //=============================================================================================
@@ -965,8 +1230,12 @@ module bulbulator_zx_ddr_top
 `else
     wire tape_cpu_tick = pe3M5_core;
 `endif
-    wire tape_advance = tape_cpu_tick & tape_warp_ready &
-                        (~sync_effective | ~tape_sync_rom | sync_hold | (sync_state == SYNC_CUSTOM));
+    // Один предикат «лента движется» на два потребителя: собственно продвижение ленты и разрешение
+    // варпа (см. комментарий у cpuwarp_req). Раньше он был здесь выражением на месте - вынесен в
+    // именованный провод, чтобы у ленты и у скорости процессора не могло разъехаться понимание того,
+    // идёт загрузка или нет. Именно такое расхождение и стоило нам SHOCK.TAP.
+    assign tape_streaming = (~sync_effective | ~tape_sync_rom | sync_hold | (sync_state == SYNC_CUSTOM));
+    wire tape_advance = tape_cpu_tick & tape_warp_ready & tape_streaming;
     /* B0046 A/B uses the player's genuine idle transition only to return the
        SAFE4 clock policy to native time without waiting for ARM CDC/polling.
        It deliberately DOES NOT alter EAR: descriptor parity makes Aliens'
@@ -988,7 +1257,12 @@ module bulbulator_zx_ddr_top
             if(tmore_s[1])   tape_seen_more    <= 1'b1;
         end
     end
-    tape_player #(.DUR_W(24), .AW(12)) tape_i (
+    // B0123: AW 12->11. Глубина 2048 дескрипторов вместо 4096 - две плитки BRAM вместо четырёх.
+    // Здесь НАСТОЯЩЕЕ место: дефолт в самом tape_bram_fifo.v ни на что не влияет, параметр
+    // задаётся тут и прокидывается через tape_player. Освобождённые плитки нужны, чтобы снять
+    // перебор блочной памяти (Used=121, Available=120), из-за которого синтезатор выдавливает
+    // буферы оболочки в распределённую память - 2526 LUT, каждый шестой на кристалле.
+    tape_player #(.DUR_W(24), .AW(11)) tape_i (
         .wr_clk(fclk100), .wr_rst_n(aresetn), .push(ctl_tape_we), .push_data(ctl_tape_data), .full(tape_full),
         .rd_clk(spclk), .rd_rst_n(sp_reset_n), .fifo_rd_rst_n(aresetn), .t_en(tape_advance), .run(trun_s[1]),
         .tape_ear(tape_ear), .playing(tape_playing), .empty(tape_empty_sp),
@@ -1048,6 +1322,28 @@ module bulbulator_zx_ddr_top
         endcase
     end
 
+    // B0103: ОЧИСТКА МАТРИЦЫ ПО ФРОНТУ ЗАКРЫТИЯ ГЕЙТА.
+    // Требование владельца: если в момент открытия навигатора клавиша зажата, машина не должна её
+    // видеть. B0102 научил гейт пропускать ОТПУСКАНИЯ, но пока палец на клавише, отпускания нет
+    // вовсе - поэтому нужен отдельный проход. По фронту gate_on прогоняем счётчик по всем 256 кодам
+    // и выдаём отпускание для каждого: 256 тактов pe3M5 = ~73 мкс, то есть заведомо раньше, чем ПЗУ
+    // успеет сделать следующий скан клавиатуры на 50 Гц.
+    // Обратный переход трогать не нужно: матрица уже чиста, и зажатая клавиша не «нажмётся» задним
+    // числом - в машину пойдёт только следующее НАСТОЯЩЕЕ событие.
+    reg        gate_d  = 1'b0;
+    reg        clr_run = 1'b0;
+    reg [7:0]  clr_cnt = 8'd0;
+    always @(posedge spclk) if (pe3M5) begin
+        gate_d <= gate_on;
+        if (gate_on & ~gate_d) begin clr_run <= 1'b1; clr_cnt <= 8'd0; end
+        else if (clr_run) begin
+            if (clr_cnt == 8'hFF) clr_run <= 1'b0;
+            else                  clr_cnt <= clr_cnt + 8'd1;
+        end
+    end
+    wire       clr_strb = clr_run;
+    wire [7:0] clr_code = clr_cnt;
+
     // ---- ARM keyboard inject (0xA8): a synthetic scancode fed into the core's key stream, the same
     //      path as the Alt-chord (syn_*), but it BYPASSES the OSD gate so the ARM can drive the machine's
     //      keyboard even with the player window up (autonomous tape-loader start + self-test). aclk write
@@ -1079,14 +1375,46 @@ module bulbulator_zx_ddr_top
         end
     end
 
-    // Merge synthetic Alt chord + real PS/2 keyboard + the 4 buttons (synthetic wins, then PS/2).
-    // ZX matrix adapter for the gate: while the OSD is open (gate_on) the real PS/2 is suppressed
-    // here so the ARM owns the keys; the Alt chord (syn_*) and the 4 buttons stay live.
-    wire       ps2_to_core = ps2_strb & ~gate_on & ~pause_byte & ~ps2tx_busy;   // ARM-owned Pause never reaches the matrix; our own TX bits never leak either
-    wire       kb_strb = arm_strb | syn_strb | ps2_to_core | kbd_strb;                                    // ARM inject wins (bypasses the gate)
-    wire       kb_make = arm_strb ? arm_make : (syn_strb ? syn_make : (ps2_to_core ? ps2_make : kbd_make));
-    wire [7:0] kb_code = arm_strb ? arm_code : (syn_strb ? syn_code : (ps2_to_core ? ps2_code : kbd_code));
+    // NumLock/Kempston ownership comes from JOY_STATE bit31.  It is a slow ARM level; synchronise it
+    // independently because the full joy_sp bus is declared below this adapter.  Bits [7:0]/[23:16]
+    // remain the two platform joystick bytes, so no game-visible Kempston bit is consumed.
+    (* ASYNC_REG="TRUE" *) reg [1:0] numjoy_s = 2'b00;
+    always @(posedge spclk) numjoy_s <= {numjoy_s[0], ctl_joy[31]};
+    wire numjoy_sp = numjoy_s[1];
 
+    // Physical NumPad data bytes in set-2.  Main Enter and "/" are bare 5A/4A; their keypad twins
+    // are E0 5A/E0 4A, hence the split.  Real cursor/Insert/Delete keys are E0-prefixed and stay live.
+    wire ps2_numpad_byte =
+        (!ps2_e0 && ((ps2_code == 8'h70) || (ps2_code == 8'h69) || (ps2_code == 8'h72) ||
+                     (ps2_code == 8'h7A) || (ps2_code == 8'h6B) || (ps2_code == 8'h73) ||
+                     (ps2_code == 8'h74) || (ps2_code == 8'h6C) || (ps2_code == 8'h75) ||
+                     (ps2_code == 8'h7D) || (ps2_code == 8'h71) || (ps2_code == 8'h79) ||
+                     (ps2_code == 8'h7B) || (ps2_code == 8'h7C))) ||
+        ( ps2_e0 && ((ps2_code == 8'h4A) || (ps2_code == 8'h5A)));
+
+    // Merge synthetic Alt chord + real PS/2 keyboard + the 4 buttons (synthetic wins, then PS/2).
+    // ZX matrix adapter for the gates: OSD owns the whole keyboard; NumLock/Kempston owns only the
+    // physical keypad.  ARM injection and the board buttons deliberately bypass both gates.
+    // Always pass BREAK data to the matrix.  A keypad key that was pressed just before the owner
+    // toggled NumLock must still be released; a release for a make we suppressed is idempotent.
+    // B0102: гейт OSD подавляет только НАЖАТИЯ. Отпускания идут в матрицу всегда - иначе
+    // нажатие, успевшее пройти до закрытия гейта, остаётся в машине навсегда (у владельца так
+    // само листалось меню при работе в навигаторе). Ровно то же ограничение уже стоит у гейта
+    // NumLock ниже в этой строке, и комментарий выше прямо требует «Always pass BREAK data to
+    // the matrix»; у гейта OSD его просто не применили. Отпускание для подавленного нажатия
+    // идемпотентно, поэтому лишним оно быть не может.
+    // 🥇 B0103a: ВНИМАНИЕ, make здесь ИНВЕРТИРОВАН - 0 значит НАЖАТА, 1 значит ОТПУЩЕНА (видно по
+    // эмиттеру аккорда Alt: syn_make=0 это down, =1 это up, и по гейту NumLock, где подавление стоит
+    // при ~ps2_make). В B0102 я написал ~ps2_make и получил обратное: гейт пропускал НАЖАТИЯ и
+    // блокировал отпускания, из-за чего стрелки навигатора залипали в машине.
+    wire       ps2_to_core = ps2_strb & (~gate_on | ps2_make)
+                           & ~(numjoy_sp & ps2_numpad_byte & ~ps2_make)
+                           & ~pause_byte & ~ps2tx_busy;
+    // B0103: проход очистки стоит приоритетом ниже инжекта ARM и выше остальных источников -
+    // он должен успеть снять матрицу до того, как в неё попадёт что-то ещё.
+    wire       kb_strb = arm_strb | clr_strb | syn_strb | ps2_to_core | kbd_strb;                          // ARM inject wins (bypasses the gate)
+    wire       kb_make = arm_strb ? arm_make : clr_strb ? 1'b1     : (syn_strb ? syn_make : (ps2_to_core ? ps2_make : kbd_make));
+    wire [7:0] kb_code = arm_strb ? arm_code : clr_strb ? clr_code : (syn_strb ? syn_code : (ps2_to_core ? ps2_code : kbd_code));
     //=============================================================================================
     // Atlas ZX Spectrum core (main). CPU enables gated by halt; video enables free-running.
     //=============================================================================================
@@ -1109,11 +1437,13 @@ module bulbulator_zx_ddr_top
     // the keyboard gate itself has been forced open by the deadman (same aliveness signal).
     (* ASYNC_REG="TRUE" *) reg [31:0] joy_m = 32'd0, joy_sp = 32'd0;
     always @(posedge spclk) begin joy_m <= ctl_joy; joy_sp <= joy_m; end
-    (* ASYNC_REG="TRUE" *) reg [1:0] pentagon_s = 2'b00, model48_s = 2'b00, ula_late_s = 2'b00;
+    (* ASYNC_REG="TRUE" *) reg [1:0] pentagon_s = 2'b00, model48_s = 2'b00, ula_late_s = 2'b00, force_atlas_s = 2'b00, snow_off_s = 2'b00;
     always @(posedge spclk) begin
         pentagon_s <= {pentagon_s[0], ctl_pentagon};
         model48_s  <= {model48_s[0],  ctl_model48};
+        force_atlas_s <= {force_atlas_s[0], ctl_force_atlas};
         ula_late_s <= {ula_late_s[0], ctl_ula_late};
+        snow_off_s <= {snow_off_s[0], ctl_snow_off};
     end
     wire pentagon_sp = pentagon_s[1];
     wire core_model_sp = ~model48_s[1];              // Atlas: 0 = 48K, 1 = 128K
@@ -1158,14 +1488,75 @@ module bulbulator_zx_ddr_top
     main core_i (
 `endif
         .model  (core_model_sp),
+        .snow_off(snow_off_s[1]),         // v145 переключатель снега. Порт есть у ВСЕХ трёх ядер:
+                                          // Atlas main, hybrid и (с 13.08) mister48_core. Раньше
+                                          // здесь стоял `ifndef MISTER48_CORE` - и на машине MiSTer
+                                          // пункт меню молча ничего не делал.
+`ifdef HYBRID_CORE
+        .force_atlas(force_atlas_s[1]),   // co-resident Atlas/mister48 select - only hybrid_zx_core has this port; standalone Atlas (main) / mister48_core do not
+`endif
         .pentagon(pentagon_sp),
+`ifndef MISTER48_CORE
+`ifndef HYBRID_CORE
+        .pent1024(pentagon_sp),   // Пентагон = 1024: это и есть машина, о которой речь
+        // B0154: фаза окна контеншена ПОРТОВ (MACHINE_CFG бит27). ЭТА СВЯЗЬ ОБЯЗАНА ЖИТЬ ПОД `ifndef`:
+        // порт есть только у Atlas (`atlas_core/main.v`), у mister48_core и hybrid_zx_core его нет,
+        // и связь вне `ifndef` уронила бы обе ветви на синтезе МОЛЧА (эта мина уже стоила шести дней,
+        // см. B0148 ниже про четыре связи карты).
+        .io_cont_early(iocont_s[1]),
+        .ram_nobit(ram_nobit_sp), // B0120: каких старших бит банка у машины НЕТ (MACHINE_CFG [16:14])
+        .mem_wait(zx_mem_wait),
+        .ram_bank(ram_bank_core),
+        .eff7_o  (eff7_core),
+        .trdos_en  (trdos_en_sp),     // B0071: трап входа в TR-DOS (MACHINE_CFG бит8, по умолчанию 0)
+        .service_en(svcrom_sp),       //        сервисная страница ПЗУ  (MACHINE_CFG бит9)
+        .svc_nmi_en(svc_nmi_en_sp),   // B0101:  магическая кнопка       (MACHINE_CFG бит13)
+        .dos_svc_en(dos_svc_en_sp),   // B0146:  под TR-DOS страница = {DOS, 7FFD[4]} (MACHINE_CFG бит25)
+        .trdos_o   (trdos_core),      //        живая защёлка DOS   -> MACH_DBG бит13
+        .rom_page_o(rom_page_core),   //        живая страница ПЗУ  -> MACH_DBG [23:22]
+        .rom_dbg_o (rom_dbg_core),    // B0147  прибор трапа       -> 0x1BC ROM_DBG
+        .page3_seen_o(page3_seen_core),// B0147 липко: слот 3 был   -> MACH_DBG бит12
+        .aud_dbg_o (zx_aud_dbg),      // B0088:  пики звука по источникам -> 0x170
+        .fdc_aclk  (fclk100),         // B0075: мост дисковода (сектора подаёт ARM)
+        .gs_en     (gs_en_sp),                  // General Sound: карта включена (бит31 слова 0x178)
+        .gs_ctl    (gs_ctl_a), .gs_ctl_we (gs_ctl_we_a),
+        .gs_stat   (gs_stat_w),
+        .gs_wq_din (gs_wq_din_sp), .gs_wq_we (gs_wq_we_sp), .gs_wq_full (gs_wq_full_sp),
+        .gs_wq_afull(gs_wq_afull_sp),            // B0119: верхний порог = условие ТАКТОВ ОЖИДАНИЯ
+        .gs_wq_drain(gs_wq_drain_sp),            //         вынутый оболочкой байт = признак её жизни
+        .gs_stat2 (gs_stat2_w), .gs_stat3 (gs_stat3_w),
+        .nemo_en (nemo_ctl_a[4]), .nemo_ctl (nemo_ctl_a), .nemo_ctl_we (nemo_ctl_we_a),
+        .nemo_stat (nemo_stat_w), .nemo_stat2 (nemo_stat2_w),
+        .km_en (km_ctl_a[31]), .km_ctl (km_ctl_a), .km_ctl_we (km_ctl_we_a),   // B0116 мышь Kempston
+        .fdc_ctl   (fdc_ctl_a), .fdc_ctl_we (fdc_ctl_we_a),
+        .fdc_data  (fdc_data_a), .fdc_data_we(fdc_data_we_a),
+        .fdc_stat  (fdc_stat_w), .fdc_stat2 (fdc_stat2_w),
+        .bdi_always(bdi_always_sp),
+        .saa_mode  (saa_mode_sp),   // B0087: SAA1099 на #FF - AUTO/ON/OFF
+`endif
+`endif
         .ula_late(ula_late_sp),
         .ula_tune(pint_active),        // B0053: PENT_INT is free on native48 and becomes a frame-atomic JTAG timing tuner
         .pent_int_v(pint_active[24:16]),
         .pent_int_h(pint_active[8:0]),
         .paper_h(paper_h_sp),
         .paper_v(paper_v_sp),
-        .mapper (1'b0),
+        .mapper (divmmc_en_sp),          // B0132: было 1'b0 - весь конус автомаппера выбрасывался
+/* 🥇 B0148 ЭТИ ЧЕТЫРЕ СВЯЗИ ОБЯЗАНЫ ЖИТЬ ПОД `ifndef`, КАК И ВСЁ ОСТАЛЬНОЕ ПРО КАРТУ.
+   Их добавили ВНЕ условной компиляции работами по Z-Controller/DivMMC (B0132/B0138/B0143), а
+   портов `zc_en`, `zc_turbo`, `dm_opt`, `dm_pagein_off` у `mister48_core`/`hybrid_zx_core` нет -
+   и обе ветви ПЕРЕСТАЛИ СИНТЕЗИРОВАТЬСЯ (`ERROR: [Synth 8-11365] named port connection does not
+   exist`), причём молча: собирали только Atlas, а на карте лежало ядро MiSTer-48, отставшее на
+   девять сборок. Ровно та мина из PROJECT_RULES.md про общий верхний модуль, только бьёт по СБОРКЕ, а
+   не по поведению: правку общего топа проверять сборкой ВСЕХ ветвей, а не той, что тестируешь. */
+`ifndef MISTER48_CORE
+`ifndef HYBRID_CORE
+        .zc_en  (zc_en_sp),              // B0138: Z-Controller
+        .zc_turbo(zc_turbo_sp),          // B0143: 1=Turbo 28MHz, 0=Standard 3.5MHz
+        .dm_opt (dm_opt_sp),
+        .dm_pagein_off(dm_pagein_off_sp),
+`endif
+`endif
         .reset  (sp_reset_n),
         .nmi    (nmi_pulse),
 
@@ -1185,7 +1576,11 @@ module bulbulator_zx_ddr_top
 
         .strb   (kb_strb), .make(kb_make), .code(kb_code),
         .joy1   (joy_sp[7:0]), .joy2(joy_sp[23:16]),   // v0x4A: Kempston fed from JOY_STATE (bits FUDLR match 1:1)
-        .cs(), .ck(), .miso(1'b1), .mosi(),
+        /* Выводы uSD ядра до сих пор висели в воздухе. Теперь на них стоит наша карта: `usd.v` и
+           `spi.v` остаются нетронутыми (в них и есть выбранная схема - выравнивание байта делает
+           железо), а протокол SD разбирает divmmc_card ниже. Второго декодера #E7/#EB не
+           появляется: мы висим на проводах, а не на шине портов. */
+        .cs(sd_cs_n_w), .ck(sd_ck_w), .miso(sd_miso_w), .mosi(sd_mosi_w),
 
         .vmmCe  (vmmCe),
         .vmmA1  (vmmA1),
@@ -1223,6 +1618,32 @@ module bulbulator_zx_ddr_top
         .scr_capD    (scr_capD_w),      //   fetched screen byte (displayed bank -> shadow-aware)
         .scr_capWe   (scr_capWe_w),     //   strobe (gated with ne7M0 at the mirror BRAM below)
         .border_o    (border_w)         //   live ULA border colour (per-scanline capture)
+    );
+
+    /* ===== DivMMC: карта SD ==================================================================
+       Стоит на выводах uSD ядра, за уже синтезированным сдвигателем `spi.v`, и работает БАЙТАМИ.
+       Вход `ce` карте больше не нужен (B0145): она берёт биты по ФРОНТУ `sck` и потому одинаково
+       работает на обеих скоростях движка - и на 28.33 МГц, и на стандартных 3.5 МГц. До B0145 здесь
+       требовался тот же `ne7M0`, что и у движка, а `.ce(1'b1)`, поставленное в B0142, убивало
+       стандартный режим: уровень `sck` жил восемь тактов, и принятый байт вырождался.
+       ⚠ От карты НЕ ИДЁТ НИ ОДНОГО такта ожидания в процессор: обратное давление у неё - байт 0xFF
+       («карта не готова»), и esxDOS его держит по построению (L1DD2/L1DC4). Заводить сюда
+       `cpu_hold` НЕЛЬЗЯ: мёртвая оболочка не имеет права заморозить Z80.
+       `map_dbg` пока ноль - его наполнит шаг автомаппера (S4), когда в memory.v появятся automap /
+       conmem / mapram / страница. */
+    divmmc_card dmmc_i (
+        .clk(spclk), .ce(1'b1), .rst_n(sp_reset_n), .en(divmmc_en_sp | zc_en_sp),   // B0138: карта одна на оба транспорта
+        .cs_n(sd_cs_n_w), .sck(sd_ck_w), .mosi(sd_mosi_w), .miso(sd_miso_w),
+        /* B0133: было 9'd0 - состояние автомаппера наружу не выходило вовсе, и отладка
+           «esxDOS не стартует» упиралась в отсутствие прибора. Теперь оно видно в
+           DMMC_STAT[13:6] = {mapForce, mapAuto, mapOnM1, mapRam, mapPage[3:0]}. */
+        .map_dbg({1'b0, map_diag_core}),
+        .aclk(fclk100), .arst_n(aresetn),
+        .ctl(dmmc_ctl_a), .ctl_we(dmmc_ctl_we_a), .cap_in(dmmc_cap_a),
+        .bufa_in(dmmc_bufa_a), .bufa_we(dmmc_bufa_we_a),
+        .bufw_in(dmmc_bufw_a), .bufw_we(dmmc_bufw_we_a), .bufr_re(dmmc_bufr_re_a),
+        .bufa_q(dmmc_bufa_q_w), .bufr_q(dmmc_bufr_q_w),
+        .stat(dmmc_stat_w), .lba_q(dmmc_lba_w), .dbg(dmmc_dbg_w)
     );
     // B0048 passive guest-observation trace.  T80 accepts DI on CEN_n, so
     // retain the LAST nc3M5-qualified sample of each IN-FE window and commit
@@ -1332,183 +1753,55 @@ module bulbulator_zx_ddr_top
     // scr_bram_raddr / scr_rdata_r are DECLARED above (before the axi_ctl instance that uses them).
     always @(posedge fclk100) scr_rdata_r <= scrmir[scr_bram_raddr];
 
-    mem_zx mem_i (
+    // Банк для ПУТЕЙ ARM (инжект образа и очистка ОЗУ) берётся из самого адреса: они всегда
+    // работают в младших 128 КБ по соглашению 128К, то есть в BRAM, и в DDR не уходят никогда.
+    wire [5:0] ram_bank_eff = (clr_active || cpu_halt_sp) ? {3'd0, memA_eff[16:14]} : ram_bank_core;
+    // Ядра без расширенной страничности (MiSTer-48 - машина 48К, страниц нет вообще; гибрид мёртв):
+    // банк равен младшим трём битам адреса ОЗУ, как было до Пентагона 1024.
+`ifdef MISTER48_CORE
+    assign ram_bank_core = {3'd0, memA_core[16:14]};
+`elsif HYBRID_CORE
+    assign ram_bank_core = {3'd0, memA_core[16:14]};
+`endif
+
+    // 0x150 MACH_DBG для ZX/Пентагона. Счётчик запросов в DDR ОТ МАШИНЫ нужен отдельно от
+    // xact_cnt в 0x14C: тот считает и транзакции стенда ARM, и по нему не отличить, ходила ли
+    // в расширенный банк сама машина.
+    reg [7:0] zxddr_req_cnt = 8'd0;
+    always @(posedge spclk) if ((zxddr_rd | zxddr_wr) && zxddr_req_cnt != 8'hFF)
+        zxddr_req_cnt <= zxddr_req_cnt + 8'd1;
+    // B0071: в свободные биты слота легли страница ПЗУ [23:22] и защёлка DOS [13] - без них
+    // «какое ПЗУ сейчас в окне» не наблюдаемо ниоткуда (регистры дисплея и так только на запись).
+    assign zx_mach_dbg = {zxddr_req_cnt, rom_page_core, eff7_core, trdos_core, page3_seen_core,
+                          p7ffd_live_core, ram_bank_eff};
+
+    mem_zx #(.ROM_PAGES(ROM_PAGES_SEL)) mem_i (
         .clock (spclk),
         .memRf (memRf),
         .memRd (memRd),
         .memWr (memWr_eff),
         .memA  (memA_eff),
+        .ram_bank(ram_bank_eff),
         .memQ  (memQ_eff),
         .memD  (memD),
+        .ddr_addr(zxddr_addr), .ddr_wdata(zxddr_wdata),
+        .ddr_rd(zxddr_rd), .ddr_wr(zxddr_wr), .ddr_rdata(zxddr_rdata),
         .vmmCe (vmmCe),
         .vmmA1 (vmmA1),
         .vmmA2 (vmmA2_eff),
-        .vmmD  (vmmD)
+        .vmmD  (vmmD),
+        // B0071: порт B ПЗУ - заливка набора ARM-ом. Строб гейтится по loading (как ld_we & loading
+        // у картриджа NES): случайная запись в 0x154 при работающей машине не должна портить ПЗУ.
+        .rom_ld_clk (fclk100),
+        .rom_ld_we  (rom_ld_we_a & rom_loading_a & rom_ld_en),
+        .rom_ld_addr(rom_ld_addr_a),
+        .rom_ld_data(rom_ld_data_a)
     );
 
     //=============================================================================================
-    // DDR double-buffered framebuffer (tear-free) - replaces the single-BRAM framebuffer.
-    //   capture (spclk) -> async FIFO -> AXI-HP0 write -> PS DDR (triple buffer) -> AXI-HP0 read
-    //   -> display BRAM -> pillarbox upscaler -> rgb24. Buffer swap on the HDMI vblank.
+    // ZX audio leg -> pre-volume mix. Master volume, the post-volume DC blocker and HDMI live in
+    // control_plane; player_pcm/pgain/mgn come from its ARM-music FIFO.
     //=============================================================================================
-    wire [10:0] cx, cy;
-    wire [23:0] rgb24;
-
-    // HP reset into fclk100 + the loader/writer/manager reset (power-on only - NOT pulsed by the
-    // soft/hard hotkeys, so the DDR masters never reset mid-burst and the AXI-HP bus can't hang).
-    reg [1:0] hprstn_s = 2'b00;
-    always @(posedge fclk100) hprstn_s <= {hprstn_s[0], hp_aresetn};
-    wire core_resetn = aresetn & hprstn_s[1];
-
-    // HDMI vblank kick (clk_pixel -> fclk100) + a 1-cycle-delayed copy to arm the loader
-    reg vbl_tog = 1'b0, cy_in_vbl_d = 1'b0;
-    wire cy_in_vbl = (cy >= 11'd720);
-    always @(posedge clk_pixel) begin
-        cy_in_vbl_d <= cy_in_vbl;
-        if (cy_in_vbl & ~cy_in_vbl_d) vbl_tog <= ~vbl_tog;
-    end
-    reg [2:0] vbl_s = 3'b000;
-    always @(posedge fclk100) vbl_s <= {vbl_s[1:0], vbl_tog};
-    wire frame_kick = vbl_s[2] ^ vbl_s[1];
-    reg frame_kick_d = 1'b0;
-    always @(posedge fclk100) frame_kick_d <= frame_kick;
-
-    // capture enable: gate until HP is up (loader read >=1 frame -> post_config done), synced to spclk
-    wire        ld_live; wire [31:0] ld_underrun;   // from fb_line_disp (replaces fb_loader.frame_cnt)
-    reg [1:0] capen_s = 2'b00;
-    wire cap_en = capen_s[1];
-    always @(posedge spclk) capen_s <= {capen_s[0], ld_live};
-
-    // capture the core video (spclk) -> async FIFO
-    wire        cap_wr; wire [63:0] cap_din;
-    fb_capture_rr capz (
-        .wr_clk(spclk), .resetn(por_n), .wr_ce(pe7M0),
-        .hsync(vid_hsync), .vsync(vid_vsync), .blank(vid_blank),
-        .r(vid_r), .g(vid_g), .b(vid_b), .i(vid_i), .enable(cap_en),
-        .fifo_wr(cap_wr), .fifo_din(cap_din),
-        .cap_geom(cap_geom_sp)
-    );
-    wire fifo_empty, fifo_rd; wire [63:0] fifo_dout; wire [6:0] fifo_rdcount;
-    async_fifo #(.DW(64), .AW(6)) ddrfifo (
-        .wr_clk(spclk), .wr_rst_n(por_n), .wr_en(cap_wr), .din(cap_din), .full(),
-        .rd_clk(fclk100), .rd_rst_n(core_resetn), .rd_en(fifo_rd), .dout(fifo_dout), .empty(fifo_empty),
-        .rd_count(fifo_rdcount)
-    );
-
-    // AXI-HP0 write + triple buffer
-    wire wr_done; wire [31:0] wr_base, disp_base;
-    fb_bufmgr3 ddrbuf (
-        .clk(fclk100), .resetn(core_resetn),
-        .frame_done(wr_done), .frame_kick(frame_kick),
-        .wr_base(wr_base), .disp_base(disp_base),
-        .wr_buf_o(), .disp_buf_o(), .ready_buf_o()
-    );
-    fb_wr_axi #(.WORDS(13'd7248)) ddrwr (   // 384*302/16 = 7248 words/frame (Pentagon 384-wide capture). MUST match
-        .clk(fclk100), .resetn(core_resetn), .base(wr_base),   // fb_capture_rr FB_W*FB_H/16 and fb_line_disp CROP_W*CROP_H, else the frame boundary lands mid-line -> picture creeps down-left
-        .fifo_empty(fifo_empty), .fifo_dout(fifo_dout), .fifo_rd(fifo_rd),
-        .aw_addr(hp_awaddr), .aw_id(hp_awid), .aw_len(hp_awlen), .aw_size(hp_awsize),
-        .aw_burst(hp_awburst), .aw_cache(hp_awcache), .aw_prot(hp_awprot),
-        .aw_lock(hp_awlock), .aw_qos(hp_awqos), .aw_valid(hp_awvalid), .aw_ready(hp_awready),
-        .w_data(hp_wdata), .w_strb(hp_wstrb), .w_last(hp_wlast), .w_valid(hp_wvalid), .w_ready(hp_wready),
-        .b_valid(hp_bvalid), .b_ready(hp_bready),
-        .frame_done(wr_done), .busy_o()
-    );
-
-    // AXI-HP0 read (per-LINE) + line-buffered scanout -> rgb24. Phase 1a: replaces fb_loader + the
-    // whole-frame display BRAM (frees ~11 BRAM36). cap_en is re-sourced from .live (above).
-    fb_line_disp #(
-        .SRC_W(384), .STRIDE(384), .CROP_W(384), .HMARGIN(256), .SX0(0),
-        .CROP_H(302), .VMARGIN(58)
-    ) ddrdisp (
-        .clk(fclk100), .resetn(core_resetn),
-        .disp_base(disp_base), .frame_kick(frame_kick_d),
-        .ar_addr(hp_araddr), .ar_id(hp_arid), .ar_len(hp_arlen), .ar_size(hp_arsize),
-        .ar_burst(hp_arburst), .ar_cache(hp_arcache), .ar_prot(hp_arprot),
-        .ar_lock(hp_arlock), .ar_qos(hp_arqos), .ar_valid(hp_arvalid), .ar_ready(hp_arready),
-        .r_data(hp_rdata), .r_last(hp_rlast), .r_valid(hp_rvalid), .r_ready(hp_rready),
-        .rd_clk(clk_pixel), .cx(cx), .cy(cy),
-        .hmargin_a(ctl_scr_pos[11:0]), .vmargin_a(ctl_scr_pos[27:16]),   // Step 15: LIVE whole-frame HDMI position (settle-latched inside fb_line_disp)
-        .sx0_a(ctl_crop_a[11:0]), .sy0_a(ctl_crop_a[27:16]),             // Step 15: LIVE crop origin
-        .cropw_a(ctl_crop_b[11:0]), .croph_a(ctl_crop_b[27:16]),         // Step 15: LIVE crop size
-
-        .rgb(rgb24),
-        .live(ld_live), .underrun_cnt(ld_underrun)
-    );
-
-    // OSD MVP step 1: composite a 1-bpp toast strip over the live scanout (post-upscaler, RGB888,
-    // clk_pixel), gated by the AXI OSD_ENABLE bit. No BRAM tile, no Z80 halt. (osd_compositor.v)
-    wire [23:0] rgb24_osd;
-    osd_compositor osd_i (
-        .clk_pixel(clk_pixel), .aclk(fclk100),
-        .osd_enable_a(ctl_osd_enable), .osd_we(ctl_osd_we),
-        .osd_waddr(ctl_osd_waddr), .osd_wdata(ctl_osd_wdata), .osd_bg_a(ctl_osd_bg), .osd_op_a(ctl_osd_op), .osd_pos_a(ctl_osd_pos),
-        .cx(cx), .cy(cy), .rgb_in(rgb24), .rgb_out(rgb24_osd)
-    );
-
-    // ---- Step 14: DDR-backed TRUE-COLOUR OSD layer. ARGB canvas in the non-cacheable DDR window,
-    // read over its OWN AXI-HP1 port (osd_ddr_rd = simplified fb_line_disp clone), alpha-blended OVER
-    // the 1bpp OSD output. Position/enable synced aclk->clk_pixel (settle-latch/2-FF); base is
-    // fclk100-domain (static, set once by the ARM). Full per-pixel FFFFFF true colour (Winamp skin). ----
-    reg [31:0] odpos_s1=32'd0, odpos_s2=32'd0, odpos_s3=32'd0, odpos_q=32'd0;
-    (* ASYNC_REG="TRUE" *) reg [1:0] oden_s = 2'b00;
-    always @(posedge clk_pixel) begin
-        odpos_s1<=ctl_ddr_osd_pos; odpos_s2<=odpos_s1; odpos_s3<=odpos_s2;
-        if (odpos_s2==odpos_s3) odpos_q<=odpos_s2;
-        oden_s <= {oden_s[0], ctl_ddr_osd_en};
-    end
-    wire [23:0] osd_ddr_rgb; wire [7:0] osd_ddr_a; wire osd_ddr_active;
-    osd_ddr_rd #(.CW(640), .CH(400)) osddr (   /* Step 14.4: enlarge canvas to DOS 80x25 (640x400 @ VGA 8x16) */
-        .clk(fclk100), .resetn(core_resetn), .osd_base(ctl_osd_ddr_base), .frame_kick(frame_kick_d),
-        .ar_addr(hp1_araddr), .ar_id(hp1_arid), .ar_len(hp1_arlen), .ar_size(hp1_arsize),
-        .ar_burst(hp1_arburst), .ar_cache(hp1_arcache), .ar_prot(hp1_arprot),
-        .ar_lock(hp1_arlock), .ar_qos(hp1_arqos), .ar_valid(hp1_arvalid), .ar_ready(hp1_arready),
-        .r_data(hp1_rdata), .r_last(hp1_rlast), .r_valid(hp1_rvalid), .r_ready(hp1_rready),
-        .rd_clk(clk_pixel), .cx(cx), .cy(cy),
-        .x0(odpos_q[10:0]), .y0(odpos_q[26:16]), .en(oden_s[1]),
-        .osd_rgb(osd_ddr_rgb), .osd_a(osd_ddr_a), .osd_active(osd_ddr_active)
-    );
-    // ---- Step 15 timing fix: the compositing chain (1bpp OSD -> DDR-OSD alpha -> banner -> hdmi)
-    // was ONE combinational cone (~21 logic levels, 18.2 ns in a 13.468 ns pixel period - the first
-    // constrained build exposed it at WNS -5.06; it had silently been the dot/stripe artefact source
-    // for the project's whole life). Split into pipeline stages. Every layer's decision + pixels are
-    // delayed TOGETHER, so intra-layer alignment is exact; the only global effect is the whole
-    // picture (fb + all overlays uniformly) shifting right by 2 px - invisible next to borders. ----
-    reg [10:0] cx_d1 = 11'd0, cx_d2 = 11'd0, cy_d1 = 11'd0, cy_d2 = 11'd0;
-    always @(posedge clk_pixel) begin cx_d1<=cx; cx_d2<=cx_d1; cy_d1<=cy; cy_d2<=cy_d1; end
-
-    // stage A: register the 1bpp-OSD composite (cuts window-compare + LUTRAM + panel blend out of the cone)
-    reg [23:0] rgb24_osd_q = 24'd0;
-    always @(posedge clk_pixel) rgb24_osd_q <= rgb24_osd;
-
-    // DDR-OSD layer: +1 delay to stay aligned with the stage-A register (its own 2-stage contract holds)
-    reg        od_act_d1 = 1'b0; reg [7:0] od_a_d1 = 8'd0; reg [23:0] od_rgb_d1 = 24'd0;
-    always @(posedge clk_pixel) begin
-        od_act_d1 <= osd_ddr_active; od_a_d1 <= osd_ddr_a; od_rgb_d1 <= osd_ddr_rgb;
-    end
-
-    // stage B: per-pixel alpha blend of the DDR OSD over the 1bpp-OSD output, REGISTERED:
-    // osd*a + under*(255-a) >>8  (the 6 multiplies now live alone in one pixel period)
-    wire [7:0]  od_ia = 8'd255 - od_a_d1;
-    wire [15:0] od_r = od_rgb_d1[23:16]*od_a_d1 + rgb24_osd_q[23:16]*od_ia;
-    wire [15:0] od_g = od_rgb_d1[15:8] *od_a_d1 + rgb24_osd_q[15:8] *od_ia;
-    wire [15:0] od_b = od_rgb_d1[7:0]  *od_a_d1 + rgb24_osd_q[7:0]  *od_ia;
-    reg [23:0] rgb24_ddr_q = 24'd0;
-    always @(posedge clk_pixel)
-        rgb24_ddr_q <= od_act_d1 ? { od_r[15:8], od_g[15:8], od_b[15:8] } : rgb24_osd_q;
-
-    // Independent status BANNER, composited OVER the OSD output (visible regardless of osd_enable).
-    // Runs on the 2-cycle-delayed coordinates so its window tracks the pipelined underlay.
-    // Chain: rgb24 -> osd_i -> [reg A] -> DDR-OSD blend [reg B] -> banner_i -> rgb24_ovl -> hdmi.
-    wire [23:0] rgb24_ovl;
-    banner_compositor banner_i (
-        .clk_pixel(clk_pixel), .aclk(fclk100),
-        .ban_enable_a(ctl_ban_enable), .ban_we(ctl_ban_we),
-        .ban_waddr(ctl_ban_waddr), .ban_wdata(ctl_ban_wdata), .ban_pos_a(ctl_ban_pos),
-        .cx(cx_d2), .cy(cy_d2), .rgb_in(rgb24_ddr_q), .rgb_out(rgb24_ovl)
-    );
-
-    //=============================================================================================
-    // Audio: 11-bit UNSIGNED PCM -> signed 16-bit, then resync into clk_audio.
     //=============================================================================================
     // Step 13.1 "full pause" mute: while the Z80 is HALTed (Pause), the AY/beeper clock-enables are
     // gated (pe3M5_core = pe3M5 & ~cpu_halt_sp), so the sound chips freeze mid-sample and their last
@@ -1560,39 +1853,6 @@ module bulbulator_zx_ddr_top
     end
     wire signed [15:0] fdc_l16 = (fdc_ly > 20'sd32767) ? 16'sd32767 : (fdc_ly < -20'sd32768) ? -16'sd32768 : fdc_ly[15:0];
     wire signed [15:0] fdc_r16 = (fdc_ry > 20'sd32767) ? 16'sd32767 : (fdc_ry < -20'sd32768) ? -16'sd32768 : fdc_ry[15:0];
-
-    //=============================================================================================
-    // Machine-agnostic ARM -> HDMI audio: the ARM player pushes signed-16 {R[31:16],L[15:0]} samples
-    // into this async FIFO (fclk100 write side), drained one per clk_audio_r tick. When the player is
-    // active the HDMI audio mux selects player PCM over the fabric core's audio - so it plays under
-    // ANY fabric machine or none. Fabric leg (fade + volume) is untouched when the player is off.
-    //=============================================================================================
-    // ctl_player_en is fclk100(aclk)-domain; 2-FF sync it into clk_audio_r before it gates the audio
-    // FIFO read enable AND the source mux. An unsynchronised enable into the FIFO read-pointer counter
-    // is a real CDC hazard (metastable rd_en can corrupt the gray/binary pointer pair). aud_empty is
-    // already a clk_audio_r (read-side) signal, so it needs no extra sync.
-    (* ASYNC_REG = "TRUE" *) reg [1:0] pen_s = 2'b00;
-    always @(posedge clk_audio_r) pen_s <= {pen_s[0], ctl_player_en};
-    wire player_live = pen_s[1] & ~aud_empty;
-    async_fifo #(.DW(32), .AW(8)) audio_fifo (
-        .wr_clk(fclk100),    .wr_rst_n(aresetn), .wr_en(ctl_audio_we), .din(ctl_audio_data), .full(aud_full),
-        .rd_clk(clk_audio_r), .rd_rst_n(aresetn), .rd_en(player_live),
-        .dout(aud_dout), .empty(aud_empty), .rd_count(aud_rdcount)
-    );
-    // Step 14.3b anti-click (the mux itself was the click source):
-    //  (1) HOLD-LAST: on an empty FIFO keep the last player sample instead of falling back to the
-    //      machine audio - a 1-sample underrun used to flap the source machine<->player at audio
-    //      rate (the "chain of clicks"), and a paused player let the machine leak into the silence.
-    reg [31:0] aud_hold = 32'd0;
-    always @(posedge clk_audio_r) if (player_live) aud_hold <= aud_dout;
-    wire [31:0] player_pcm = player_live ? aud_dout : aud_hold;
-    //  (2) CROSSFADE machine<->player over ~1.3 ms on AUDIO_CTRL on/off (mirrors the mgain pause
-    //      fade) - no more DC step when the mux engages/releases (start/stop clicks).
-    reg  [8:0] pgain = 9'd0;
-    wire [8:0] ptgt = pen_s[1] ? 9'd256 : 9'd0;
-    always @(posedge clk_audio_r)                            /* 1/sample slew = ~5.3 ms crossfade (a 1.3 ms DC ramp was still a soft thump) */
-        if (pgain < ptgt) pgain <= pgain + 9'd1; else if (pgain > ptgt) pgain <= pgain - 9'd1;
-    wire [8:0] mgn = 9'd256 - pgain;
     // blend in full-width products (lesson: a narrow assignment context truncates the multiply)
     wire signed [25:0] lmix_p = $signed(fdc_l16) * $signed({1'b0, mgn}) + $signed(player_pcm[15:0])  * $signed({1'b0, pgain});
     wire signed [25:0] rmix_p = $signed(fdc_r16) * $signed({1'b0, mgn}) + $signed(player_pcm[31:16]) * $signed({1'b0, pgain});
@@ -1618,83 +1878,9 @@ module bulbulator_zx_ddr_top
     wire [15:0] src_left  = (lsum > 17'sd32767) ? 16'h7FFF : (lsum < -17'sd32768) ? 16'h8000 : lsum[15:0];
     wire [15:0] src_right = (rsum > 17'sd32767) ? 16'h7FFF : (rsum < -17'sd32768) ? 16'h8000 : rsum[15:0];
 
-    // HDMI volume (Step 13, F9 menu): scale the signed-16 PCM by ctl_vol (0..255 gain, /256; 255 ~=
-    // unity) in the slow clk_audio domain, so the multiply has ample slack and one DSP per channel.
-    // ctl_vol is set by the ARM from the options menu; 2-FF sync it in. Composes with the pause mute
-    // (while halted src_left/src_right is already silenced, and silence*gain stays silent).
-    reg  [7:0] vol_c0 = 8'd255, vol_c1 = 8'd255;   // 2-FF CDC of the TARGET volume (ctl_vol)
-    reg  [7:0] vgain  = 8'd255;                     // click-free SLEWED gain (ramps toward the target)
-    always @(posedge clk_audio_r) begin
-        vol_c0 <= ctl_vol; vol_c1 <= vol_c0;        // sync the target across the clock domain
-        if      (vgain < vol_c1) vgain <= vgain + 8'd1;   // 1 LSB/sample: full 0..255 swing ~5.3 ms;
-        else if (vgain > vol_c1) vgain <= vgain - 8'd1;   // a 5%-step (~13 LSB) glides in ~0.27 ms -> no zipper
-    end
-    // FULL-WIDTH product first (a bare (a*b)>>>8 assigned to a 16-bit reg makes Verilog size the
-    // multiply to the 16-bit assignment context -> the product overflows + truncates -> garbage/no
-    // sound). Compute the signed product in a 25-bit wire, THEN arithmetic-shift /256 (vol 255 ~= 1x).
-    wire signed [24:0] lprod = $signed(src_left)  * $signed({1'b0, vgain});
-    wire signed [24:0] rprod = $signed(src_right) * $signed({1'b0, vgain});
-    reg signed [15:0] left16_v, right16_v;
-    always @(posedge clk_audio_r) begin
-        left16_v  <= lprod >>> 8;
-        right16_v <= rprod >>> 8;
-    end
-
-    // Step 14.3c studio-grade DC blocker (single-pole HPF, fc ~30 Hz): y[n] = x[n] - x[n-1] + (255/256)y[n-1].
-    // This is the digital twin of the AC-coupling caps in the real hardware's audio path - NO source
-    // (machine DC from the beeper bit, mux transitions, pause) can push a DC step to the speakers, so
-    // any residual transition thump dies by construction. Audio content above ~40 Hz is untouched.
-    reg signed [15:0] dcb_lx = 16'sd0, dcb_rx = 16'sd0;
-    reg signed [19:0] dcb_ly = 20'sd0, dcb_ry = 20'sd0;       /* headroom against clip-adjacent swings */
-    // Verilog gotcha (caused a full-scale rumble on hardware): a CONCATENATION is always UNSIGNED and
-    // poisons the whole expression -> ">>>" degraded to a logical shift for negative y. Sign-extend
-    // through intermediate SIGNED wires so the arithmetic (and the shift) stay signed. Verified
-    // against a bit-exact host simulation (buggy: mean err 30807 = garbage; signed: 389 = clean HPF).
-    wire signed [19:0] dcb_xl  = { {4{left16_v[15]}},  left16_v  };
-    wire signed [19:0] dcb_xr  = { {4{right16_v[15]}}, right16_v };
-    wire signed [19:0] dcb_xl1 = { {4{dcb_lx[15]}}, dcb_lx };
-    wire signed [19:0] dcb_xr1 = { {4{dcb_rx[15]}}, dcb_rx };
-    wire signed [19:0] dcb_lyn = dcb_xl - dcb_xl1 + dcb_ly - (dcb_ly >>> 8);
-    wire signed [19:0] dcb_ryn = dcb_xr - dcb_xr1 + dcb_ry - (dcb_ry >>> 8);
-    always @(posedge clk_audio_r) begin
-        dcb_lx <= left16_v;  dcb_ly <= dcb_lyn;
-        dcb_rx <= right16_v; dcb_ry <= dcb_ryn;
-    end
-    wire signed [15:0] dcb_l16 = (dcb_ly > 20'sd32767) ? 16'sd32767 : (dcb_ly < -20'sd32768) ? -16'sd32768 : dcb_ly[15:0];
-    wire signed [15:0] dcb_r16 = (dcb_ry > 20'sd32767) ? 16'sd32767 : (dcb_ry < -20'sd32768) ? -16'sd32768 : dcb_ry[15:0];
-    wire [15:0] audio_left_f  = dcb_l16;
-    wire [15:0] audio_right_f = dcb_r16;
-
     //=============================================================================================
-    // HDMI 1.4 (720p50) with stereo audio + OBUFDS to the TMDS pins.
-    //=============================================================================================
-    wire [2:0] tmds;
-    wire       tmds_clock;
-    hdmi_wrap hdmi_ (
-        .clk_pixel_x5(clk_ser),
-        .clk_pixel   (clk_pixel),
-        .clk_audio   (clk_audio_r),
-        .reset       (hdmi_reset),
-        .rgb         (rgb24_ovl),
-        .audio_left  (audio_left_f),
-        .audio_right (audio_right_f),
-        .tmds        (tmds),
-        .tmds_clock  (tmds_clock),
-        .cx          (cx),
-        .cy          (cy)
-    );
-    OBUFDS obuf_clk (.I(tmds_clock), .O(TMDS_Clk_p), .OB(TMDS_Clk_n));
-    genvar gi;
-    generate for (gi = 0; gi < 3; gi = gi + 1) begin : tb
-        OBUFDS obuf_d (.I(tmds[gi]), .O(TMDS_Data_p[gi]), .OB(TMDS_Data_n[gi]));
-    end endgenerate
-
-    //=============================================================================================
-    // Indicators.
+    // Indicators. (led_heart is driven by the shell.)
     //=============================================================================================
     assign led_lock = sp_lock;
-    reg [25:0] hb = 26'd0;
-    always @(posedge clk_pixel) hb <= hb + 26'd1;
-    assign led_heart = hb[24];
 endmodule
 //-------------------------------------------------------------------------------------------------

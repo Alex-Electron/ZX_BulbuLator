@@ -31,7 +31,8 @@ module nes_wrap (
     output wire [8:0]  scanline,
     output wire [2:0]  emphasis,
     output wire [15:0] sample,
-    output wire        apu_ce
+    output wire        apu_ce,
+    output wire [31:0] mem_dbg      // bring-up: {vram_ce_cnt, ciram_write_cnt} from nes_mem_bram
 );
     // ---- aclk -> nesclk 2-FF synchronisers (quasi-static / slow signals) ----
     (* ASYNC_REG="TRUE" *) reg [63:0] mf_s1=0, mf_s2=0;
@@ -51,13 +52,16 @@ module nes_wrap (
     wire [21:0] cpumem_addr, ppumem_addr;
     wire        cpumem_read, cpumem_write, ppumem_read, ppumem_write;
     wire [7:0]  cpumem_dout, ppumem_dout, cpumem_din, ppumem_din;
+    wire        vram_ce_ns, vram_a10_ns;   // PPU CIRAM select/mirroring (nametable vs cart CHR)
     nes_mem_bram mem (
         .clk(clk), .ld_clk(ld_clk), .loading(loading_ns),
         .cpumem_addr(cpumem_addr), .cpumem_read(cpumem_read), .cpumem_write(cpumem_write),
         .cpumem_dout(cpumem_dout), .cpumem_din(cpumem_din),
         .ppumem_addr(ppumem_addr), .ppumem_read(ppumem_read), .ppumem_write(ppumem_write),
         .ppumem_dout(ppumem_dout), .ppumem_din(ppumem_din),
-        .ld_we(ld_we & loading), .ld_sel(ld_sel), .ld_addr(ld_addr), .ld_data(ld_data)   // aclk-domain load
+        .ppu_vram_ce(vram_ce_ns), .ppu_vram_a10(vram_a10_ns),
+        .ld_we(ld_we & loading), .ld_sel(ld_sel), .ld_addr(ld_addr), .ld_data(ld_data),  // aclk-domain load
+        .dbg(mem_dbg)
     );
 
     // ---- joypad parallel->serial shifter (nesclk) ----
@@ -86,6 +90,7 @@ module nes_wrap (
         .cpumem_dout(cpumem_dout), .cpumem_din(cpumem_din),
         .ppumem_addr(ppumem_addr), .ppumem_read(ppumem_read), .ppumem_write(ppumem_write),
         .ppumem_dout(ppumem_dout), .ppumem_din(ppumem_din),
+        .ppumem_vram_ce(vram_ce_ns), .ppumem_vram_a10(vram_a10_ns),
         .bram_addr(), .bram_din(8'h00), .bram_dout(), .bram_write(), .bram_override(),
         .cycle(cycle), .scanline(scanline),
         .int_audio(1'b1), .ext_audio(1'b0), .apu_ce(apu_ce),

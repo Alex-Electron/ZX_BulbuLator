@@ -21,6 +21,7 @@ cp -f "$SRC" "$APPDIR/src/main.c"
 cp -f "$ARMD/vga866.h" "$APPDIR/src/vga866.h"          # Step 14.4: CP866 VGA 8x16 font (DOS-Navigator OSD)
 cp -f "$ARMD/player.c" "$APPDIR/src/player.c"          # universal music player (Step 13.2)
 cp -f "$ARMD/mp3dec.c" "$ARMD/mp3dec.h" "$APPDIR/src/"        # Step 14.3: shared MP3 source (music + tape)
+cp -f "$ARMD/nes_rom.c" "$APPDIR/src/"
 cp -f "$TP/minimp3/minimp3.h" "$APPDIR/src/"                  # minimp3 (public-domain MP3 decoder, CC0)
 cp -f "$TP/speexdsp/resample.c" "$TP/speexdsp/arch.h" "$TP/speexdsp/fixed_generic.h" \
       "$TP/speexdsp/speex_resampler.h" "$APPDIR/src/"         # speexdsp polyphase resampler (BSD) - audiophile WAV/MP3 -> 47996
@@ -46,13 +47,16 @@ arm-none-eabi-gcc -O2 -c -fmessage-length=0 \
   -I"$BSP/include" -I../src -o src/mp3dec.o ../src/mp3dec.c
 arm-none-eabi-gcc -O2 -c -fmessage-length=0 \
   -mcpu=cortex-a9 -mfpu=vfpv3 -mfloat-abi=hard \
+  -I"$BSP/include" -I../src -o src/nes_rom.o ../src/nes_rom.c
+arm-none-eabi-gcc -O2 -c -fmessage-length=0 \
+  -mcpu=cortex-a9 -mfpu=vfpv3 -mfloat-abi=hard \
   -o src/ayumi.o ../src/ayumi.c
 
 echo "=== link (main.o + player + ayumi + xilffs objs + libxil.a[xsdps]) ==="
 arm-none-eabi-gcc -mcpu=cortex-a9 -mfpu=vfpv3 -mfloat-abi=hard \
   -Wl,-build-id=none -specs=Xilinx.spec -Wl,-T -Wl,../src/lscript.ld \
   -L"$BSP/lib" -o loader.elf \
-  src/main.o src/player.o src/mp3dec.o src/resample.o src/ayumi.o "$XF/ff.o" "$XF/ffunicode.o" "$XF/ffsystem.o" "$XF/diskio.o" \
+  src/main.o src/player.o src/mp3dec.o src/resample.o src/ayumi.o src/nes_rom.o "$XF/ff.o" "$XF/ffunicode.o" "$XF/ffsystem.o" "$XF/diskio.o" \
   -Wl,--start-group,-lxil,-lgcc,-lc,-lm,--end-group
 
 ls -la loader.elf

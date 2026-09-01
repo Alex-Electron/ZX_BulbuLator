@@ -1,4 +1,17 @@
 //-------------------------------------------------------------------------------------------------
+// ps2.v - PS/2 keyboard decoder.
+//
+// Derived from the ZX Spectrum core by Sorgelig and contributors
+// (sorgelig/ZX_Spectrum-128K_MIST; downstream AtlasFPGA/zx), licensed GPL-2.0-or-later.
+// Modified for BulbuLator: a watchdog that resyncs the PS/2 bit counter (fixes fuzzy keys),
+// and a `perr` parity/framing-error output that drives the fabric host-RESEND.
+// Copyright (C) 2016-2019 Sorgelig; modifications Copyright (C) 2026 Alexander Lavrinovich.
+//
+// This program is free software: you can redistribute it and/or modify it under the terms of
+// the GNU General Public License as published by the Free Software Foundation, either version 2
+// of the License, or (at your option) any later version.
+// SPDX-License-Identifier: GPL-2.0-or-later
+//-------------------------------------------------------------------------------------------------
 module ps2
 //-------------------------------------------------------------------------------------------------
 (
@@ -8,7 +21,8 @@ module ps2
 	input  wire      ps2D,
 	output reg       strb,
 	output reg       make,
-	output reg [7:0] code
+	output reg [7:0] code,
+	output reg       perr        // Step 15: 1-cycle pulse on a parity/framing error (a dropped byte) -> host RESEND
 );
 //-------------------------------------------------------------------------------------------------
 
@@ -49,6 +63,7 @@ reg[10:0] wdt;   // inter-bit watchdog. A PS/2 frame never pauses more than ~100
 always @(posedge clock) if(ce)
 begin
 	strb <= 1'b0;
+	perr <= 1'b0;
 	if(count == 4'd0 || ps2n) wdt <= 11'd0;
 	else                      wdt <= wdt + 11'd1;
 	if(count != 4'd0 && wdt == 11'd1417)           // 1417 ce ticks @ 3.5417 MHz = 400 us
@@ -76,8 +91,9 @@ begin
 					strb <= 1'b1;
 					code <= data[7:0];
 				end
+				else perr <= 1'b1;
 			end
-			else count <= 1'd0;
+			else begin count <= 1'd0; perr <= 1'b1; end
 		end
 	end
 end
