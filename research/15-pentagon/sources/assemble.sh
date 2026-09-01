@@ -40,6 +40,7 @@ ln -sfn "$REPO/cores/hdmi" "$B/hdmi"
 # `-tclargs mistert80` and `-tclargs mister48` reproducible with no /tmp staging.
 ln -sfn "$REPO/cores/zx-mister/rtl"     "$B/mister48"
 ln -sfn "$REPO/cores/zx-mister/rtl/T80" "$B/mister_t80"
+ln -sfn "$REPO/research/15-pentagon/sources/t80_bulb" "$B/t80_bulb"
 
 # Step 15 deliberately modifies the Atlas model, memory, video timing and PS/2 receiver.
 # Keep those exact sources beside this step and compile them from build/atlas_core. Never

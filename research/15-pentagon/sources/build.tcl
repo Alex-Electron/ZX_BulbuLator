@@ -28,7 +28,10 @@ if {$MISTERT80} {
     mister_t80/T80_MCode.vhd mister_t80/T80_ALU.vhd \
     mister_t80/T80.vhd mister_t80/T80pa.vhd]
 } else {
-  read_vhdl [glob zx/src/T80/*.vhd]
+  read_vhdl [list \
+    t80_bulb/T80_Pack.vhd t80_bulb/T80_Reg.vhd \
+    t80_bulb/T80_MCode.vhd t80_bulb/T80_ALU.vhd \
+    t80_bulb/T80.vhd t80_bulb/T80pa.vhd]
 }
 read_verilog [glob zx/src/JT49/*.v]
 read_verilog -sv zx/src/saa1099.sv
