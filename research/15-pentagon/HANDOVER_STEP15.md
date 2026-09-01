@@ -17,7 +17,7 @@ BulbuLator — эмулятор ретро-машин на плате EBAZ4205 (
 ## 1. Окружение и доступ
 
 - **Плата** EBAZ4205 (Zynq-7010) подключена к **ThinkPad** (не к маку). Экран/клавиатура ZX у платы — на них смотрит владелец.
-- **JTAG:** Xilinx Platform Cable USB II → `hw_server` на `localhost:3121` (ThinkPad). ⚠️ Прежний xvc-pico МЁРТВ, не использовать.
+- **JTAG:** Xilinx Platform Cable USB II → `hw_server` :3121 (ThinkPad). См. `../JTAG.md`.
 - **Мак** (где работает агент) = пульт: всё делается через `ssh thinkpad` (юзер `lavrinovich`, 16 ядер). Синтез, сборка, прошивка, JTAG — ВСЁ на ThinkPad.
 - **Тулчейн на ThinkPad:** Vivado 2023.1 (`/tools/Xilinx/Vivado/2023.1/settings64.sh`), Vitis 2023.1 (`/tools/XilinxVitis/Vitis/2023.1/`), `arm-none-eabi-gcc`, `xsct`, `hw_server`. `vivado`/`xsct` НЕ в PATH при ssh — сорсить settings64.sh.
 - **Дерево:** `~/bulb-v13/research/15-pentagon/` (репо-шаг). Ядра — `~/bulb-v13/cores/` (fetch'атся по SHA).

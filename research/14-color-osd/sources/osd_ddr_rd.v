@@ -108,8 +108,18 @@ module osd_ddr_rd #(
     wire ar_hs = ar_valid & ar_ready;
     wire r_hs  = r_valid & r_ready;
 
-    // row byte address = base + row * (WPR*8 bytes)
-    function [31:0] row_addr_f(input [9:0] r); row_addr_f = frame_base + (r * (WPR*8)); endfunction
+    // row byte address = base + row * (WPR*8 bytes). Step 15 timing fix: this multiply used to sit
+    // COMBINATIONALLY inside the FSM's ar_addr assignment (nr_stable -> DSP48 -> add -> FSM mux ->
+    // ar_addr in one 10 ns fclk100 cycle = WNS -2.96 in the first constrained build). Precompute both
+    // candidate addresses into registers, each with a ROW TAG; the FSM launches a fetch only when the
+    // tag matches the row it wants - a just-changed nr_stable can never pair a stale address with a
+    // fresh row tag (coherent by construction; worst case a 1-cycle stall per row change).
+    reg [31:0] addr0_q = 32'd0, addr1_q = 32'd0;
+    reg [9:0]  addr0_row_q = ROW_NONE, addr1_row_q = ROW_NONE;
+    always @(posedge clk) begin
+        addr0_q <= frame_base + (want0 * (WPR*8));  addr0_row_q <= want0;
+        addr1_q <= frame_base + (want1 * (WPR*8));  addr1_row_q <= want1;
+    end
 
     always @(posedge clk) begin
         if (!resetn) begin
@@ -120,16 +130,16 @@ module osd_ddr_rd #(
             case (rstate)
             RD_IDLE: begin
                 ar_valid<=1'b0; outstanding<=3'd0; ar_issued<=10'd0; words_rcvd<=10'd0;
-                if (base_valid && !have0 && (b0_spare || b1_spare)) begin
+                if (base_valid && !have0 && (b0_spare || b1_spare) && (addr0_row_q == want0)) begin
                     tgt <= b0_spare ? 1'b0 : 1'b1;  tgt_row <= want0;
                     if (b0_spare) begin buf_valid[0]<=1'b0; buf_row[0]<=ROW_NONE; end
                     else          begin buf_valid[1]<=1'b0; buf_row[1]<=ROW_NONE; end
-                    ar_addr <= row_addr_f(want0); rstate <= RD_AR;
-                end else if (base_valid && !have1 && (b0_spare || b1_spare)) begin
+                    ar_addr <= addr0_q; rstate <= RD_AR;
+                end else if (base_valid && !have1 && (b0_spare || b1_spare) && (addr1_row_q == want1)) begin
                     tgt <= b0_spare ? 1'b0 : 1'b1;  tgt_row <= want1;
                     if (b0_spare) begin buf_valid[0]<=1'b0; buf_row[0]<=ROW_NONE; end
                     else          begin buf_valid[1]<=1'b0; buf_row[1]<=ROW_NONE; end
-                    ar_addr <= row_addr_f(want1); rstate <= RD_AR;
+                    ar_addr <= addr1_q; rstate <= RD_AR;
                 end
             end
             RD_AR: begin

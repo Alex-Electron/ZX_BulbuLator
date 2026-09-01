@@ -2,14 +2,20 @@
 #include "xil_cache.h"   /* Xil_DCacheEnable / Xil_ICacheEnable */
 #include "xil_mmu.h"     /* Xil_SetTlbAttributes + NORM_NONCACHE (carve the fabric-shared DMA window) */
 #include "ff.h"          /* FatFs (xilffs) - BSP provides xsdps + ChaN FatFs */
+#include "divmmc_fs.h"   /* v327 */
 #include "mp3dec.h"      /* shared minimp3 source: MP3 as music (player) AND as cassette (edge-detect) */
 #include "xtime_l.h"     /* XTime / COUNTS_PER_SECOND - long-name marquee timing */
 #include "xscugic.h"     /* Step 14.3b: GIC + private timer drive the 1 ms audio-consumer interrupt */
 #include "xscutimer.h"
 #include "xil_exception.h"
+#include "tv_ui.h"
 
 static const char* machine_name(void);
 static const char* machine_type(void);
+/* v0.15.179: лампочка NUM LOCK как ИНДИКАТОР режима цифрового блока (владелец: "не забывай про лампочку").
+   Горит = блок отдан джойстику. Команда PS/2 0xED + маска (bit0=Scroll, bit1=Num, bit2=Caps). */
+static void kbd_leds_set(uint32_t mask);      /* fwd: тело рядом с kbd_tx_byte */
+static uint32_t kbd_led_mask(void);           /* v216: NumLock ownership + ScrollLock pause together */
 
 /* universal music player (player.c): machine-agnostic ARM soft-synth -> HDMI audio FIFO */
 int  player_play_psg(const char* path);
@@ -23,6 +29,20 @@ void player_pump(void);
 void player_isr_tick(void);               /* Step 14.3b: audio consumer (1 ms timer ISR feeds the fabric FIFO) */
 void player_audio_irq(int ok);            /* tell the player whether the ISR is live (else it polls inline) */
 int  player_active(void);
+static int g_menu_open = 0;
+/* 🥇 РЕВЬЮ 19.08: СТРОКУ 22 ИНОГДА ПИШЕТ САМА ВЫПАДАШКА. v0.15.369 добавил в пять рисовальщиков
+   строки состояния общий запрет `g_modal_level || g_menu_open` - чтобы ФОНОВЫЕ маляры (маркиза
+   музыки, статус ленты, счётчик файлов) не лезли под открытый диалог. Заодно он погасил ДВА
+   переднеплановых: dn_status_msg (подсказка vwhy пункта, «ENTER = APPLY» и ВСЕ отказы apply_*,
+   которые зовутся с Enter внутри меню) и dn_draw_status, которым меню ВОЗВРАЩАЕТ строке обычное
+   содержимое, уходя с пункта. То есть механизм v0.15.334 «объясни, когда трогать» с v369 на экран
+   не попадал ни разу. Флаг = «сейчас строку пишет меню»: фоновые маляры по-прежнему молчат. */
+static int g_status_force = 0;
+/* v265: General Sound как ЖИВОЙ источник звука (не файл): мелкая очередь + суммирование в ЦАП */
+unsigned player_gs_room(void);
+void player_gs_push(int16_t l, int16_t r);
+void player_gs_enable(int on);
+int  player_gs_on(void);
 void player_stop(void);
 void player_pause_toggle(void);   /* Space: pause/resume transport */
 int  player_paused(void);         /* 1 = paused */
@@ -61,7 +81,205 @@ unsigned player_progress(void);   /* 0..100 playback progress */
 #define OSD_OP     (*(volatile uint32_t*)(GP0+0x6C))  /* OSD panel opacity alpha 0..255 */
 #define OSD_POS    (*(volatile uint32_t*)(GP0+0x70))  /* OSD panel position {Y0[26:16],X0[10:0]} */
 #define VOL_REG    (*(volatile uint32_t*)(GP0+0x74))  /* HDMI volume gain 0..255 (PCM * vol / 256) */
-#define KBD_DATA   (*(volatile uint32_t*)(GP0+0x54))  /* [9]=release_flag(1=break) [8]=empty [7:0]=code; read pops */
+#define KBD_DATA_HW (*(volatile uint32_t*)(GP0+0x54)) /* [9]=release_flag(1=break) [8]=empty [7:0]=code; read pops */
+/* v0.15.165 KEY-INJECT ДЛЯ ОБОЛОЧКИ (fs cmd 11).
+   Зачем: 0xA8 KBD_INJECT кладёт клавишу в ГОСТЕВУЮ машину, минуя гейт, и до меню не доходит (проверено
+   на железе: F12 через 0xA8 не открывает OSD). Свои клавиши оболочка читает из железного FIFO 0x54 -
+   и делает это в ДЕСЯТКАХ мест (get_keysym_blocking, диалоги, главный цикл, визарды). Поэтому подменяем
+   САМО ЧТЕНИЕ, а не каждый вызов: очередь инжекта опрашивается первой, иначе отдаём железный регистр.
+   Формат слова совпадает с железным ([9]=release, [8]=empty, [7:0]=scancode PS/2 set-2), так что декодер
+   и его отбрасывание префиксов 0xE0/0xF0 работают без изменений. Нужно для JTAG-КВМ (навигация по меню
+   из браузера) и для смоук-автотеста #31. */
+#define KINJ_N 32u
+static uint32_t g_kinj[KINJ_N];
+static volatile uint32_t g_kinj_r = 0, g_kinj_w = 0;
+/* v0.15.196: вернуть УЖЕ ВЫНУТЫЙ кадр клавиши обратно в поток. Нужно kbd_wait_byte: он вычерпывает
+   FIFO в поисках ответа устройства и раньше молча ВЫБРАСЫВАЛ всё остальное - то есть настоящие
+   нажатия и отпускания. Владелец: «намлок то с первого, то с третьего раза» - его же отпускание
+   съедалось ожиданием ACK, защёлка nl_held оставалась поднятой, и следующие нажатия не делали ничего. */
+static void kinj_push(uint32_t v){
+    if((g_kinj_w + 1u - g_kinj_r) > KINJ_N) return;      /* очередь полна: терять, но не затирать */
+    g_kinj[g_kinj_w % KINJ_N] = v & 0x2FFu;              /* [9]=отпускание, [7:0]=код (уже свёрнутый) */
+    g_kinj_w++;
+}
+static void kbd_inj_pump(void);   /* определена ниже: макросы мейлбокса объявлены дальше по файлу */
+/* v0.15.175 РАСШИРЕННЫЕ КЛАВИШИ (владелец: «цифровая часть завязана на навигатор, хочу свободно
+   назначать на джойстики»). В PS/2 set-2 стрелка вправо = E0 74, а numpad 6 = 74: раньше префикс E0
+   просто отбрасывался в шести местах, поэтому стрелка и цифровая клавиша приходили ОДНИМ кодом и
+   различить их было физически нельзя. Теперь префикс сворачивается ЗДЕСЬ - в единственной воронке,
+   через которую идут все потребители (макрос KBD_DATA): расширенная клавиша получает код | 0x80.
+   Следствие: стрелки/Home/End/PgUp/PgDn/Ins/Del = 0xF5/0xF2/0xEB/0xF4/0xEC/0xE9/0xF0/0xF1, а весь
+   цифровой блок остаётся «чистыми» кодами и свободен для назначения на джойстики.
+   Инжектированные слова (fs cmd 11 / КВМ) НЕ сворачиваются - хост присылает уже готовый код. */
+static int g_kbd_ext = 0;               /* видели E0: следующий код - расширенная клавиша */
+static void kbd_state_clear(void);      /* v0.15.192: тело ниже; нужно и запуску ROM, и flush */
+static XTime g_kbd_ext_t = 0;           /* v0.15.192: КОГДА видели - просроченный префикс не применяем */
+/* v0.15.192 ФАНТОМНЫЕ РАСШИРЕННЫЕ КЛАВИШИ = ЗАЛИПШИЙ START (владелец: "в танчиках и в другой игре
+   на экране номера уровня Start нажать уже не могу").
+   Механизм: флаг `g_kbd_ext` жил МЕЖДУ вызовами чтения без ограничения. Достаточно одного кадра E0,
+   съеденного не тем, кто прочитает следующий код (например `kbd_flush` вычерпал E0 последним перед
+   пустым FIFO), и следующая клавиша сворачивается в расширенную. Если так свернулось ОТПУСКАНИЕ Enter
+   (0x5A -> 0xDA), то в таблице `g_kd[0x5A]` остаётся 1 навсегда: для машины Start зажат вечно.
+   Игра проходит «дождись нажатия Start» мгновенно, а на «дождись отпускания» встаёт - и это не зависит
+   от игры, отсюда «и в другой игре тоже». Приборное подтверждение: в таблице зажатых висел именно
+   0xDA (расширенный 0x5A = Enter цифрового блока), которого никто не держал.
+   Кадры внутри одной последовательности PS/2 идут через ~1 мс, поэтому 50 мс - заведомо щедрый срок:
+   настоящую последовательность не разорвёт, а зависший флаг умрёт сам. */
+/* v0.15.200 / ядро CE28: у оболочки появился СВОЙ регистр диагностики PS/2 - машино-независимый.
+   Раньше эти числа брали из 0xB8, а он на NES занят отладкой памяти ядра: я на этом ошибся дважды
+   (эвристика v186 и «шторм resend»). Формат: {счётчик ответов[31:24], последний ответ[23:16],
+   ошибки чётности[15:0]}. Байты-ответы устройства (FA/AA/EE/FE) в поток скан-кодов больше не идут -
+   фабрика кладёт их сюда, а ждёт их только kbd_wait_byte. */
+#define PS2_DIAG    (*(volatile uint32_t*)(GP0+0x13C))
+#define JOYCAP_COOKED 0x8u        /* LOAD_CAPS бит3: фабрика отдаёт ГОТОВЫЙ кадр (бит10 = расширенная) */
+#define KBD_EXT_TTL (COUNTS_PER_SECOND/20u)     /* 50 мс */
+/* v0.15.194 ФАНТОМНЫЕ ЗАЖАТЫЕ КЛАВИШИ — ЗАКРЫТ КЛАСС, а не случай.
+   Приборно снято с платы 31.07 ДО всяких инжектов: в `g_kd` висели 0x75 (голый numpad 8),
+   0xF4 (расш. стрелка вправо), 0xFA (расш. PgDn) при ОТПУЩЕННОЙ клавиатуре, а `JOY_STATE` отдавал
+   машине «вправо» навечно. Механизм: у расширенных клавиш make = `E0 75`, break = `E0 F0 75`.
+   Срок годности выше спасает от ЗАВИСШЕГО флага, но сам же РВЁТ живую последовательность, если
+   главный цикл притормозил МЕЖДУ `E0` и кодом (захват кадра по JTAG тормозит его штатно —
+   так и накопились те три фантома): нажатие попадает в ОДИН вариант кода, отпускание — в ДРУГОЙ,
+   и первый остаётся зажат навсегда. Для игры это вечно зажатое направление, а если так застрянет Enter
+   (0x5A = Start) — игра мгновенно проходит «ждать нажатия Start» и встаёт на «ждать отпускания»:
+   именно так выглядело «Start нажать не могу» на экране номера уровня.
+   Лечение: пока флаг `E0` поднят, а FIFO пуст, ждём напарника ОГРАНИЧЕННО (кадр PS/2 на 12.5 кГц
+   идёт ~0.9 мс, берём 4 мс запаса) вместо немедленного возврата «пусто» — тогда последовательность
+   физически нельзя разорвать и срок годности перестаёт что-либо решать.
+   Чего ДЕЛАТЬ НЕЛЬЗЯ (разобрано и отвергнуто): чистить на отпускании ОБА варианта кода
+   (`c` и `c^0x80`). 0x75 и 0xF5 — РАЗНЫЕ физические клавиши (numpad-8 и стрелка), а у нас второй
+   игрок сидит на цифровом блоке, а первый на стрелках — отпускание у P2 гасило бы удержание у P1.
+   Архитектурно правильный шаг на потом: отдать признак «расширенная» из фабрики битом `KBD_DATA`
+   (там уже есть bit9 = отпускание) — вместе с отдельным регистром диагностики PS/2 для оболочки. */
+/* v0.15.195: окно было 4 мс — ПРИБОРНО МАЛО. Замер во время живой работы владельца клавиатурой:
+   ждали 45 раз, НЕ дождались 14 (31 %). Значит главный цикл притормаживает сильнее 4 мс каждый третий
+   раз, и это ровно «периодически клавиши срабатывают нечётко» (стрелки у владельца — расширенные,
+   то есть каждое их нажатие идёт через префикс). Ставим 15 мс и ЗАМЕРЯЕМ, сколько реально нужно
+   (g_kbd_extmax), чтобы следующий размер окна взять из данных, а не из головы. */
+#define KBD_EXT_WAIT (COUNTS_PER_SECOND/67u)    /* ~15 мс: ждём код после префикса, не больше */
+/* v0.15.200: если ядро умеет собирать кадр САМО (LOAD_CAPS бит3), вся программная возня с префиксами
+   ниже не нужна и не выполняется - фабрика отдаёт готовое {расширенная, отпускание, код}, и разорвать
+   последовательность нечем в принципе. Старый путь остаётся для ядер без этого бита (например ZX
+   B0064, пока он не пересобран) - поэтому признак ПЕРЕЧИТЫВАЕТСЯ после каждой смены ядра. */
+static int g_kbd_cooked = -1;           /* -1 = ещё не спрашивали у фабрики */
+/* телеметрия фикса (читается по JTAG): сколько раз ждали напарника, сколько раз НЕ дождались и
+   сколько микросекунд занял самый долгий УДАЧНЫЙ ожидание. g_kbd_extto > 0 = класс ещё не закрыт. */
+static volatile uint32_t g_kbd_extw   __attribute__((used)) = 0;
+static volatile uint32_t g_kbd_extto  __attribute__((used)) = 0;
+static volatile uint32_t g_kbd_extmax __attribute__((used)) = 0;   /* мкс */
+/* v0.15.195: байты-ОТВЕТЫ протокола PS/2 в потоке скан-кодов. Приборно: сразу после чистой загрузки,
+   когда НИКТО ничего не нажимал, в таблице зажатых висел 0xFA — а это ACK клавиатуры на команду хоста
+   (прошивка на старте сама шлёт «лампочки» kbd_leds_set). В set-2 make-коды заканчиваются на 0x83 (F7),
+   поэтому ГОЛЫЙ (не свёрнутый из E0) код >= 0x84 клавишей быть не может: это FA/AA/EE/FE или мусор.
+   Такой байт попадал в g_kd и висел «зажатым» вечно. Условие «голый» обязательно: расширенный 0x7A
+   (PgDn) после свёртки тоже даёт 0xFA — его выбрасывать нельзя. */
+static volatile uint32_t g_kbd_protdrop __attribute__((used)) = 0;
+/* v0.15.204 ФАЛЬШИВЫЙ SHIFT. Владелец: «назначаю клавишу на ВЛЕВО, меняется значение и у ВПРАВО».
+   Причина найдена и она в протоколе PS/2, а не в визарде: при ВКЛЮЧЁННОМ NumLock клавиатура посылает
+   перед каждой навигационной клавишей (стрелки, Ins/Del/Home/End/PgUp/PgDn) «фальшивый Shift»
+   `E0 12`, а при отпускании `E0 F0 12`. После свёртки это код 0x92 (и 0xD9 для правого Shift).
+   Захват в визарде возвращает ПЕРВЫЙ пришедший фронт - то есть записывал 0x92 вместо стрелки.
+   Назначил ВЛЕВО - записался 0x92; назначил ВПРАВО - тот же 0x92; оба поля показывают одно значение,
+   и это выглядит как «изменилось соседнее». Тот же 0x92 давно жил в таблице зажатых как фантом
+   (см. комментарий к kbd_state_clear).
+   Настоящей клавиши с кодом `E0 12` НЕ СУЩЕСТВУЕТ: реальный левый Shift - это голый 0x12. Поэтому
+   свёрнутые 0x92/0xD9 не клавиши вообще и наружу идти не должны - ни в таблицу зажатых, ни в визард,
+   ни в машину. Отбрасываем на входе, там же где байты-ответы устройства. */
+static volatile uint32_t g_kbd_fakeshift __attribute__((used)) = 0;
+/* v0.15.196: ОДИН читатель FIFO, ДВА потребителя. Байты-ответы забирает фильтр в kbd_data_read, но их
+   ждёт и kbd_wait_byte (ACK на команду лампочек). Поэтому фильтр не просто выбрасывает байт, а кладёт
+   его сюда, а kbd_wait_byte смотрит и в поток, и в этот ящик. 0x100 = ящик пуст. */
+static volatile uint32_t g_kbd_prot_last __attribute__((used)) = 0x100u;
+/* v0.15.197 ТРАССИРОВКА СЫРЫХ КАДРОВ PS/2 (читается по JTAG). Владелец приборно показал главное:
+   на цифровом блоке отклик хороший, на СТРЕЛКАХ залипания возвращаются. Стрелки идут через префикс
+   `E0`, а при включённом NumLock клавиатура добавляет вокруг них «фальшивый Shift» (`E0 12`), то есть
+   на одно нажатие 4-6 кадров вместо 1-2. Счётчики дали: 1440 ожиданий напарника, 698 таймаутов (48 %),
+   самое долгое УДАЧНОЕ ожидание 14.5 мс. Такой паузы между кадрами одной последовательности быть не
+   должно (кадр PS/2 ~0.9 мс), а FIFO её дать не может: pop защищён по empty, синхронизация 2 такта.
+   Значит кадр либо теряется в фабрике (`wr_en = ps2_strb & kce & ~ps2tx_busy` - во время передачи
+   хосту кадры НЕ пишутся), либо приходит совсем не так, как мы думаем. Кольцо пишет КАЖДЫЙ вынутый
+   кадр и КАЖДЫЙ таймаут вместе с паузой до него - по нему видно точную картину одного нажатия. */
+#define KTR_N 64
+static volatile uint32_t g_ktr[KTR_N] __attribute__((used)) = {0};
+static volatile uint32_t g_ktr_w __attribute__((used)) = 0;
+static XTime g_ktr_t = 0;
+/* слово: [31:16]=пауза до кадра в мкс (обрезано 65535), [10]=метка таймаута, [9]=отпускание, [7:0]=код */
+static inline void ktr(uint32_t v){
+    XTime now; XTime_GetTime(&now);
+    uint32_t dt = 0;
+    /* v0.15.205: шаг 10 мкс, а не 1 мкс. При шаге 1 мкс поле упиралось в 65 мс, и в разборе жалобы
+       про двух игроков вся временная картина превратилась в частокол «65535» - читать было нечего.
+       Теперь предел 655 мс, чего хватает и на тайпматик, и на паузу между нажатиями. */
+    if(g_ktr_t){ uint64_t d = (uint64_t)(now - g_ktr_t) * 100000ull / (uint64_t)COUNTS_PER_SECOND;
+                 dt = (d > 0xFFFFull) ? 0xFFFFu : (uint32_t)d; }
+    g_ktr_t = now;
+    g_ktr[g_ktr_w % KTR_N] = (dt << 16) | (v & 0x7FFu);
+    g_ktr_w++;
+}
+/* v0.15.195: длина прохода главного цикла (мкс). g_loop_gt4 - сколько раз проход был дольше 4 мс
+   (столько длилось прежнее окно ожидания префикса), g_loop_gt15 - дольше нового окна 15 мс. */
+static volatile uint32_t g_loop_max_us __attribute__((used)) = 0;
+static volatile uint32_t g_loop_gt4    __attribute__((used)) = 0;
+static volatile uint32_t g_loop_gt15   __attribute__((used)) = 0;
+static volatile uint32_t g_loop_n      __attribute__((used)) = 0;
+/* v0.15.198: сколько кадров пришлось вычерпать за один проход. Больше 1 = очередь копилась. */
+static volatile uint32_t g_kdrain_max __attribute__((used)) = 0;
+static inline uint32_t kbd_data_read(void){
+    for(;;){
+        if(g_kinj_r != g_kinj_w){ uint32_t v = g_kinj[g_kinj_r % KINJ_N]; g_kinj_r++; return v; }
+        kbd_inj_pump();             /* v0.15.166: обслужить инжект даже из модального ожидания клавиши */
+        if(g_kinj_r != g_kinj_w){ uint32_t v = g_kinj[g_kinj_r % KINJ_N]; g_kinj_r++; return v; }
+        if(g_kbd_cooked < 0) g_kbd_cooked = ((*(volatile uint32_t*)(GP0+0xC0)) & JOYCAP_COOKED) ? 1 : 0;
+        if(g_kbd_cooked){                             /* v200: кадр уже собран в фабрике */
+            uint32_t vc = KBD_DATA_HW;
+            if(vc & 0x100u) return vc;                /* FIFO пуст */
+            ktr(vc & 0x7FFu);
+            uint32_t cc = vc & 0xFFu;
+            if(vc & 0x400u){
+                if(cc == 0x12u || cc == 0x59u){ g_kbd_fakeshift++; continue; }   /* v204: фальшивый Shift */
+                if(cc < 0x80u) vc = (vc & ~0xFFu) | (cc | 0x80u);                /* расширенная -> код|0x80 */
+            }
+            return vc;
+        }
+        uint32_t v = KBD_DATA_HW;
+        if((v & 0x100u) && g_kbd_ext){                /* v194: не рвать `E0`+код — см. KBD_EXT_WAIT выше */
+            XTime t0, tn; XTime_GetTime(&t0);
+            g_kbd_extw++;
+            for(;;){
+                v = KBD_DATA_HW;
+                if(!(v & 0x100u)){                    /* напарник пришёл - запомним, сколько ждали */
+                    XTime_GetTime(&tn);
+                    uint32_t us = (uint32_t)(((uint64_t)(tn - t0) * 1000000ull) / (uint64_t)COUNTS_PER_SECOND);
+                    if(us > g_kbd_extmax) g_kbd_extmax = us;
+                    break;
+                }
+                XTime_GetTime(&tn);
+                if((uint64_t)(tn - t0) >= (uint64_t)KBD_EXT_WAIT){ g_kbd_extto++; ktr(0x400u); break; }
+            }
+        }
+        if(v & 0x100u) return v;                      /* FIFO пуст - ext сохраняем до следующего кадра */
+        ktr(v & 0x3FFu);                              /* v197: сырой кадр из FIFO, до всякой свёртки */
+        uint32_t code = v & 0xFFu;
+        if(code == 0xE0u){ g_kbd_ext = 1; XTime_GetTime(&g_kbd_ext_t); continue; } /* префикс расширенной клавиши */
+        if(code == 0xF0u){ continue; }                /* префикс отпускания: флаг уже в бите 9 */
+        if(code == 0xE1u){ g_kbd_ext = 0; return v; } /* v179 ФИКС: E1 отдаём наружу - на нём построен
+                                                         матчер клавиши Pause в главном цикле (pst=1),
+                                                         съедание E1 в v175 ломало Pause. */
+        if(g_kbd_ext){
+            XTime now; XTime_GetTime(&now);
+            int fresh = ((uint64_t)(now - g_kbd_ext_t) < (uint64_t)KBD_EXT_TTL);
+            g_kbd_ext = 0;
+            if(fresh && (code == 0x12u || code == 0x59u)){ g_kbd_fakeshift++; continue; }  /* v204 */
+            if(fresh && code < 0x80u) v = (v & ~0xFFu) | (code | 0x80u);   /* просроченный E0 игнорируем */
+        } else if(code >= 0x84u){          /* v195: ответ протокола (FA/AA/EE/FE) или мусор - НЕ клавиша */
+            g_kbd_protdrop++;
+            g_kbd_prot_last = code;        /* v196: но ACK нужен kbd_wait_byte - отдаём через ящик */
+            continue;                      /* в g_kd он лечь не должен: иначе висит «зажатым» навсегда */
+        }
+        return v;
+    }
+}
+#define KBD_DATA   kbd_data_read()
 #define KBD_STATUS (*(volatile uint32_t*)(GP0+0x58))  /* bit0 = FIFO empty */
 #define KBD_HB     (*(volatile uint32_t*)(GP0+0x5C))  /* any write = deadman heartbeat */
 #define KBD_TX     (*(volatile uint32_t*)(GP0+0xB0))  /* Step 15: W byte -> PS/2 host TX (LEDs/typematic/resend) */
@@ -73,12 +291,17 @@ unsigned player_progress(void);   /* 0..100 playback progress */
 #define MACHINE_CFG (*(volatile uint32_t*)(GP0+0xBC))  /* Step 15: bit0=Pentagon, bit1=48K, bit2=Sinclair ULA Late (48K/128K) */
 #define PENT_INT    (*(volatile uint32_t*)(GP0+0xC4))  /* Step 15: W {v[24:16], hc[8:0]} = Pentium INT position tuner */
 #define PAPER_H     (*(volatile uint32_t*)(GP0+0xC8))  /* live paper h start (left border) */
-#define PAPER_V     (*(volatile uint32_t*)(GP0+0xCC))  /* live paper v start (top border) */
-#define SCR_POS     (*(volatile uint32_t*)(GP0+0xD0))  /* live whole-frame HDMI position: {vmargin[15:0], hmargin[15:0]} (fb_line_disp) */
+#define PAPER_V     (*(volatile uint32_t*)(GP0+0xCC))
+#define ULA_TUNE_REG (*(volatile uint32_t*)(GP0+0x100))  /* B0156: live ULA timing, contention & border phase tuner */  /* live paper v start (top border) */
+#define SCR_POS     (*(volatile uint32_t*)(GP0+0xD0))
+#define SCR_SCALE   (*(volatile uint32_t*)(GP0+0x118)) /* CE21: live integer upscale {ymul[7:4], xmul[3:0]} - PER MACHINE */  /* live whole-frame HDMI position: {vmargin[15:0], hmargin[15:0]} (fb_line_disp) */
 #define CROP_A      (*(volatile uint32_t*)(GP0+0xD4))  /* live crop origin: {sy0[15:0], sx0[15:0]} (trims left/top) */
 #define CROP_B      (*(volatile uint32_t*)(GP0+0xD8))  /* live crop size:   {croph[15:0], cropw[15:0]} (trims right/bottom) */
 #define WARP_HOLD   (*(volatile uint32_t*)(GP0+0xDC))  /* Step 15: continuous-warp latch idle-release timeout in CPU T-states; 0 = hold warp until the ARM clears tape-run (EOT). 0 gives 100% 8x loads (the idle-release watchdog dropping the latch during long inter-block pauses was the last ~10% of failures). */
 #define SYNC_HOLD   (*(volatile uint32_t*)(GP0+0x1C))  /* Step 15: SYNC-loader (demand-tape) hysteretic-hold sustained-quiet FREEZE threshold in CPU T-states. Only active when SYNC is enabled. ~1024 (FUSE-like) freezes the tape fast enough during a loading-screen animation to stop over-run at 8x; the fabric reset default (16384) is too high (tape over-runs before it freezes). Deadlock-free: re-asserts on any port-0xFE read (raw CPU demand). */
+/* v0.15.234: веб-КВМ определён в net_kvm.c (подключён перед main), а команда 13 - выше по файлу. */
+static uint32_t net_init(void);   /* поднять сеть; 1 = слушаем, старший байт = код отказа */
+static void     net_poll(void);   /* Ethernet опросом из главного цикла, БЕЗ прерываний */
 #define MACHINE_ID (*(volatile uint32_t*)(GP0+0x60))  /* loaded-core identity ([15:0]=code) */
 /* Step 14: DDR-backed TRUE-COLOUR OSD (ARGB8888 canvas read by osd_ddr_rd over HP1; OSD_CTRL bit1=EN) */
 #define OSD_DDR_BASE (*(volatile uint32_t*)(GP0+0x94))  /* DDR byte address of the ARGB canvas */
@@ -88,13 +311,151 @@ unsigned player_progress(void);   /* 0..100 playback progress */
 #define TAPE_C_MORE 0x40u                              /* TAPE_CTRL bit6 = tape_more_data: ARM still delivering the tape -> a tail FIFO underrun FREEZES the CPU glitch-free (sampling_active has decayed at the tail; this keeps cpu_starve armed) instead of leaking a stale edge that hangs the turbo loader. Cleared at TRUE end-of-tape (ring drained) so the game runs. */
 #define TAPE_FIFO   (*(volatile uint32_t*)(GP0+0xA0))  /* push {level[31], duration[23:0] in T-states} */
 #define TAPE_STATUS (*(volatile uint32_t*)(GP0+0xA4))  /* bit0 = FIFO full, bit1 = playing, bit2 = byte_wait, bit3 = sampling_active */
-#define LOAD_CAPS_R (*(volatile uint32_t*)(GP0+0xC0))  /* capability mask: bit0 = JOY_STATE present (v0x4A) */
+/* capability mask (GP0+0xC0), read-only. bit0 = JOY_STATE present (v0x4A).
+   v0.15.176 ЗАДЕЛ ПОД АППАРАТНЫЙ ДЖОЙСТИК (владелец: "в будущем будет аппаратный джойстик, предусмотреть"):
+     bit1 = в фабрике есть физический порт 1,  bit2 = есть физический порт 2.
+   КОНТРАКТ, который делает железный пад drop-in: биты в JOY_STATE уже УНИФИЦИРОВАНЫ (CE22, одинаково для
+   всех ядер - 0=R 1=L 2=D 3=U 4=A/Fire 5=B 6=Select 7=Start), поэтому фабрика должна просто СЛОЖИТЬ
+   (OR) свои линии с половиной игрока из JOY_STATE в том же порядке: P1 -> [7:0], P2 -> [23:16].
+   ARM пишет регистр только при ИЗМЕНЕНИИ маски, так что OR в фабрике ничего не затирает и ARM
+   не воюет с железом. Пока bit1/bit2 не подняты, выбор источника в меню зажат на клавиатуру. */
+#define LOAD_CAPS_R (*(volatile uint32_t*)(GP0+0xC0))
+#define JOYCAP_PAD1 2u
+#define JOYCAP_PAD2 4u
 #define JOY_STATE   (*(volatile uint32_t*)(GP0+0x100)) /* generic pad @0x100 (0xC4 занят PENT_INT!): [15:0] p1, [31:16] p2 */
 /* v146 NES core control (only in the NES bitstream; axi_ctl ifdef NES_CORE). ROM streamed into the core BRAM. */
 #define NES_MAP0   (*(volatile uint32_t*)(GP0+0x104)) /* mapper_flags[31:0] */
 #define NES_MAP1   (*(volatile uint32_t*)(GP0+0x108)) /* mapper_flags[63:32] */
 #define NES_LD     (*(volatile uint32_t*)(GP0+0x10C)) /* W: one ROM byte -> BRAM @ current load addr, then addr++ */
 #define NES_LDCTL  (*(volatile uint32_t*)(GP0+0x110)) /* W: bit0 loading, bit1 sel(0=PRG/1=CHR), bit2 reset_nes pulse, bit3 rewind addr */
+/* B0071 ЗАЛИВКА ПЗУ МАШИНЫ С КАРТЫ (ядро ZX Atlas; у ядра без порта LOAD_CAPS бит4 = 0 и мы не льём).
+   ПЗУ в фабрике - 4 страницы по 16 КБ, КАНОНИЧЕСКАЯ раскладка задана НАМИ и одна для всех наборов:
+   0 = 128-меню, 1 = 48 BASIC, 2 = TR-DOS, 3 = сервисное. Порядок страниц в файле на карте другой
+   (у пентагоновских BIOS это [сервис, TR-DOS, 128, 48]), поэтому раскладывает страницы ARM - по
+   содержимому, а не по вере в порядок файла. Заводское ПЗУ живёт в битстриме ($readmemh) и
+   возвращается только перезагрузкой ядра через PCAP. */
+#define ROM_LD     (*(volatile uint32_t*)(GP0+0x154)) /* W: один байт ПЗУ по текущему адресу, затем addr++ */
+#define ROM_LDCTL  (*(volatile uint32_t*)(GP0+0x158)) /* W: bit0 loading (машина в СБРОСЕ), bit3 = адрес в начало */
+#define ROM_LDADDR (*(volatile uint32_t*)(GP0+0x15C)) /* RW: адрес заливки; чтение = {loading[16], addr[15:0]} */
+/* B0075 ДИСКОВОД (Beta Disk + WD1793 внутри ядра; сектора подаёт ARM с карты).
+   FDC_STAT: [31:24] секторов подано, [23] страница TR-DOS вставлена, [22] sd_ack, [21] DRQ,
+             [20] INTRQ, [19] busy, [18] prepare, [17] запрос ЗАПИСИ, [16] запрос ЧТЕНИЯ,
+             [13:3] LBA (512-байтовые блоки), [2:0] системный регистр #FF.
+   FDC_CTL:  [3:0] команда (1 = начать подачу сектора, 2 = сектор подан, 3 = образ вставлен),
+             [4] защита записи, [5] дискета готова, [8:6] size_code (1 = 16x256 = TRD),
+             [9] layout (0 = дорожка-сторона-сектор), [31:12] размер образа в байтах.
+   FDC_DATA: байт сектора (адрес в буфере контроллера считает фабрика). */
+#define FDC_STAT   (*(volatile uint32_t*)(GP0+0x160))
+#define FDC_CTL    (*(volatile uint32_t*)(GP0+0x164))
+#define FDC_DATA   (*(volatile uint32_t*)(GP0+0x168))
+#define FDC_STAT2  (*(volatile uint32_t*)(GP0+0x16C))
+#define GS_STAT    (*(volatile uint32_t*)(GP0+0x174))  /* R: B0108 {ovr7[31], ovr0[30], тоггл событий
+                                                          машины er7[28]/ev0[26], b7 машины[22],
+                                                          b0[21], байт от карты не забран[20],
+                                                          cmd[15:8], последний байт[7:0]} */
+#define GS_RQ      (*(volatile uint32_t*)(GP0+0x180))  /* R: B0108 очередь данных GS - {занятость[24:16],
+                                                          пусто[8], байт[7:0]}. Чтение ИЗВЛЕКАЕТ байт
+                                                          (как у клавиатурного FIFO), при пустой - нет. */
+/* 🥇 B0119 ПРИБОР ОБРАТНОГО ДАВЛЕНИЯ. Считаем ПОТЕРЯННЫЕ БАЙТЫ, а не эпизоды: эпизод не говорит
+   о размере ущерба, а у нас именно ущерб и надо знать (в приёмке B0118 было "7 эпизодов" - и ни
+   одного способа выяснить, семь это байт или семьсот). Отдельно - цена корректности: сколько раз
+   и на сколько тактов процессора пришлось придержать шину тактами ожидания. */
+#define GS_ST2_P   ((volatile uint32_t*)(GP0+0x194))   /* R: {потеряно БАЙТОВ[27:16], удержаний[11:0]} */
+#define GS_ST3_P   ((volatile uint32_t*)(GP0+0x198))   /* R: {сторож[31:30], тактов процессора,
+                                                             проведённых в ожидании[19:0]} */
+/* B0112 NEMO-IDE. Слово управления защёлкивает МАШИНА по тогглу записи, поэтому пишем его целиком:
+   [31:24] байт в буфер, [23:15] адрес в буфере, [14] строб записи, [13:6] регистр состояния ATA,
+   [5] «ARM владеет буфером» (машине отдаём BSY), [4] РАЗРЕШЕНИЕ интерфейса, [3:0] код ошибки.
+   v291 (ядро B0115): свободных БИТ в слове нет, но есть свободное СОСТОЯНИЕ - при снятом стробе
+   буфера ([14] = 0) поля адреса и данных не значат ничего, мы всегда пишем туда нули. Оно занято
+   ЗАПИСЬЮ РЕГИСТРА ATA со стороны ARM: [23:18] = маркер 101010, [17:15] = номер регистра (2 cnt,
+   3 lba0, 4 lba1, 5 lba2, 6 head), [31:24] = значение, и ОБЯЗАТЕЛЬНО [5] = 1. Владение буфером
+   здесь второй ключ, а не украшение: маркер 101010 - это адрес 336, то есть байты 336..343
+   ОБЫЧНОЙ заливки сектора дают ту же комбинацию [23:18], и отличал бы их один-единственный бит
+   [14]. Смаз битов между двумя соседними словами у нас измерен на железе, а заливку прошивка
+   всегда ведёт при [5] = 0 - значит два состояния расходятся двумя битами сразу. */
+#define NEMO_CTL   (*(volatile uint32_t*)(GP0+0x184))
+/* B0116 МЫШЬ KEMPSTON (v0.15.304). Слово защёлкивает МАШИНА по тогглу записи, поэтому пишем его
+   ЦЕЛИКОМ, как у NEMO-IDE: [31] мышь включена, [18:16] кнопки {средняя, правая, левая}, [15:8] Y,
+   [7:0] X. Чтение того же адреса возвращает записанное - без обратного чтения нечем доказать по
+   JTAG, что оболочка вообще шевелит мышь, а не что софт её не понимает. */
+#define KM_CTL     (*(volatile uint32_t*)(GP0+0x190))
+/* ---- DivMMC: карта SD в фабрике (sources/divmmc_card.v; индексы axi_ctl.v:392-394) --------- */
+#define DMMC_CTL   (*(volatile uint32_t*)(GP0+0x19C)) /* W: ЦЕЛОЕ слово режима и подтверждений (строб-тоггл) */
+#define DMMC_BUFA  (*(volatile uint32_t*)(GP0+0x1A0)) /* W: указатель в буфере; R: ЖИВОЙ указатель карты */
+#define DMMC_BUFW  (*(volatile uint32_t*)(GP0+0x1A4)) /* W: четыре байта {b3,b2,b1,b0}, указатель += 4 */
+#define DMMC_BUFR  (*(volatile uint32_t*)(GP0+0x1A8)) /* R: слово из буфера; САМО ЧТЕНИЕ двигает указатель */
+#define DMMC_STAT  (*(volatile uint32_t*)(GP0+0x1AC)) /* R: состояние и запросы */
+#define DMMC_LBA   (*(volatile uint32_t*)(GP0+0x1B0)) /* R: сектор запроса; достоверен ТОЛЬКО пока запрос поднят */
+#define DMMC_DBG   (*(volatile uint32_t*)(GP0+0x1B4)) /* R: счётчики команд/блоков/отказов */
+#define DMMC_CAP   (*(volatile uint32_t*)(GP0+0x1B8)) /* W: ёмкость в секторах; СВОЕГО строба нет - см. ниже */
+#define DMC_EN      0x00000001u
+#define DMC_WP      0x00000002u   /* том только на чтение: запрос записи к ARM не поднимается вовсе */
+#define DMC_CCS     0x00000004u   /* SDHC, адресация блоками. СНИМАТЬ НЕЛЬЗЯ: RTL не масштабирует адрес */
+#define DMC_FSMRST  0x00000008u   /* сброс протокола ПО СТРОБУ. В подтверждениях ВСЕГДА ноль */
+#define DMC_RSEQ(x) (((uint32_t)(x) & 3u) << 6)
+#define DMC_RDACK   0x00000100u
+#define DMC_RDERR   0x00000200u
+#define DMC_RBUF    0x00004000u
+#define DMC_FAST    0x00008000u   /* B0150: последний байт занятости после записи = 0x01 (esxDOS выходит из ожидания сразу) */
+#define DMS_RQ_RD   0x00000001u
+#define DMS_RQ_WR   0x00000002u
+#define DMS_SEQ(x)  (((x) >> 2) & 3u)
+#define DMS_RBUF(x) (((x) >> 4) & 1u)
+/* v0.15.397 подтверждение ЗАПИСИ - зеркало чтения; раскладка из divmmc_card.v:231-233. */
+#define DMC_WSEQ(x) (((uint32_t)(x) & 3u) << 10)
+#define DMC_WRACK   0x00001000u
+#define DMC_WRERR   0x00002000u
+#define DMB_RDA  0x000u
+#define DMB_RDB  0x200u
+#define DMB_WRA  0x400u   /* v0.15.397: сюда фабрика кладёт сектор, записанный МАШИНОЙ (B_WR) */
+#define DMB_CSD  0x600u
+#define DMB_CID  0x610u
+/* 🥇 РАСКЛАДКА СЧИТАНА С ЖЕЛЕЗА, А НЕ ИЗ НАМЕРЕНИЯ. В фабрике конкатенация вышла шириной 30 бит
+   (1+9+4+8+8), а присваивается 32-битному проводу - значит слева дописались два нуля и ВСЕ поля
+   уехали. Прибор показал `0x2000EC00` в момент, когда машина выдала IDENTIFY: строб оказался на
+   бите 29, а команда - на [15:8]. Читаем как есть; выравнивать поля в фабрике будем следующей
+   сборкой, заодно добавив туда полный LBA. */
+#define NEMO_STAT  (*(volatile uint32_t*)(GP0+0x188))  /* R: B0113 {строб[31], slave[30],
+                                                          адрес чтения[29:21], команда[15:8], LBA0[7:0]} */
+#define NEMO_STAT2 (*(volatile uint32_t*)(GP0+0x18C))  /* R: B0115 {head[31:24], LBA2, LBA1,
+                                                          счётчик секторов #50[7:0]}. До B0115 в
+                                                          младшем байте дублировался LBA0 (он и так
+                                                          есть в NEMO_STAT), а счётчик наружу не
+                                                          выходил вовсе - именно его читает 0x91 и
+                                                          по нему же проверяется наша запись. */
+#define AUD_PK     (*(volatile uint32_t*)(GP0+0x17C))  /* R: B0107 пики {ARM-нога[31:16], итоговый микс[15:0]}.
+                                                          Пик-метр 0x170 наполняет МАШИНА, а General Sound
+                                                          живёт на ARM и ни в один её слот не попадает. */
+#define GS_CTL     (*(volatile uint32_t*)(GP0+0x178))  /* W: B0107 ЗЕРКАЛО состояния эмулятора -
+                                                          {en[31], b7[30], b0[29], эхо тогглов
+                                                          er7[28]/ev7[27]/ev0[26], сброс липких[25],
+                                                          dout[7:0]} */  /* B0083 кольцо; B0089 в режиме вычитывания - байт буфера */
+#define FDC_RDMODE 0x00000800u   /* B0089 FDC_CTL бит11: строб FDC_DATA шагает адресом, не записывая */
+#define FDCS_RD    0x00010000u
+#define FDCS_WR    0x00020000u
+#define FDCS_TRDOS 0x00800000u
+#define FDC_LBA(v) (((v) >> 3) & 0x7FFu)
+#define ROM_LDCNT  (*(volatile uint32_t*)(GP0+0x144)) /* R: сколько байт ФАКТИЧЕСКИ легло в BRAM (факт, не намерение) */
+#define LOADCAP_ROM 0x10u                             /* LOAD_CAPS бит4: порт заливки ПЗУ есть */
+#define LOADCAP_DIVMMC 0x100u                         /* LOAD_CAPS бит8: в этом ядре ЕСТЬ DivMMC
+                                                         (карта + автомаппер). Ядра без него - NES и
+                                                         MiSTer-48; там опцию включать нечему. */
+#define LOADCAP_IDEREG 0x20u                          /* LOAD_CAPS бит5: ядро принимает запись
+                                                         регистров ATA от ARM (B0115 и новее) */
+#define LOADCAP_KMOUSE 0x40u                          /* LOAD_CAPS бит6: в ядре есть порты мыши
+                                                         Kempston (B0116 и новее). Кэш возможностей
+                                                         обязан умирать вместе со старым битстримом -
+                                                         см. fabric_reinit_after_reload. */
+#define LOADCAP_IDEDRQ 0x80u                          /* LOAD_CAPS бит7: DRQ ведёт ФАБРИКА (B0117):
+                                                         снимает его по факту вычерпывания блока и
+                                                         держит BSY, пока мы не подложим следующий.
+                                                         Бит нужен, чтобы знать, куда класть метку
+                                                         «блок последний»: на ядре без него тот же
+                                                         бит1 слова состояния уехал бы прямо в
+                                                         регистр состояния машины. */
+#define ROM_PG_SZ   16384u
+#define ROM_PG_N    4u
 #define SMP_CNT     (*(volatile uint32_t*)(GP0+0xB0))  /* R: raw port-FE read counter (smart-loader custom-loader rate classify) */
 #define AUDIO_CTRL  (*(volatile uint32_t*)(GP0+0x78))  /* bit0: 1=player mux->HDMI, 0=fabric/machine. Also owned by player.c; we drive it only while a tape loads (player is stopped then) */
 #define TAPE_HZ 3546900u   /* ZX128 T-state rate -> tape time in seconds = T_states / TAPE_HZ */
@@ -182,9 +543,184 @@ static int opt_region = 0;
 static int opt_palette = 0;
 #define opt_romtrap    (*(volatile int*)     (KMB+0x30u))   /* #65 ROM-trap enable - in the NC mailbox so JTAG toggles it COHERENTLY (was a cached static -> D-cache raced the poke, couldn't enable for testing) */
 #define opt_smartload  (*(volatile int*)     (KMB+0x34u))   /* SMART LOAD enable - MiSTer-style ARM byte-feeder: the ROM tape edge-loop is overridden in the fabric, the CPU spins on JR $ and demands each standard-ROM-loader byte via the TAPE_CTRL/TAPE_STATUS handshake (no pulses). NC mailbox so JTAG toggles it coherently, same as opt_romtrap. */
-#define g_dbg_ferate   (*(volatile uint32_t*)(KMB+0x38u))   /* DEBUG (NC): last FE-read count measured in a 0.5 s smart-classify window (JTAG-readable to tune the custom-loader threshold) */
+/* ---- КАРТА МЕЙЛБОКСА (собрана по ВСЕМУ файлу, а не по этому блоку) ----
+   0x00..0x3C  управление и опции (см. объявления выше)
+   0x40..0x73  ЖУРНАЛ ДИСКОВОДА: DISK_LOG_N (0x40) + 12 записей DISK_LOG(i) = 0x44+4i, объявлен
+               около строки 2659 - НЕ в этом блоке, из-за чего я дважды принял область за свободную
+   0x74/0x78   ТРАССА NEMO-IDE: сколько событий записано (0x74) и САМООПИСАНИЕ кольца
+               (0x78 = {записей[31:16], слов на запись[15:0]}) - хост берёт размеры оттуда,
+               а не зашивает их у себя. Само кольцо лежит на 0x3200, см. ниже
+   0x7C        свободно
+   0x80..0xBC  счётчик темпа ленты (0x80) и General Sound (0x84..0xBC, см. блок ниже)
+   0xC0..0xC4  очередь данных General Sound (занятость, потери)
+   0xC8..0xCC  переключения страниц GS и адрес его ОЗУ
+   0xD0..0xD8  регистры процессора карты и её рабочие ячейки
+   0xDC        NUMPG карты (её собственный замер памяти)
+   0xEC        сколько записей в трассе протокола GS (кольцо на 0x2800)
+   0xF0/0xF4   длина и контрольная сумма текущего потока к карте (сброс по #D1)
+   0x2800..0x2FFC  ТРАССА ПРОТОКОЛА GS: по слову на событие {тип[31:24], значение[7:0]},
+               тип 1 = команда от машины, 2 = байт данных, 3 = чтение машиной ответа.
+               Нужна, чтобы ПОВТОРИТЬ последовательность плеера на хостовом стенде.
+   0x3100/0x3140  кольцо трассировки BDI (по 12 слов), снимается командой мейлбокса 4
+   0x3200..0x51FC  ТРАССА NEMO-IDE (v294): 256 событий по 8 слов = 8 КБ. Пишется на КАЖДУЮ
+               команду машины, включая те, что мы считаем неинтересными, и включая обращения
+               к slave: фильтр прячет ровно ту команду, из-за которой софт и уходит в отказ.
+               Формат события расписан у объявления IDE_TRC. Обнуляется вставкой образа и
+               командой мейлбокса gs_ctl = 7
+   0xE0..0xE8  защёлкиваний сэмплов, громкости каналов, сами каналы
+   0xEC..0xF4  трасса GS и целостность потока к карте (см. строки выше) - строка «0xEC..0xFC
+               свободно» была ОШИБКОЙ карты: область занята с v276
+   0xF8/0xFC   NEMO-IDE: команд обслужено и последняя команда со своим LBA
+   0x5400..0x590C  пофазный секундомер главного цикла (v297, PH_M_*)
+   0x5A00..0x5A14  прибор темпа General Sound (v298, gs_m_*): средний и худший темп за окно,
+               сэмплы и слоты ЦАП, замирания, невыбранный догон
+   0x100       g_autodir, 0x180 g_autoname, 0x200 g_fs_path, 0x400 g_fs_path2, 0x800 g_fs_out
+   Перед тем как занять адрес, искать `KMB+0x` ПО ВСЕМУ ФАЙЛУ. */
+#define g_dbg_ferate   (*(volatile uint32_t*)(KMB+0x80u))   /* v255: было 0x38 (поверх opt_snow), потом
+                                                              0x40 (поверх журнала дисковода) - обе мои
+                                                              коллизии; 0x80 свободен по карте выше */   /* DEBUG (NC): last FE-read count measured in a 0.5 s smart-classify window (JTAG-readable to tune the custom-loader threshold) */
 #define opt_snow       (*(volatile int*)     (KMB+0x38u))   /* v145 ULA snow: 1=ON (faithful 128, default), 0=OFF (clean). Live via MACHINE_CFG bit4 (Atlas core only). */
 #define opt_ulalate    (*(volatile int*)     (KMB+0x3Cu))   /* Sinclair ULA phase: 0=Type 1/Early, 1=Type 2/Late; fixed NC address for JTAG tests */
+/* ---- General Sound (стоп-точка по скорости). Управление через мейлбокс: 1 = загрузить ПЗУ с
+   карты и сбросить, 2 = прогнать одну виртуальную секунду и замерить. Результат в 0x54/0x58. */
+#define gs_ctl         (*(volatile uint32_t*)(KMB+0x84u))
+#define gs_res_cyc     (*(volatile uint32_t*)(KMB+0x88u))
+#define gs_res_us      (*(volatile uint32_t*)(KMB+0x8Cu))
+#define gs_res_flg     (*(volatile uint32_t*)(KMB+0x90u))   /* бит0 = ПЗУ загружено */
+/* v261: диагностика эмулятора - живой ли он и что делает */
+#define gs_d_pc        (*(volatile uint32_t*)(KMB+0x94u))   /* PC процессора GS */
+#define gs_d_cyc       (*(volatile uint32_t*)(KMB+0x98u))   /* всего исполнено тактов */
+#define gs_d_cmdrd     (*(volatile uint32_t*)(KMB+0x9Cu))   /* сколько раз GS ЗАБРАЛ команду */
+/* v0.15.299: считаем ПРИНЯТЫЕ картой прерывания, а не выданные нами. Прежнее число росло всегда
+   (37 тыс/с) независимо от того, взяла их карта или сидела в DI, - то есть доказывало ровно ничего.
+   Рядом - сколько шагов прерывание пришлось ДЕРЖАТЬ на ноге: у Z80 INT это уровень, и раньше мы его
+   в такие моменты теряли (см. gs_run). */
+#define gs_d_int       (*(volatile uint32_t*)(KMB+0xA0u))   /* прерываний ПРИНЯТО картой */
+#define gs_d_intheld   (*(volatile uint32_t*)(KMB+0x5A20u)) /* шагов с удержанным прерыванием (карта в DI) */
+#define gs_d_bp2       (*(volatile uint32_t*)(KMB+0x5A24u)) /* B0119: {потеряно байт[31:16], удержаний[15:0]} */
+#define gs_d_bp3       (*(volatile uint32_t*)(KMB+0x5A28u)) /* B0119: {сторож[31:28], потеряно команд[27:24], тактов[23:0]} */
+/* v311, ПРИБОР К ГИПОТЕЗЕ ПРО NeoGS: {команд #AA[31:16], команд #55[15:0]}.
+   Загрузчик прошивки NeoGS (NGSLOAD) начинается с `OUT (#33),#80`, а сразу за ним шлёт в карту два
+   опознавательных байта - #55 и #AA - через ОБЫЧНЫЕ порты #B3/#BB, которые мы обслуживаем. Порт
+   #33 в фабрике не декодируется и без пересборки ядра невидим, а вот эта пара видна даром: если
+   софт пошёл дорогой загрузчика, счётчики вырастут. Ноль на живом прогоне = дорогой загрузчика
+   софт НЕ шёл, и ссылаться на отсутствие #33 как на причину зависания нельзя. */
+#define gs_d_ngs       (*(volatile uint32_t*)(KMB+0x5A2Cu))
+/* v317: худший интервал между фактическими чтениями GS из четырёх окон сэмплов за последнюю
+   восьмую секунды. Это не underrun ARM FIFO: прибор находится внутри Z80 и видит свежесть каналов. */
+#define gs_d_lgap      (*(volatile uint32_t*)(KMB+0x5A30u)) /* виртуальных тактов GS */
+#define gs_d_lgpc      (*(volatile uint32_t*)(KMB+0x5A34u)) /* {PC прошлого latch, PC нового latch} */
+#define gs_d_lgpos0    (*(volatile uint32_t*)(KMB+0x5A38u)) /* 0x415A..0x415D до разрыва */
+#define gs_d_lgpos1    (*(volatile uint32_t*)(KMB+0x5A3Cu)) /* 0x415A..0x415D после разрыва */
+#define gs_d_lgirq     (*(volatile uint32_t*)(KMB+0x5A40u)) /* {held[15:0], accepted[15:0]} */
+#define gs_d_modpos    (*(volatile uint32_t*)(KMB+0x5A44u)) /* живые MTPATPS/MTSNGPS/... */
+#define gs_d_lgseq     (*(volatile uint32_t*)(KMB+0x5A48u)) /* номер опубликованного окна */
+/* v318: автономная липкая копия худшего окна. Во время прослушивания JTAG не работает вообще;
+   после теста хост делает одно чтение этих слов и не крадёт реальное время у ARM-аудионасоса. */
+#define gs_s_lgap      (*(volatile uint32_t*)(KMB+0x5A4Cu))
+#define gs_s_lgpc      (*(volatile uint32_t*)(KMB+0x5A50u))
+#define gs_s_lgpos0    (*(volatile uint32_t*)(KMB+0x5A54u))
+#define gs_s_lgpos1    (*(volatile uint32_t*)(KMB+0x5A58u))
+#define gs_s_lgirq     (*(volatile uint32_t*)(KMB+0x5A5Cu))
+#define gs_s_lgseq     (*(volatile uint32_t*)(KMB+0x5A60u))
+/* ==== v0.15.332 ПРИБОР «ГДЕ КАРТА ТЕРЯЕТ ЗВУК» ====
+   Считает исполнения ключевых мест ПРОШИВКИ КАРТЫ (адреса сняты сканом assets_gs105b.rom по
+   сигнатурам исходников gs105b, см. блок в gs_arm.c):
+     HSEND  - карта ждёт, пока машина ЗАБЕРЁТ байт ответа; главный цикл карты в это время СТОИТ
+              и не зовёт ENGINE, то есть кольцо квантов (54.6 мс звука) не пополняется;
+     QTFAULT- кольцо опустело, прерывание вернулось БЕЗ EI: защёлкиваний нет, ЦАП держит уровень;
+     QTPLAY - проигрывание возобновлено (IM 1 / EI).
+   🥇 Само по себе попадание в QTFAULT НОРМАЛЬНО (на хостовом стенде без опроса вовсе - 58 раз в
+   секунду), поэтому вердикт выносится не по счётчику, а по ДЛИНЕ дыры: сколько сэмплов ЦАП прошло
+   между QTFAULT и QTPLAY. Делить на 47.996 - получатся миллисекунды.
+   Замер снимается ДВАЖДЫ: при играющей игре (ZYNAP) и при работающем Z-Player. */
+#define gs_d2_hsend    (*(volatile uint32_t*)(KMB+0x5A64u)) /* оборотов ожидания HSEND (34 такта Z80 каждый) */
+#define gs_d2_hget     (*(volatile uint32_t*)(KMB+0x5A68u)) /* оборотов ожидания HGET */
+#define gs_d2_htail    (*(volatile uint32_t*)(KMB+0x5A6Cu)) /* оборотов ожидания HTAIL2 */
+#define gs_d2_qtf      (*(volatile uint32_t*)(KMB+0x5A70u)) /* входов в QTFAULT */
+#define gs_d2_qtp      (*(volatile uint32_t*)(KMB+0x5A74u)) /* входов в QTPLAY */
+#define gs_d2_holes    (*(volatile uint32_t*)(KMB+0x5A78u)) /* сколько дыр всего */
+#define gs_d2_holemax  (*(volatile uint32_t*)(KMB+0x5A7Cu)) /* САМАЯ ДЛИННАЯ дыра, сэмплов ЦАП */
+#define gs_d2_holesum  (*(volatile uint32_t*)(KMB+0x5A80u)) /* суммарно сэмплов в дырах */
+#define gs_d2_smpout   (*(volatile uint32_t*)(KMB+0x5A84u)) /* сэмплов выдано всего - знаменатель */
+#define gs_d2_ctl      (*(volatile uint32_t*)(KMB+0x5A88u)) /* запись 1 = обнулить счётчики */
+#define gs_d_acc       (*(volatile uint32_t*)(KMB+0xA4u))   /* команд машины, увиденных насосом */
+/* v265: приборы для рукопожатия и звука. Без них потеря байта была НЕВИДИМА, а «музыку рабочей
+   объявлять нельзя без положительного отсчёта» - правило владельца. */
+#define gs_d_dat       (*(volatile uint32_t*)(KMB+0xA8u))   /* байтов данных от машины принято */
+#define gs_d_rd        (*(volatile uint32_t*)(KMB+0xACu))   /* чтений #B3 машиной увидено */
+#define gs_d_ovr       (*(volatile uint32_t*)(KMB+0xB0u))   /* липкие переполнения ловушки {ovr7, ovr0} */
+#define gs_d_smp       (*(volatile uint32_t*)(KMB+0xB4u))   /* сэмплов отдано в звуковой тракт */
+#define gs_d_pk        (*(volatile uint32_t*)(KMB+0xB8u))   /* последнее слово пик-метра 0x17C */
+#define gs_d_pass      (*(volatile uint32_t*)(KMB+0xBCu))   /* проходов насоса */
+#define gs_d_inq       (*(volatile uint32_t*)(KMB+0xC0u))   /* B0108: {занятость очереди ARM[31:16], фабрики[15:0]} */
+#define gs_d_drop      (*(volatile uint32_t*)(KMB+0xC4u))   /* B0108: байтов потеряно НАШЕЙ стороной (должно быть 0) */
+#define gs_d_pgsel     (*(volatile uint32_t*)(KMB+0xC8u))   /* v269: переключений страницы картой (порт 0) */
+#define gs_d_rambase   (*(volatile uint32_t*)(KMB+0xCCu))   /* v269: адрес ОЗУ карты в DDR (по JTAG НЕ читать - кэш) */
+#define gs_d_bcde      (*(volatile uint32_t*)(KMB+0xD0u))   /* v270: {B,C,D,E} процессора карты */
+#define gs_d_ahl       (*(volatile uint32_t*)(KMB+0xD4u))   /* v270: {A,H,L,страница} */
+#define gs_d_ram19B    (*(volatile uint32_t*)(KMB+0xD8u))   /* v270: ячейки прошивки 0x419B..0x419E
+                                                              (SMPS: адрес и СТРАНИЦА начала сэмплов) */
+#define gs_d_latch     (*(volatile uint32_t*)(KMB+0xE0u))   /* v272: защёлкиваний сэмплов (окно 0x6000) */
+#define gs_d_vols      (*(volatile uint32_t*)(KMB+0xE4u))   /* v272: {vol4,vol3,vol2,vol1} - их ставит МОДУЛЬ */
+#define gs_d_chans     (*(volatile uint32_t*)(KMB+0xE8u))   /* v272: сами защёлкнутые сэмплы каналов */
+#define gs_d_trc_n     (*(volatile uint32_t*)(KMB+0xECu))   /* v276: событий записано в трассу */
+/* v278: ЦЕЛОСТНОСТЬ ПОТОКА. На плате мы приняли 22182 байта модуля, а файл на диске - 22234.
+   Разница в полсотни байт объясняет и молчание: разбор модуля внутри карты уезжает. Считаем длину
+   и контрольную сумму КАЖДОГО потока (сброс по #D1) - их можно сверить с эталоном на хостовом
+   стенде побайтно. Липкие биты ловят только переполнение очереди в ПЛИС, а этот прибор ловит
+   потерю на всём пути от машины до эмулятора. */
+#define gs_d_stream_n  (*(volatile uint32_t*)(KMB+0xF0u))   /* байтов в текущем потоке */
+#define gs_d_stream_s  (*(volatile uint32_t*)(KMB+0xF4u))   /* их сумма (простая, но ловит и порядок) */
+/* 🥇 v0.15.298 ЧЕСТНЫЙ ПРИБОР ТЕМПА КАРТЫ (он же виден в оболочке: Options > Machine > GS speed).
+   Мерить «мгновенную» скорость эмуляции бессмысленно: она рваная по своей природе - карту двигает
+   главный цикл, а он то отрисовывает навигатор, то читает сектор. Прибор считает КОНЕЧНЫЙ
+   результат: сколько сэмплов карта реально отдала в звук. Окно - секунда, разбитая на восемь долей
+   по 1/8 с; наружу идёт и средний темп за окно, и ХУДШАЯ доля (провалы иначе усредняются в ничто).
+   Мегагерцы пересчитываются из сэмплов, а не измеряются отдельно: 47996 сэмплов в секунду = 12 МГц
+   ровно, поэтому доля от номинала и есть доля от 12 МГц. Единица - десятые доли мегагерца. */
+#define gs_m_avg10     (*(volatile uint32_t*)(KMB+0x5A00u)) /* средний темп за окно 1 с, 0.1 МГц */
+#define gs_m_min10     (*(volatile uint32_t*)(KMB+0x5A04u)) /* худшая доля окна (1/8 с), 0.1 МГц */
+#define gs_m_smp       (*(volatile uint32_t*)(KMB+0x5A08u)) /* сэмплов ушло в звук за окно */
+#define gs_m_slots     (*(volatile uint32_t*)(KMB+0x5A0Cu)) /* слотов ЦАП за окно (номинал 47996) */
+#define gs_m_gaps      (*(volatile uint32_t*)(KMB+0x5A10u)) /* замираний за окно / всего: {окно<<16|всего} */
+#define gs_m_debt      (*(volatile uint32_t*)(KMB+0x5A14u)) /* невыбранный догон, тактов Z80 */
+/* v0.15.299: ещё два числа, без которых прибор врал по-крупному.
+   1) ЗАПРОСОВ В СЕКУНДУ - сколько раз машина спросила у карты состояние (#20..#2F, #60..#6F).
+      Именно этот поток даёт окно трекера, и без него «музыка рвётся» и «музыка идёт чисто»
+      выглядят одинаково: остальные показания в обоих случаях те же.
+   2) ХУДШАЯ ДОЛЯ ЗА ВСЁ ВРЕМЯ, а не только за текущее окно: провал раз в полминуты из окна в
+      секунду уходит бесследно, а слышно именно его. Обнуляется вместе с прибором. */
+#define gs_m_poll      (*(volatile uint32_t*)(KMB+0x5A18u)) /* запросов состояния за окно */
+#define gs_m_min10w    (*(volatile uint32_t*)(KMB+0x5A1Cu)) /* худшая 1/8 с ЗА ВСЁ ВРЕМЯ, 0.1 МГц */
+/* v282 ПРИБОР ПО ДИСКОВОДУ: снять кольцо трассировки BDI. Кольцо в фабрике хранит 12 последних
+   обращений машины двумя словами: `{счётчик, чтение/запись, адрес порта, PC}` и `{данные, ПОСЛЕДНЯЯ
+   КОМАНДА, дорожка, сектор}`. Выбор записи идёт через FDC_CTL, где в том же слове живут готовность
+   привода и размер образа, поэтому писать туда вслепую нельзя - берём сохранённое значение `g_fdc_lv`.
+   Нужно, чтобы ответить на вопрос «какую команду софт вообще выдаёт» без гадания: сейчас - про
+   READ TRACK у Z-Player, дальше - на IDE и DivMMC. */
+#define disk_ring0     ((volatile uint32_t*)(KMB+0x3100u))  /* 12 слов: счётчик, rw, порт, PC */
+#define disk_ring1     ((volatile uint32_t*)(KMB+0x3140u))  /* 12 слов: данные, команда, дорожка, сектор */
+#define GS_TRC         ((volatile uint32_t*) (KMB+0x2800u)) /* v276: кольцо трассы, 512 записей */
+/* v0.15.391: счётчики по КОДУ команды - 256 слов, 0x4000..0x43FF мейлбокса (диапазон свободен:
+   занято 0x2800 трасса, 0x30F0..0x32xx диск/IDE, 0x5400+ секундомер и приборы GS). Кольцо трассы
+   отвечает «в каком порядке», а эта таблица - «сколько раз и чем вообще пользовались», и её поток
+   опросов не смывает. Плюс два общих счётчика: байт данных и байт ответов. */
+#define GS_CMDCNT      ((volatile uint32_t*) (KMB+0x4000u))  /* [код команды] -> сколько раз */
+#define gs_d_datn      (*(volatile uint32_t*)(KMB+0x4400u))  /* всего байт данных в карту */
+#define gs_d_rspn      (*(volatile uint32_t*)(KMB+0x4404u))  /* всего байт ответов машине */
+/* 🥇 v0.15.392 ВЫКЛЮЧАТЕЛЬ ТРАССЫ. Ноль (умолчание) = ни одной записи в некэшируемую память из
+   горячего цикла карты. Единица = полная трасса для разбора. Прибор, который меняет поведение
+   измеряемого, обязан быть отключаемым - за это правило заплачено ровно этим случаем. */
+#define gs_trc_en      (*(volatile uint32_t*)(KMB+0x4408u))  /* бит0 трасса, бит1 снимок данных */
+#define gs_d_capn      (*(volatile uint32_t*)(KMB+0x440Cu))  /* снято байт данных в FS_BUF */
+#define GS_TRC_N       512u
+#define gs_d_numpg     (*(volatile uint32_t*)(KMB+0xDCu))   /* v271: {NUMPG, CPAGE, SYSTEM, SDPAGE} =
+                                                              0x4080.. Число страниц ОЗУ, КОТОРОЕ
+                                                              КАРТА НАМЕРИЛА САМА. Цикл пересчёта
+                                                              сэмплов берёт B = NUMPG - страница
+                                                              начала, и при NUMPG=0 это 253 страницы
+                                                              вместо 12 - те самые 20 с ожидания. */
 #define g_autodir      ((volatile char*)     (KMB+0x100u))  /* was char[96]  */
 #define g_autoname     ((volatile char*)     (KMB+0x180u))  /* was char[64]  */
 #define g_fs_path      ((volatile char*)     (KMB+0x200u))  /* was char[256] */
@@ -197,30 +733,30 @@ static int opt_palette = 0;
 #define SC_F5   0x03u
 #define SC_F12  0x07u
 #define SC_ESC  0x76u
-#define SC_UP    0x75u   /* PS/2 set-2: cursor up (E0-prefix stripped by ARM) / numpad 8 */
-#define SC_DOWN  0x72u   /* cursor down / numpad 2 */
+#define SC_UP    0xF5u   /* v175: E0 75 -> 0xF5 (numpad 8 остаётся 0x75) */
+#define SC_DOWN  0xF2u   /* v175: E0 72 -> 0xF2 (numpad 2 = 0x72) */
 #define SC_ENTER 0x5Au
 #define SC_SPACE 0x29u   /* PS/2 set-2 Space: player pause/resume (while OSD open) */
 #define SC_F2    0x06u   /* PS/2 set-2 F2: cycle the music play mode (FOLDER / REPEAT-1 / REPEAT-ALL) */
 #define SC_F3    0x04u   /* PS/2 set-2 F3: cycle the browser sort mode (only while browsing) */
 #define SC_F4    0x0Cu   /* Ctrl+F4 = sort by extension (DN sort hotkey) */
 #define SC_F9    0x01u   /* PS/2 set-2 F9: open/close the options (settings) menu */
-#define SC_LEFT  0x6Bu   /* cursor left  (E0 prefix stripped by ARM) / numpad 4 */
-#define SC_RIGHT 0x74u   /* cursor right (E0 prefix stripped by ARM) / numpad 6 */
-#define SC_PGUP  0x7Du   /* Page Up   (E0 7D, prefix stripped) / numpad 9 - page scroll in the browser */
-#define SC_PGDN  0x7Au   /* Page Down (E0 7A, prefix stripped) / numpad 3 */
+#define SC_LEFT  0xEBu   /* v175: E0 6B -> 0xEB (numpad 4 = 0x6B) */
+#define SC_RIGHT 0xF4u   /* v175: E0 74 -> 0xF4 (numpad 6 = 0x74) */
+#define SC_PGUP  0xFDu   /* v175: E0 7D -> 0xFD (numpad 9 = 0x7D) */
+#define SC_PGDN  0xFAu   /* v175: E0 7A -> 0xFA (numpad 3 = 0x7A) */
 #define SC_BACKSPACE 0x66u /* PS/2 set-2 Backspace: stop the player */
 #define SC_F10   0x09u   /* Step 13.1 Pause bring-up fallback (not in the ZX matrix) */
 #define SC_F8    0x0Au   /* Step 14: toggle the DDR-RGB true-colour OSD window (OSD_CTRL bit1) */
 #define SC_F6    0x0Bu   /* F6: rename / move */
 #define SC_F7    0x83u   /* F7: make directory (mkdir) */
-#define SC_INS   0x70u   /* Insert (E0 70, prefix stripped): tag/untag current entry (= Space) */
+#define SC_INS   0xF0u   /* v175: E0 70 -> 0xF0 (numpad 0 = 0x70) */
 #define SC_F11   0x78u   /* hard reset (fabric-decoded); ARM taps it to mark the loaded app STOPPED */
 #define SC_KPPLUS  0x79u /* numpad + : volume up   (conflict-free; ZX has no numpad) */
 #define SC_KPMINUS 0x7Bu /* numpad - : volume down */
 #define SC_KPMUL   0x7Cu /* numpad * : Shift = invert selection */
-#define SC_HOME    0x6Cu /* Home (E0 6C, prefix stripped) */
-#define SC_END     0x69u /* End (E0 69, prefix stripped) */
+#define SC_HOME    0xECu   /* v175: E0 6C -> 0xEC (numpad 7 = 0x6C) */
+#define SC_END     0xE9u   /* v175: E0 69 -> 0xE9 (numpad 1 = 0x69) */
 
 /* ZX Spectrum 8x8 system font, chars 32..127, extracted from rom128.hex @ 0x7D00 */
 static const uint8_t zxfont[96][8] = {
@@ -456,8 +992,34 @@ static uint32_t g_dn_alpha = 0xCCu;   /* OSD background opacity (0x00..0xFF; adj
 #define DNK_FLD_FG   FG(15)    /* white field text */
 enum { BX_H=0xCD,BX_V=0xBA,BX_TL=0xC9,BX_TR=0xBB,BX_BL=0xC8,BX_BR=0xBC,BX_LT=0xCC,BX_RT=0xB9,BX_TT=0xCB,BX_BT=0xCA,
        SL_H=0xC4,SL_V=0xB3,SL_TL=0xDA,SL_TR=0xBF,SL_BL=0xC0,SL_BR=0xD9, SH_L=0xB0,SH_M=0xB1,SH_D=0xB2,BLK_=0xDB };
+/* 🥇 КЛИП КАК СВОЙСТВО ОКНА (жалоба владельца 12.08, ПОВТОРНАЯ: «надпись вылазит за пределы окна
+   диалога... сделай, чтобы этого никогда не происходило, ни в каком диалоговом окне»).
+   Корень был в том, что dn_puts обрезал строку по краю ЭКРАНА (DN_COLS), а про окно не знал НИКТО
+   из восемнадцати диалогов. Каждое окно считало ширину само, кто во что горазд, и каждое новое
+   нарушало правило заново - потому жалоба и повторяется: в v0.15.182 чинили ОДНУ строку визарда,
+   укоротив литерал, а не примитив.
+   Теперь правило лежит в САМОМ НИЖНЕМ месте: прямоугольник вывода со стеком, и проверка прямо
+   здесь, в dn_putc. Нарушить его стало физически нельзя - ни dn_puts, ни dn_putsn, ни dn_radio,
+   ни dn_button, ни dn_fill не могут нарисовать за рамку, что бы им ни передал вызывающий.
+   Стек нужен, потому что окна вкладываются (три слота BoxSave), а полный клип - потому что строка
+   состояния, строка подсказок и панель рисуются НИЖЕ модального окна и обязаны это уметь. */
+typedef struct { int l, t, r, b; } DnClip;          /* включительно, в клетках */
+static DnClip   g_clip_stk[4];
+static int      g_clip_sp = 0;                       /* 0 = клипа нет, режем только по канве */
+static unsigned g_txt_clip = 0;                      /* сколько клеток текста реально отрезано */
+static void clip_push(int l,int t,int r,int b){
+    if(g_clip_sp < 4){ g_clip_stk[g_clip_sp].l=l; g_clip_stk[g_clip_sp].t=t;
+                       g_clip_stk[g_clip_sp].r=r; g_clip_stk[g_clip_sp].b=b; }
+    g_clip_sp++;                                     /* считаем и переполнение - утечка видна по счётчику */
+}
+static void clip_push_full(void){ clip_push(0,0,DN_COLS-1,DN_ROWS-1); }
+static void clip_pop(void){ if(g_clip_sp > 0) g_clip_sp--; }
 static void dn_putc(int cx,int cy,unsigned code,uint32_t fg,uint32_t bg){
     if(cx<0||cy<0||cx>=DN_COLS||cy>=DN_ROWS) return;
+    if(g_clip_sp > 0 && g_clip_sp <= 4){
+        const DnClip* k = &g_clip_stk[g_clip_sp-1];
+        if(cx < k->l || cx > k->r || cy < k->t || cy > k->b){ g_txt_clip++; return; }
+    }
     const unsigned char* g=vga866[code&0xFFu];
     for(int r=0;r<16;r++){ unsigned char bits=g[r]; int qy=cy*16+r;
         for(int c=0;c<8;c++) g_osdc[qy*OSDC_W + cx*8+c] = (bits&(0x80u>>c))?fg:bg; }
@@ -466,6 +1028,17 @@ static void dn_puts(int cx,int cy,const char* s,uint32_t fg,uint32_t bg){
     for(; *s && cx<DN_COLS; s++,cx++) dn_putc(cx,cy,(unsigned char)*s,fg,bg); }
 static void dn_putsn(int cx,int cy,const char* s,int maxc,uint32_t fg,uint32_t bg){
     for(int i=0;*s&&i<maxc&&cx<DN_COLS;s++,i++,cx++) dn_putc(cx,cy,(unsigned char)*s,fg,bg); }
+/* Обрезка ВИДИМАЯ, а не молчаливая: владелец не должен гадать, так файл называется или хвост
+   отрезан. Для мест, где прокрутке взяться неоткуда - строка подсказок, баннер, строка состояния. */
+static void dn_putsn_ell(int cx,int cy,const char* s,int maxc,uint32_t fg,uint32_t bg){
+    int len=0; while(s[len]) len++;
+    if(maxc <= 0) return;
+    if(len <= maxc){ dn_putsn(cx,cy,s,maxc,fg,bg); return; }
+    g_txt_clip++;
+    if(maxc < 6){ for(int i=0;i<maxc;i++) dn_putc(cx+i,cy,'.',fg,bg); return; }
+    dn_putsn(cx,cy,s,maxc-3,fg,bg);
+    for(int i=0;i<3;i++) dn_putc(cx+maxc-3+i,cy,'.',fg,bg);
+}
 static void dn_fill(int cx,int cy,int cw,int chh,uint32_t bg){
     for(int y=0;y<chh;y++) for(int x=0;x<cw;x++) dn_putc(cx+x,cy+y,' ',bg,bg); }
 static void dn_hpx(int x0,int x1,int y,uint32_t c){ if(y<0||y>=OSDC_H)return; for(int x=x0;x<=x1;x++) if(x>=0&&x<OSDC_W) g_osdc[y*OSDC_W+x]=c; }
@@ -614,11 +1187,39 @@ static void titlebar(void){ for(int y=0;y<8;y++) for(int w=0;w<OSD_WPR;w++) osdb
 static void draw_title(const char* s){   titlebar(); g_inv=1; draw_text(2,0,1,s); g_inv=0; }
 static void draw_title_c(const char* s){ titlebar(); int x0=(OSD_W-slen(s)*8)/2; if(x0<0)x0=0; g_inv=1; draw_text(x0,0,1,s); g_inv=0; }
 static int browser_on;   /* tentative decl (defined with the other view flags below); needed by the early status helpers */
+/* 🥇 v0.15.305 СООБЩЕНИЕ, КОТОРОЕ ОБЯЗАНО ПЕРЕЖИТЬ ПЕРЕРИСОВКУ. Причина: результат заливки ПЗУ
+   печатается в конце rom_reapply_and_reset, а сразу за ним закрывается меню - menubar_exec делает
+   ПОЛНУЮ перерисовку навигатора (render_browser -> dn_draw_list -> dn_draw_status), и строка
+   «ROM SET + TR-DOS: …» жила доли секунды. Владелец видел сброс машины и НИ СЛОВА о том, что легло.
+   Поэтому у строки состояния появилось «удержание»: сообщение запоминается и его возвращает на место
+   КАЖДАЯ перерисовка, пока не истечёт окно. Окно, а не «до следующего нажатия»: перерисовку делает и
+   тик музыки, и движение курсора, то есть по событиям сообщение снималось бы тем же самым способом,
+   от которого мы его и защищаем. Любое НОВОЕ сообщение старое снимает - свежая правда важнее. */
+/* 🥇 v0.15.386: было 64. С v384 g_rom_msg вырос до 72, и сообщение длиннее 63 знаков жило
+   ПОЛНЫМ ровно до первой перерисовки, а дальше возвращалось УДЕРЖАННОЙ обрезкой. Строка состояния
+   всё равно шириной DN_COLS-2 = 78, поэтому 80 - это «сколько вообще может быть видно». */
+static char  g_hold_msg[80] = "";
+static XTime g_hold_t = 0;
+#define STATUS_HOLD_S 6u                     /* сколько секунд удержанное сообщение переживает перерисовки */
 static void dn_status_msg(const char* s){   /* centred transient on the DN status row (22); the next status tick / list redraw repaints */
-    if(!s) return;
+    if(!s || g_modal_level > 0) return;   /* ревью: выпадашка НЕ блокирует, см. g_status_force */
+    /* 🥇 РИСОВАНИЕ ВНЕ ОКНА. Строка состояния (22) и строка подсказок (24) живут НИЖЕ любого
+       модального окна и обязаны рисоваться при открытом диалоге - клип интерьера срезал бы их
+       молча. Поднимаем полный клип на время своей работы. Ставим ПОСЛЕ раннего возврата, чтобы
+       стек не перекосило. */
+    clip_push_full();
+    g_hold_msg[0] = 0;                      /* новое сообщение отменяет удержанное: врать старым нельзя */
     dn_fill(1,22,DN_COLS-2,1,DNK_PANEL_BG);
     int l=slen(s), x=(DN_COLS-l)/2; if(x<1) x=1;
     dn_puts(x,22,s,DNK_HEADER,DNK_PANEL_BG);
+    clip_pop();
+}
+static void dn_status_hold(const char* s){   /* то же самое, но переживает полную перерисовку навигатора */
+    if(!s || !s[0]) return;
+    dn_status_msg(s);
+    int i=0; for(; s[i] && i<(int)sizeof(g_hold_msg)-1; i++) g_hold_msg[i]=s[i];
+    g_hold_msg[i]=0;
+    XTime_GetTime(&g_hold_t);
 }
 static void browser_status(const char* s){   /* transient feedback (MOUNT/READ/F2 mode): DN status row when the browser is up, else legacy 1bpp title bar */
     if(browser_on){ dn_status_msg(s); return; }
@@ -628,14 +1229,25 @@ static void browser_status(const char* s){   /* transient feedback (MOUNT/READ/F
 /* Title screen (shown when the OSD opens with F12): just the name, centred, scale 2. */
 /* Firmware build tag shown on the F12 splash (bump per milestone). The PL core VERSION
    (0x4000_0000) is shown live too, so the splash states exactly which firmware + bitstream run. */
-#define BULB_FW "v0.15.149"
+#define BULB_FW "v0.15.432"
 static char hexnib(uint32_t v){ return (v<10) ? ('0'+v) : ('A'+v-10); }
 /* Single source of truth for the version line ("v0.13 core 0xB01B0013"): the ARM firmware tag
    BULB_FW + the live PL core VERSION read from register 0x00. Used by BOTH the F12 splash
    (show_header) and the F1 help page (show_help), so the two can never drift apart. */
-static void version_str(char* out){                   /* firmware version vX.Y.Z only - the core ID never changes build-to-build, so it's dropped */
+/* v0.15.230: прошивка И ЖИВОЕ ЯДРО. Раньше здесь была только версия прошивки с пометкой «core ID
+   never changes build-to-build» - это НЕВЕРНО: регистр VERSION меняется на КАЖДОЙ сборке RTL
+   (за один день B0086 -> B0087 -> B0088 -> B0089 -> B0090), и по экрану нельзя было понять, какой
+   битстрим живой. Показываем младшие 16 бит: старшие 0xB01B постоянны и места не стоят.
+   Читаем регистр КАЖДЫЙ раз, а не кэшируем: ядро меняется на ходу (PCAP-перезагрузка, смена
+   машины), и закэшированное значение врало бы ровно в тот момент, когда важно. */
+static void version_str(char* out){
     int p=0; const char* fw = BULB_FW;
     while(*fw) out[p++]=*fw++;
+    out[p++]=' '; out[p++]='/'; out[p++]=' ';      /* формат по просьбе владельца: «v0.15.230 / b0090» */
+    { uint32_t v = REG_VERSION; const char* hx = "0123456789abcdef";
+      out[p++]='b';
+      out[p++]=hx[(v>>12)&15]; out[p++]=hx[(v>>8)&15];
+      out[p++]=hx[(v>>4)&15];  out[p++]=hx[v&15]; }
     out[p]=0;
 }
 static void show_header(void){
@@ -679,49 +1291,468 @@ static int g_kb_shift = 0; /* Shift held (upper-case + symbols for text entry) -
    физических входов нет, арбитраж придёт с ними. OSD открыт -> джойстик обнулён (клавиши идут
    меню). Противоположные направления гасятся попарно (грабля Zelda-II класса). */
 static uint8_t g_kd[256];           /* fwd: определена ниже (единая таблица нажатий, kbd_note) */
+static XTime   g_kd_t[256];         /* fwd (то же tentative-объявление): время последнего нажатия */
 /* v0.15.138 JOYMAP этап 2: все 8 бит Kempston (000FUDLR + расширенные Fire2/3/bit7) назначаемы
    интерактивно. g_joymap[b] = PS/2 make-код клавиши на бит b (0 = не назначено). Дефолт QAOP+Space+M.
    Порядок бит фиксирован протоколом JOY_STATE: 0=R 1=L 2=D 3=U 4=Fire 5=Fire2 6=Fire3 7=bit7. */
 /* v0.15.146 2 ИГРОКА: g_joymap[player][bit]. JOY_STATE = P1 | (P2<<16); ядро читает [7:0]=P1, [23:16]=P2.
    Работает и для ZX Kempston (биты 0-4 = R/L/D/U/Fire) И для NES/Денди (все 8 = R/L/D/U/A/B/Select/Start).
    Дефолты: P1 = QAOP+Space+M (правая рука); P2 = IJKL+Enter (не пересекается с P1). */
-static const uint8_t JOYDEF[8]  = {0x4D,0x44,0x1C,0x15,0x29,0x3A,0,0}; /* P1: R=P L=O D=A U=Q Fire=Spc Fire2=M */
-static const uint8_t JOYDEF2[8] = {0x4B,0x3B,0x42,0x43,0x5A,0,0,0};    /* P2: R=L L=J D=K U=I Fire=Enter */
-static const char* const JOYBTN[8] = {"RIGHT","LEFT","DOWN","UP","FIRE","FIRE 2","FIRE 3","BIT 7"};
-static uint8_t  g_joymap[2][8] = {{0x4D,0x44,0x1C,0x15,0x29,0x3A,0,0},{0x4B,0x3B,0x42,0x43,0x5A,0,0,0}};
+/* v0.15.174 (owner: "mapping per machine - for the Spectrum that is the Kempston map, for the Dendy
+   BOTH pads"; "it has to be universal and uniform in how the config is stored").
+   The bit NUMBER is now identical on every core - CE22 taught nes_wrap.v the platform order, so:
+        bit0=RIGHT 1=LEFT 2=DOWN 3=UP 4=A/FIRE 5=B/FIRE2 6=SELECT/FIRE3 7=START
+   Before CE22 the NES read the same byte as A,B,Select,Start,Up,Down,Left,Right, so every label below
+   lied AND the SOCD cancel of pairs (0,1)/(2,3) killed "A+B" and "Select+Start" instead of opposite
+   directions. Only the LABELS differ per machine now, and the map itself lives in the machine's own
+   parameter set (g_mp[].joy) exactly like paper/crop/screen - one store, one ini section per machine.
+   PLAYERS is per machine too: Kempston is a SINGLE port (0x1F) and both our ZX cores feed it joy1|joy2
+   (atlas_core/main.v:495, mister48_core.sv:231), so a second ZX player would just duplicate the first -
+   real 2-player on a Spectrum needs Sinclair Interface 2 (keyboard matrix), which is a separate job. */
+static const char* const JOYBTN_ZX [8] = {"RIGHT","LEFT","DOWN","UP","FIRE","FIRE 2","FIRE 3","BIT 7"};
+static const char* const JOYBTN_NES[8] = {"RIGHT","LEFT","DOWN","UP","A","B","SELECT","START"};
+/* ZX has one Kempston port.  NES keeps its two independent pads. */
+static const int MACHINE_PLAYERS[5]    = {1,1,1,1,2};
+static uint8_t  g_joymap[2][8];        /* LIVE map of the CURRENT machine (loaded from g_mp[].joy) */
 static int      g_joyp = 0;                  /* wizard: current player being edited (0=P1, 1=P2) */
+static int      opt_numjoy = 0;              /* v176 VIEW: NumPad as joystick у текущей машины */
+static int      opt_jsrc1  = 0, opt_jsrc2 = 0;   /* v176 VIEW: источник игрока 1 / 2 */
 static uint32_t g_joy_last = 0xFFFFFFFFu;
-static void joymap_eval(void){
-    static int cap = -1;
-    if(cap < 0) cap = (LOAD_CAPS_R & 1u) ? 1 : 0;
-    if(!cap) return;
-    uint32_t m = 0;
-    if(!osd_on && !browser_on){
-        uint32_t m1=0, m2=0;
-        for(int b=0;b<8;b++){
-            if(g_joymap[0][b] && g_kd[g_joymap[0][b]]) m1 |= 1u<<b;
-            if(g_joymap[1][b] && g_kd[g_joymap[1][b]]) m2 |= 1u<<b;
-        }
-        if((m1&3u)==3u) m1 &= ~3u;  if((m1&12u)==12u) m1 &= ~12u;   /* P1 SOCD (R+L, U+D) */
-        if((m2&3u)==3u) m2 &= ~3u;  if((m2&12u)==12u) m2 &= ~12u;   /* P2 SOCD */
-        m = m1 | (m2 << 16);        /* JOY_STATE two-player layout */
+static int is_numpad(uint32_t c);   /* fwd (тело ниже): v180 - джойстик тоже уважает переключатель */
+/* v0.15.304 МЫШЬ KEMPSTON. Опция машины: 0 OFF / 1 ON (порты есть, но руки нет - под будущую
+   настоящую мышь PS/2) / 2 KEYPAD (мышь водит цифровой блок). Тела - ниже, рядом с is_numpad;
+   здесь только объявления, потому что владельца цифрового блока обязан спрашивать уже joy_key_down. */
+static int opt_kmouse = 0;
+/* Предварительное (tentative) определение - тот же приём, что у g_kd/g_kd_t выше: кэш последнего
+   отданного фабрике слова нужен уже в mp_load (смена машины меняет разрешение мыши), а тело службы
+   стоит ниже, рядом с is_numpad. Инициализатор - там, здесь только имя. */
+static uint32_t g_km_last;
+static int kmouse_owns_numpad(void);
+/* v0.15.180: NumLock - НАСТОЯЩИЙ переключатель владельца цифрового блока (владелец: "либо отдана
+   цифровая часть джойстикам, либо навигатору"). В v176 он гейтил только оболочку, а джойстик держал
+   numpad-привязки всегда - значит блок принадлежал ОБОИМ. Теперь симметрично:
+     numjoy=1 -> цифровой блок работает ТОЛЬКО как джойстик (оболочка и диалоги его не видят);
+     numjoy=0 -> цифровой блок работает ТОЛЬКО в оболочке (громкость/выделение), джойстик его игнорирует.
+   Привязки при этом НЕ теряются - они остаются в карте машины и оживают обратным переключением. */
+/* v0.15.206 ПРОТИВОПОЛОЖНЫЕ НАПРАВЛЕНИЯ - ТЕПЕРЬ ВЫБОР ВЛАДЕЛЬЦА, А НЕ НАША ВЫДУМКА.
+   Вопрос владельца (и он прав): на стандартном джойстике можно ли было нажать все направления сразу
+   и пользовался ли этим код игр?
+   Как на самом деле: крестовина оригинального пада NES - одна резиновая качалка на четырёх контактах,
+   и строго противоположные направления не даёт нажать сама механика. Но ЭЛЕКТРИЧЕСКИ в сдвиговом
+   регистре четыре независимых бита, и «влево+вправо» вполне выразимо: так умеют сторонние пады,
+   аркадные стики, адаптеры и TAS-прогоны, на таких сочетаниях построены известные глитчи. У Кемпстона
+   на Спектруме биты тоже независимы. То есть ЛЮБОЕ наше преобразование - это ложь машине.
+   Гашение попарно ставили не ради достоверности, а как обход конкретной грабли (класс Zelda II:
+   удержание влево+вправо ломает поведение персонажа). Настоящей же причиной «направление умерло»
+   были ПОТЕРЯННЫЕ ОТПУСКАНИЯ, и их источники вычищены отдельно (фальшивый Shift, байты-ответы
+   протокола, разрыв последовательности префикса - кадр теперь собирает фабрика).
+   Поэтому по умолчанию НЕ ПРЕОБРАЗУЕМ ВООБЩЕ, а обход оставляем переключателем на случай игры,
+   которой он нужен. */
+static const char* const CH_SOCD[] = {"AS PRESSED","LAST WINS","CANCEL BOTH"};
+static int opt_socd = 0;             /* VIEW текущей машины: 0 = как нажато (достоверно) */
+static XTime kd_when(uint8_t c){ return (c && g_kd[c]) ? g_kd_t[c] : (XTime)0; }
+static uint32_t socd_apply(uint32_t m, const uint8_t* map){
+    if(opt_socd == 0) return m;                       /* достоверно: отдаём ровно то, что нажато */
+    if(opt_socd == 2){                                /* старое поведение: гасить оба */
+        if((m & 3u) == 3u)   m &= ~3u;
+        if((m & 12u) == 12u) m &= ~12u;
+        return m;
     }
+    if((m & 3u) == 3u){                                /* побеждает нажатое позже */
+        m &= ~3u;  m |= (kd_when(map[0]) >= kd_when(map[1])) ? 1u : 2u;
+    }
+    if((m & 12u) == 12u){
+        m &= ~12u; m |= (kd_when(map[2]) >= kd_when(map[3])) ? 4u : 8u;
+    }
+    return m;
+}
+static int joy_key_down(uint8_t c){
+    if(!c) return 0;
+    /* v0.15.304: у цифрового блока по-прежнему РОВНО ОДИН владелец, просто претендентов стало три -
+       оболочка, джойстик и мышь. Мышь старше джойстика не по капризу: её раскладка ЖЁСТКАЯ (8/2/4/6
+       и диагонали - иначе это не мышь), а джойстик у нас полностью переназначаемый, и владелец
+       может увести его на любые другие клавиши. Обратное правило оставило бы мышь без клавиш вовсе. */
+    if(is_numpad(c) && (!opt_numjoy || kmouse_owns_numpad())) return 0;
+    return g_kd[c] ? 1 : 0;
+}
+static int g_joy_cap = -1;   /* v174: LOAD_CAPS bit0, re-read on every core change (was a function-local
+                                static read ONCE for the whole run, so after a pl_reload the joystick could
+                                stay silently disabled - or enabled - for the rest of the session). */
+/* ==== v0.15.199 ТИП ДЖОЙСТИКА У ZX (задача A очереди) ============================================
+   Kempston - это ОДИН порт 0x1F, и оба наших ZX-ядра кладут в него joy1|joy2 (atlas_core/main.v:495,
+   mister48_core.sv:231). Значит второй игрок на Kempston физически невозможен: он просто дублирует
+   первого. На настоящем Спектруме второй игрок жил не в порту, а В КЛАВИАТУРНОЙ МАТРИЦЕ - интерфейсы
+   Sinclair и Cursor нажимают обычные цифровые клавиши. У нас для этого уже есть готовый тракт:
+   `KBD_INJECT` (0xA8) кладёт клавишу прямо в матрицу гостя, минуя гейт OSD. Поэтому вся задача
+   решается в ARM, без синтеза, и сразу даёт двух игроков.
+     Sinclair 1 (правый):  6=влево 7=вправо 8=вниз 9=вверх 0=огонь
+     Sinclair 2 (левый):   1=влево 2=вправо 3=вниз 4=вверх 5=огонь
+     Cursor (Protek/AGF):  5=влево 6=вниз 7=вверх 8=вправо 0=огонь
+   Дефолт для ZX: игрок 1 - Kempston (как было), игрок 2 - Sinclair 2. Регрессии нет: до этой правки
+   второй игрок ТОЛЬКО дублировал первого в том же порту, теперь он настоящий. */
+static const char* const CH_JTYPE[] = {"KEMPSTON","SINCLAIR 1","SINCLAIR 2","CURSOR"};
+static int opt_jtype1 = 0, opt_jtype2 = 0;          /* VIEW текущей машины (меню правит их) */
+/* v0.15.207 НАБОР ПЗУ (задача владельца 03.08: «ром у нас весь от 128к спектрума»). Список строится
+   ОБХОДОМ 0:/ROMS/ при каждом входе в подменю машины: пункт меню - обычный ITEM_CHOICE, но его
+   choices/nchoices подставляются в рантайме (opt_items не const, рендер разыменовывает их каждый раз).
+   Элемент 0 всегда "BUILT-IN" = ПЗУ, вшитое в битстрим; оно и есть фолбэк, если файла нет. */
+/* 🥇 v0.15.384 ПРЕДЕЛ БЫЛ МЕНЬШЕ, ЧЕМ ФАЙЛОВ НА КАРТЕ. В 0:/ROMS/ лежит 18 файлов, а цикл обхода
+   (romset_scan) молча обрывался на ROMSET_MAX=15 - трёх последних владелец не видел вовсе и понять
+   этого из интерфейса не мог. Цена подъёма до 31 - 868 байт на имена, лишний элемент в конце - под
+   набор, ВЫБРАННЫЙ ВНЕ 0:/ROMS/ (см. romset_rescan_sync). */
+#define ROMSET_MAX   31                        /* + BUILT-IN + внешний путь = 33 элемента списка */
+#define ROMSET_NAMEL 28
+#define ROMSET_PATHL 96                        /* v384: набор можно выбрать ЛЮБЫМ путём, не только имя в ROMS */
+static char        g_rs_buf[ROMSET_MAX][ROMSET_NAMEL];
+static const char* g_rs_name[ROMSET_MAX+2] = { "BUILT-IN" };
+static uint8_t     g_rs_pages[ROMSET_MAX+2] = { 0 };   /* v302: сколько страниц по 16 КБ в файле списка */
+static uint8_t     g_rs_kind[ROMSET_MAX+2]  = { 0 };   /* v305: тип ПЕРВОЙ страницы файла (см. rom_page_kind;
+                                                          3 = ПЗУ Спектрума без наших подписей) */
+static char        g_rs_extra[ROMSET_PATHL] = "";      /* v384: последний элемент списка - набор вне 0:/ROMS/ */
+static int         g_rs_n = 1;                 /* сколько пунктов в списке (минимум один - BUILT-IN) */
+static int         opt_romset = 0;             /* VIEW текущей машины: индекс в g_rs_name */
+/* v0.15.302 ЯВНЫЕ СЛОТЫ ПЗУ (жалоба владельца: «одиночное ПЗУ на 16 КБ вообще не грузится» и «надо
+   более простое, очевидное переключение банков»). Раньше единственной единицей выбора был НАБОР
+   целиком, а одиночный файл уезжал в слот ПО ПОДПИСИ - то есть FATAL, у которого нет ни одной из
+   наших подписей, попадал в слот 3 (сервисный), а сервисная страница без настоящей магической
+   кнопки недостижима. Теперь у каждой из ЧЕТЫРЁХ страниц свой пункт меню и свой ключ ini, и в любую
+   можно положить любой файл на 16 КБ из 0:/ROMS/.
+     g_mp[m].rom[s]  - ЧТО НАЗНАЧЕНО в слот (имя файла, "" = взять из набора / оставить заводское);
+     g_pg_file[s]    - ЧТО РЕАЛЬНО ЛЕГЛО в страницу после заливки (для показа: интерфейс не врёт);
+     g_slot_disp[s]  - строка, которую рисует меню (указывает в одно из двух выше). */
+static char        g_pg_file[ROM_PG_N][ROMSET_NAMEL] = {{0}};
+static const char* g_slot_disp[ROM_PG_N] = { "(BUILT-IN)","(BUILT-IN)","(BUILT-IN)","(BUILT-IN)" };
+/* v0.15.303: 1 = в СТАРТОВОЙ странице сейчас лежит КОПИЯ чужого слота (пункт «Boot machine from»).
+   Без этой памяти возврат в AUTO физически ничего не менял: заливка пропускает страницу, у которой
+   нет источника, поэтому копия оставалась в BRAM - машина продолжала стартовать с чужого ПЗУ, а
+   меню показывало AUTO. Признак и говорит заливке, что страницу надо ВЕРНУТЬ себе. */
+static int         g_boot_alien = 0;
+static int         g_slot_zero = 0;            /* значение для пунктов-слотов: у них ОДИН вариант,
+                                                  а работа делается модальным выбором файла */
+static int         opt_rombus = 0;             /* VIEW машины: 0 AUTO, 1..4 = стартовать со слота 0..3 */
+static int         g_rom_loaded = 0;           /* 1 = в фабрике лежит НЕ заводское ПЗУ (вернуть = pl_reload) */
+static int         g_trdos_ok = 0;             /* 1 = в залитом наборе есть страница TR-DOS -> трап включаем */
+static int         g_svc_ok   = 0;             /* 1 = в залитом наборе есть СЕРВИСНАЯ страница (слот 3) */
+/* v0.15.388: 1 = в сервисной странице стоит МЕХАНИЗМ входа штатного BIOS - поле из 12 нулей по
+   0x3FF0..0x3FFB и вход 0x3FFC = DI; JP (F3 C3). Проверен по пяти наборам с живых пентагонов: есть
+   ровно у FATALL и Proteus, у Gluk/PGCLASSC там FF (их вход - NMI, это опция SERVICE ROM = NMI).
+   Признак МЕХАНИЗМА, а не имени менеджера: список знакомых программ устарел бы на шестом. */
+static int         g_svc_entry = 0;
+static int         opt_svcrom = 0;             /* VIEW машины: 0 OFF / 1 NMI (магическая кнопка) / 2 ALWAYS */
+/* 🥇 v0.15.388 СТРАНИЦА ПЗУ ПОД TR-DOS (ядро B0146). У настоящего Пентагона-1024 с 64-КБ BIOS
+   блок ПЗУ выбирает ПАРА {~DOS, 7FFD[4]}, поэтому сброс бита 4 порта #7FFD при вставленном TR-DOS
+   переключает окно на СЕРВИСНУЮ страницу - этим штатные BIOS входят в свой файловый менеджер
+   (FATALL, Proteus). У нас до B0146 под защёлкой стояла страница TR-DOS безусловно, и такие наборы
+   выглядели как «не грузятся». Спорное - в переключатель: у двухстраничных наборов и у заводского
+   ПЗУ битстрима слота 3 нет вовсе, и тот же сброс увёл бы окно в незаписанную BRAM. */
+static int         opt_dossvc = 1;             /* v388: 0 OFF / 1 AUTO / 2 ON (см. apply_dossvc) */
+static int         opt_saa    = 0;             /* v217: SAA1099 на #FF - 0 AUTO / 1 ON / 2 OFF (см. apply_saa) */
+static int         opt_gs     = 0;             /* v265: General Sound - 0 OFF / 1 ON (см. apply_gs) */
+static int         opt_ide    = 1;             /* v283: NEMO-IDE - 0 OFF / 1 ON.
+                                                  🥇 v0.15.300 ВКЛЮЧЁН ПО УМОЛЧАНИЮ. Владелец: «з-плейер
+                                                  не видит немоиде» - «а должен». Винчестер у нас такая же
+                                                  штатная часть машины, как дисковод, и требовать вставлять
+                                                  образ руками на каждом старте значит прятать готовую фичу.
+                                                  Живое значение всё равно приходит из профиля машины
+                                                  (mp_load), поэтому настоящий дефолт стоит в g_mp[] перед
+                                                  config_load; эта строка - страховка до его загрузки. */
+static int         opt_divmmc = 0;             /* v0.15.327: DivMMC OFF/ON */
+static int         opt_dmmode = 0;             /* v0.15.327: 0 FOLDER / 1 IMAGE */
+static int         opt_zc = 0;                 /* v350: Z-Controller (#77/#57) - другой транспорт к той же карте */
+static int         opt_zcmode = 0;             /* v379: 0 FOLDER / 1 IMAGE */
+static int         opt_zcfat32 = 1;            /* v379: 0 FAT16 / 1 FAT32 (default 1 for ZC) */
+static int         opt_zcroot = 0;
+static int         opt_zcturbo = 1;            /* v382: 1 Turbo 28MHz / 0 Standard 3.5MHz */             /* v379: 0 2048 / 1 512 */
+static int         opt_dmroot = 0;             /* v355: 0 = 2048 записей корня (esxDOS), 1 = 512 (LFN-браузер) */
+/* v0.15.397 запись на карту: 0 OFF / 1 только ОБРАЗ / 2 образ и папка (папка - шаг 2, пока
+   отвергается вслух, чтобы переключатель уже был, а поведение включилось после стенда).
+   Умолчание 1: образ писать безопасно - его служебные структуры принадлежат ему самому. */
+/* v0.15.409 ЗАПИСЬ НА КАРТУ - У КАЖДОГО ТРАНСПОРТА СВОЙ ВЫКЛЮЧАТЕЛЬ (решение владельца).
+   0 = только чтение, 1 = машина пишет в смонтированный ОБРАЗ. Умолчание 0 у обоих: запись на карту
+   включается осознанно. Носитель у транспортов ОДИН (один движок SPI и одна модель карты в
+   фабрике), поэтому при ДВУХ включённых транспортах действует более строгий из двух - см.
+   `card_write_ok`, а интерфейс это помечает. Папочного тома в значениях нет: `divmmc_fs_write`
+   написан, но не выверен, а значение, которое молча отказывает, хуже отсутствующего. */
+static int         opt_dmwr = 0;               /* DivMMC / esxDOS */
+static int         opt_zcwr = 0;               /* Z-Controller (KOE) */
+/* v0.15.427 БЫСТРОЕ ПОДТВЕРЖДЕНИЕ ЗАПИСИ (ядро B0150). esxDOS 0.8.9 ждёт конца занятости карты
+   циклом «читать до байта ≠ 0xFF, не более 12 800 раз»; по спеке SD такого байта нет, и цикл всегда
+   доходит до таймаута - 132 мс на КАЖДЫЙ записанный сектор, `.mkdir` (256 секторов нулей) - 35 с.
+   При 1 карта отдаёт последним байтом занятости 0x01 - драйвер выходит сразу. Отход от буквы спеки,
+   поэтому опция; умолчание ВКЛ - байт принимают esxDOS, KOE («ждать ≠0») и NedoOS («ждать ≠FF»). */
+static int         opt_dmfast = 1;
+static int         opt_dmfat32 = 1;            /* v359: 0 = FAT16, 1 = FAT32.
+                                                  🥇 v0.15.390 УМОЛЧАНИЕ СТАЛО FAT32 (решение владельца).
+                                                  FAT16 был выбран по НАШЕЙ простоте, а не по требованию
+                                                  софта, и трижды выставил цену: предел записей корня,
+                                                  невидимость тома для чужих FAT32-драйверов (Wild Player,
+                                                  Z-Player), и вис FATALL 0.25 из ПЗУ на поиске свободного
+                                                  кластера. На FAT32 esxDOS читает ФС наравне с FAT16
+                                                  (замер 19.08: 53 команды / 42 чтения против 51/40).
+                                                  FAT16 остаётся ОПЦИЕЙ ради LFN-браузера Bob Fossil: он
+                                                  разбирает FAT сам и требует RootEntCnt РОВНО 512, а у
+                                                  FAT32 этого поля нет вовсе. */
+static int         opt_idedev = 0;             /* v292: устройства на шине - 0 MASTER / 1 MASTER+SLAVE.
+                                                  Второго образа прошивка ещё не обслуживает (на slave
+                                                  фабрика честно отвечает «устройства нет»), поэтому
+                                                  пункт живёт с ОДНИМ значением - см. ide_slave_present.
+                                                  Показать «MASTER+SLAVE» без второго образа = соврать. */
+static int         opt_ramsize = 3;           /* v0.15.314: ОБЪЁМ ОЗУ МАШИНЫ - индекс в CH_RAMSIZE
+                                                  (0 128К / 1 256К / 2 512К / 3 1024К). В ядро уходит
+                                                  через RAMSIZE_CFG в MACHINE_CFG [15:14]. Дефолт -
+                                                  1024К, то есть прежнее поведение Пентагона. */
+static int         opt_gsram  = 1;             /* v281: ОЗУ карты - 0 128К / 1 512К / 2 1М / 3 2М (v299) */
+static int         opt_gsclk  = 2;             /* v336: частота карты GS - индекс CH_GSCLK (2 = 18 МГц) */
+static char        g_rom_msg[72] = "";         /* что показать в статусе после заливки (успех/причина отказа) */
+/* 🥇 v0.15.384 ПРЕДУПРЕЖДЕНИЕ ЖИВЁТ ОТДЕЛЬНО ОТ СООБЩЕНИЯ. Оплачено молчанием: «ROM SET HAS NO 128
+   MENU» писалось в тот же g_rom_msg, а через двадцать строк его затирала строка успеха «ROM SET:
+   <имя>» - владелец видел успех там, где страница НЕ ЛЕГЛА и в ней осталось прежнее содержимое BRAM.
+   Теперь заливка складывает оговорки сюда, а печать выбирает: есть предупреждение - показываем ЕГО. */
+static char        g_rom_warn[72] = "";
+/* v0.15.208 ДИСКОВОД: образ держим ОТКРЫТЫМ - сектор просят в темпе работы TR-DOS, открывать файл
+   на каждый сектор было бы и медленно, и опасно (FatFs не реентерабелен). Пока только ЧТЕНИЕ. */
+/* v220: одиночные g_disk/g_disk_open/g_disk_name/g_disk_size УБРАНЫ - состояние теперь
+   пер-приводное (g_dfil/g_dopen/g_dnm/g_dsz, см. блок NDRV ниже). Не возвращать их:
+   компилятор такую ошибку не поймает, а обращение к ним молча читало бы нули. */
+static uint32_t    g_disk_secs = 0;            /* сколько секторов отдали (приборный счётчик) */
+static uint32_t    g_disk_err  = 0;            /* отказов чтения образа */
+/* ВАЖНО (стоило «Disk Error» на первых прогонах): в FDC_CTL живут И команда, И УРОВНИ (готовность,
+   защита записи, геометрия). Служба подачи секторов писала туда чистые 1 и 2 - и каждая подача
+   сектора ОБНУЛЯЛА «дискета готова», после чего контроллер честно отвечал «нет диска». Поэтому
+   уровни держим в теневой копии и подмешиваем в КАЖДУЮ запись. */
+static uint32_t    g_fdc_lv = 0x00000010u;     /* по умолчанию: ready=0, wp=1 */
+/* v218 SCL. Формат (проверен на 400 образах из 1173): "SINCLAIR", байт числа файлов N,
+   N записей по 14 байт (имя[8], тип, адрес[2], длина[2], СЕКТОРОВ[1]), затем данные файлов
+   ПОДРЯД, в конце 0/4/8 байт контрольной суммы. Каталога на образе нет вовсе.
+   Ключ: SCL - это ДЕФРАГМЕНТИРОВАННЫЙ TRD, файлы лежат ровно так, как легли бы на чистую
+   дискету. Поэтому нулевую дорожку синтезируем сами, а данные отдаём прямо из файла. */
+/* v220 ЧЕТЫРЕ ПРИВОДА. У настоящего Beta Disk их четыре (A/B/C/D), и TR-DOS выбирает их младшими
+   битами системного регистра #FF. Номер выбранного привода фабрика уже отдаёт в FDC_STAT[1:0]
+   (это sysreg[1:0]), поэтому RTL менять не нужно. Контроллер один - как и в железе; своя
+   позиция головки у каждого привода ведётся самим TR-DOS, а не контроллером.
+   ⚠ Уровни FDC_CTL (готовность, защита записи, ГЕОМЕТРИЯ образа) у приводов РАЗНЫЕ, поэтому при
+   смене выбранного привода их надо перетолкнуть - и с учётом гочи «команда подачи сектора
+   обнуляет уровни» это делается тем же словом, что и подача. */
+#define NDRV 4
+static FIL         g_dfil[NDRV];
+static uint8_t     g_dopen[NDRV];              /* 1 = в приводе есть образ */
+static char        g_dnm[NDRV][28];            /* имя файла образа (для надписей) */
+/* v0.15.414: полный путь образа. Нужен окну настроек дисковода: поле пути нечем заполнить, а
+   показывать имя без пути - врать о том, что именно вставлено (файлов с одним именем на карте много). */
+static char        g_dpath[NDRV][96];
+static uint32_t    g_dsz[NDRV];                /* размер, который показываем контроллеру */
+static uint8_t     g_dscl[NDRV];               /* 1 = SCL (каталог синтезирован) */
+static uint32_t    g_dscldat[NDRV];            /* смещение данных в файле SCL = 9 + 14*N */
+static uint32_t    g_dlv[NDRV];                /* уровни FDC_CTL этого привода */
+static uint8_t     g_trk0[NDRV][4096];         /* синтезированная дорожка 0 на каждый привод */
+static int         opt_drvsel  = 0;            /* КУДА монтируем (опция меню): 0=A .. 3=D */
+/* v223 РАЗРЕШЕНИЕ ЗАПИСИ. Намеренно НЕ сохраняется в ini: защита от записи должна заново
+   вставать на каждом включении, иначе однажды включённая запись молча живёт вечно и первый же
+   сбойный софт испортит образ. SCL не пишется никогда - формат упакованный. */
+static int         opt_diskwr  = 0;            /* 0 = только чтение (по умолчанию), 1 = запись разрешена */
+static uint32_t    g_disk_wrn  = 0;            /* сколько секторов записано (приборный счётчик) */
+/* v235 разбор записи: фронты DRQ и снимок кольца на момент отдачи сектора. Числа читаются по
+   символам ELF (arm-none-eabi-nm loader.elf | grep g_drq) - адреса сдвигаются каждой сборкой. */
+static volatile uint32_t g_drq_edges = 0;            /* сколько раз контроллер ПОПРОСИЛ байт */
+static uint32_t    g_drq_last  = 0;            /* прошлое состояние бита DRQ */
+static volatile uint32_t g_wr_events = 0;            /* сколько раз контроллер просил забрать сектор */
+static volatile uint32_t g_wr_nonzero = 0;            /* сколько НЕнулевых байт пришло в вычитанном буфере */
+static volatile uint32_t g_wr_lba = 0;
+static volatile uint32_t g_wr_nz_first = 0xFFFFFFFFu; /* ненулевых в ПЕРВОМ секторе (каталог) */
+static volatile uint32_t g_wr_lba_first = 0xFFFFFFFFu;/* и его LBA */
+static volatile uint32_t g_wr_vfy_bad = 0;            /* расхождений при перечитывании из файла */
+static volatile uint32_t g_wr_vfy_nz  = 0;            /* ненулевых при перечитывании */
+static volatile uint32_t g_wr_vfy_run = 0;            /* сколько раз сверяли */
+static volatile uint32_t g_wr_wrenb = 0;              /* B0092: срабатываний записи ЦП в буфер */
+static volatile uint32_t g_wr_wrenb_first = 0xFFFFFFFFu;
+/* v238 ПЕТЛЯ: подали сектор в буфер и сами же вычитали. Машина не участвует. */
+static volatile uint32_t g_lb_run = 0;                 /* не используется с v239 */
+/* v239: что и куда мы подали в буфер последним - для сравнения с вычитанным при записи. */
+static uint8_t           g_push_buf[512] __attribute__((aligned(32)));
+static volatile uint32_t g_push_lba = 0xFFFFFFFFu;
+static volatile uint32_t g_pr_diff  = 0xFFFFFFFFu;     /* отличий вычитанного от поданного */
+static volatile uint32_t g_pr_nz    = 0;               /* ненулевых в поданном (проверка затравки) */
+static volatile uint32_t g_pr_run   = 0;               /* сравнений сделано */
+static volatile uint32_t g_pr_lba   = 0xFFFFFFFFu;     /* на каком LBA сравнивали */
+/* v240 (ядро B0093): адреса двух сторон буфера в момент отдачи сектора. */
+static volatile uint32_t g_ba_byte  = 0xFFFFFFFFu;     /* byte_addr - куда писал процессор */
+static volatile uint32_t g_ba_block = 0xFFFFFFFFu;     /* sd_block - добавка порта хоста */
+static volatile uint32_t g_ba_raw   = 0;               /* сырое слово, на всякий случай */
+static volatile uint32_t g_ba_first_byte  = 0xFFFFFFFFu;
+static volatile uint32_t g_ba_first_block = 0xFFFFFFFFu;
+/* v243: диапазон, записанный машиной, и результат сборки сектора. */
+static volatile uint32_t g_rg_min = 0xFFFFFFFFu;
+static volatile uint32_t g_rg_max = 0xFFFFFFFFu;
+static volatile uint32_t g_rg_skip = 0;   /* сколько раз машина не записала ничего */
+static volatile uint32_t g_rg_used = 0;   /* сколько секторов собрано по диапазону */
+/* v244: приборы защиты от фантомов. */
+static volatile uint32_t g_ph_wr  = 0;    /* запрос записи при СНЯТОЙ занятости = фантом */
+static volatile uint32_t g_ph_both= 0;    /* подняты оба запроса сразу */
+static volatile uint32_t g_ph_lba = 0;    /* подавали другой блок - писать нельзя */
+static int g_dsync_due = 0;               /* v245: есть несброшенные секторы */
+/* v241: журнал ВСЕХ отданных секторов - последовательность записи TR-DOS целиком. */
+static volatile uint32_t g_wl_n = 0;                  /* сколько записей в журнале */
+static volatile uint32_t g_wl_lba[12];                /* куда */
+static volatile uint32_t g_wl_head[12];               /* первые 4 байта сектора */
+static volatile uint32_t g_wl_diff[12];               /* сколько байт отличается от поданного */
+static volatile uint32_t g_lb_bad = 0;                 /* расхождений байт в последней */
+static volatile uint32_t g_lb_first_bad = 0xFFFFFFFFu; /* индекс первого расхождения */
+static volatile uint8_t  g_lb_sent[16];                /* что подали (первые 16) */
+static volatile uint8_t  g_lb_got[16];                 /* что вычитали (первые 16) */
+static volatile uint8_t  g_wr_first[32];              /* первые 32 байта первого сектора */            /* LBA последнего записанного сектора */
+static volatile uint32_t g_ring_snap[12];            /* кольцо BDI на момент отдачи сектора */
+static volatile uint32_t g_ring_snap2[12];           /* и второе слово тех же событий */
+
+static uint8_t     g_dro[NDRV];                /* 1 = файл открылся только на чтение (карта/атрибут) */
+static int         g_drv_live  = -1;           /* чьи уровни сейчас выставлены в фабрику */
+static int         g_drv_last  = 0;            /* последний обслуженный - его имя у иконки */
+static const char  DRV_LTR[NDRV] = {'A','B','C','D'};
+static int cicmp(const char* a, const char* b);   /* тело ниже (рядом с сортировкой браузера) */
+static const uint8_t ZXD[10] = {0x16,0x1E,0x26,0x25,0x2E,0x36,0x3D,0x3E,0x46,0x45}; /* PS/2 set-2: 1..9,0 */
+/* [тип][бит] -> индекс цифры в ZXD; порядок бит платформенный: 0=R 1=L 2=D 3=U 4=Fire. 0xFF = нет */
+static const uint8_t JT_KEY[4][5] = {
+    {0xFF,0xFF,0xFF,0xFF,0xFF},   /* KEMPSTON: не через матрицу, идёт в JOY_STATE */
+    {   6,   5,   7,   8,   9},   /* SINCLAIR 1: R=7 L=6 D=8 U=9 F=0 */
+    {   1,   0,   2,   3,   4},   /* SINCLAIR 2: R=2 L=1 D=3 U=4 F=5 */
+    {   7,   4,   5,   6,   9},   /* CURSOR:     R=8 L=5 D=6 U=7 F=0 */
+};
+static uint8_t g_jmx_cur[2] = {0,0};   /* какие 5 бит СЕЙЧАС зажаты в матрице у каждого игрока */
+static uint8_t g_jmx_code[2][5] = {{0,0,0,0,0},{0,0,0,0,0}};  /* каким кодом нажат каждый бит: отпускать
+                                          надо ИМЕННО им, иначе смена типа оставит цифру зажатой */
+static int     g_jmx_tprev[2] = {0,0}; /* тип, на котором сейчас держатся клавиши */
+static XTime   g_jmx_t = 0;            /* когда был прошлый инжект (темп ограничен, см. ниже) */
+static void joymx_pump(uint32_t m1, uint32_t m2);   /* fwd: тело ниже */
+static void joymap_eval(void){
+    if(g_joy_cap < 0) g_joy_cap = (LOAD_CAPS_R & 1u) ? 1 : 0;
+    if(!g_joy_cap) return;
+    uint32_t m = 0;
+    uint32_t m1 = 0, m2 = 0;      /* v199: нужны и ПОСЛЕ блока - матричным джойстикам (joymx_pump) */
+    if(!osd_on && !browser_on){
+        for(int b=0;b<8;b++){
+            if(joy_key_down(g_joymap[0][b])) m1 |= 1u<<b;   /* v180: уважает NumLock-переключатель */
+            if(joy_key_down(g_joymap[1][b])) m2 |= 1u<<b;
+        }
+        m1 = socd_apply(m1, g_joymap[0]);          /* v206: режим выбирает владелец (CH_SOCD) */
+        m2 = socd_apply(m2, g_joymap[1]);
+        /* v199: в порт идут только игроки типа KEMPSTON. Матричный игрок в JOY_STATE попадать не
+           должен - иначе одно нажатие пришло бы в машину ДВАЖДЫ (и портом, и клавишей). */
+        m = ((opt_jtype1 == 0) ? m1 : 0u) | (((opt_jtype2 == 0) ? m2 : 0u) << 16);
+    }
+    /* v210: bit31 is a shell-to-ZX ownership level, not a gamepad bit (cores consume only
+       [7:0] and [23:16]).  The ZX top uses it to keep the physical NumPad out of the 8x5 matrix
+       while NumLock gives that block to Kempston.  NES maps are independent and never set it. */
+    /* v0.15.304: тот же бит поднимает и мышь. Без него цифровые клавиши двигали бы курсор И
+       одновременно сыпались в матрицу Спектрума - софт получал бы фантомные нажатия ровно тогда,
+       когда владелец ведёт мышь по его же меню. */
+    if(opt_defmachine != 4 && (opt_numjoy || kmouse_owns_numpad())) m |= 0x80000000u;
     if(m != g_joy_last){ JOY_STATE = m; g_joy_last = m; }
+    joymx_pump(m1, m2);
+}
+/* v0.15.199: матричные джойстики (Sinclair/Cursor) - ОДИН инжект за вызов и не чаще раза в
+   миллисекунду. Почему так: `inject_cdc` переносит запись в домен Спектрума ТОГГЛОМ (ZX-топ, ~835),
+   а тоггл, перевёрнутый дважды внутри одного такта приёмника, теряется целиком - две записи подряд
+   дали бы пропавшее нажатие. Клавиша в матрице держится УРОВНЕМ до отпускания, поэтому темп в 1 мс
+   ничего не стоит по ощущениям: полная смена направления с огнём разложится на 2-3 мс. */
+static void joymx_pump(uint32_t m1, uint32_t m2){
+    XTime now; XTime_GetTime(&now);
+    if(g_jmx_t && (uint64_t)(now - g_jmx_t) < (uint64_t)(COUNTS_PER_SECOND/1000u)) return;
+    for(int pl = 0; pl < 2; pl++){
+        int t = pl ? opt_jtype2 : opt_jtype1;
+        if(t < 0 || t > 3) t = 0;
+        uint8_t want = (t == 0) ? 0u : (uint8_t)((pl ? m2 : m1) & 0x1Fu);   /* Kempston -> всё отпустить */
+        if(t != g_jmx_tprev[pl]){          /* тип сменили: сперва отпустить всё старыми кодами */
+            if(g_jmx_cur[pl] == 0){ g_jmx_tprev[pl] = t; }
+            else want = 0;
+        }
+        uint8_t diff = (uint8_t)(want ^ g_jmx_cur[pl]);
+        if(!diff) continue;
+        int b = 0; while(!(diff & (1u << b))) b++;
+        int press = (want >> b) & 1;
+        if(press){
+            uint8_t ki = JT_KEY[t][b];
+            if(ki == 0xFF) { g_jmx_cur[pl] |= (uint8_t)(1u << b); continue; }  /* бит без клавиши */
+            KBD_INJECT = ZXD[ki];  g_jmx_code[pl][b] = ZXD[ki];
+        } else {
+            if(g_jmx_code[pl][b]) KBD_INJECT = 0x100u | g_jmx_code[pl][b];
+            g_jmx_code[pl][b] = 0;
+        }
+        g_jmx_cur[pl] = (uint8_t)((g_jmx_cur[pl] & ~(1u << b)) | (press << b));
+        g_jmx_t = now;
+        return;                     /* ровно один инжект за вызов */
+    }
 }
 static void render_pause_sign(void);
-static void open_osd(void){ show_header(); OSD_CTRL = (OSD_CTRL | 1u) & ~2u; osd_on = 1; browser_on = 0; opt_on = 0; osd_view = 1; render_pause_sign(); }
-static void close_osd(void){ OSD_CTRL &= ~3u; osd_on = 0; browser_on = 0; opt_on = 0; osd_view = 0; render_pause_sign(); }  /* DN-only build: clear both OSD layers */
+/* v256: отпустить в МАШИНЕ всё, что оболочка считает зажатым. Вызывается на каждом переключении
+   гейта: нажатие могло уйти в машину до закрытия гейта, а отпускание - уже не дойти, и клавиша
+   осталась бы зажатой навсегда (у владельца так листалось меню машины при работе в навигаторе).
+   `KBD_INJECT` кладёт прямо в матрицу Z80, минуя гейт, - тот же приём, что в автостарте ленты.
+   Правка не опирается на то, ЧТО именно съело отпускание: она снимает состояние при любой причине. */
+static void zx_release_all(void){
+    for(unsigned c = 0; c < 256u; c++)
+        if(g_kd[c]) KBD_INJECT = 0x100u | c;      /* бит8 = отпускание */
+}
+/* v256: создать все каталоги пути, кроме последнего элемента (он - имя файла). Уже существующие
+   каталоги дают FR_EXIST, и это не ошибка. */
+static void fs_mkpath(const char* path){
+    char buf[256]; int n = 0;
+    for(; path[n] && n < (int)sizeof(buf)-1; n++) buf[n] = path[n];
+    buf[n] = 0;
+    for(int i = 0; buf[i]; i++){
+        if(buf[i] != '/' || i == 0) continue;
+        if(i >= 2 && buf[i-1] == ':') continue;        /* '0:/' - не каталог */
+        buf[i] = 0;
+        f_mkdir(buf);                                  /* FR_EXIST - штатно, игнорируем */
+        buf[i] = '/';
+    }
+}
+static void open_osd(void){ zx_release_all(); show_header(); OSD_CTRL = (OSD_CTRL | 1u) & ~2u; osd_on = 1; browser_on = 0; opt_on = 0; osd_view = 1; render_pause_sign(); }
+static void close_osd(void){ zx_release_all(); OSD_CTRL &= ~3u; osd_on = 0; browser_on = 0; opt_on = 0; osd_view = 0; render_pause_sign(); }  /* DN-only build: clear both OSD layers */
 
 /* ---- F5 SD file browser (read-only) with directory navigation, into the 256x128 OSD panel ---- */
+/* v0.15.202: предел ЖЁСТКИЙ и раньше был молчаливым — каталог из 300 файлов выглядел полным.
+   У владельца 164 рома в одной букве уже сейчас, а подходящих в коллекции 12 445. Список теперь
+   помечает усечение (см. g_flist_trunc), чтобы «файла нет на карте» не отправляло искать призрак. */
 #define MAXFILES 256
 #define BROWS    18                       /* file rows visible in the DN 80x25 panel */
 #define NAMELEN  96                 /* store the full long name (panel shows VISCH; marquee reveals the rest) */
 static char  flist[MAXFILES][NAMELEN+1];
 static uint8_t fisdir[MAXFILES];
 static uint8_t fhidden[MAXFILES];   /* 1 = hidden/system/dotfile (shown only when opt_showhidden; marked in the list) */
+static uint8_t g_flist_trunc = 0;   /* v0.15.202: 1 = каталог не поместился в MAXFILES */
 static uint8_t fsel[MAXFILES];      /* 1 = tagged (Space, DN group-select) -> group copy/delete/move */
 static void menubar_draw(int cur);
 static void draw_topstatus(void);   /* top-right: machine status + volume + version */
+static int  drive_select_dialog(const char* img);   /* v221: модальный выбор привода A..D при вставке образа */
+static void drive_manage_dialog(void);              /* v224: то же окно без вставки - посмотреть и извлечь */
+static void sd_info_dialog(void);                   /* v227: информация о карте, как инфо-панель DN */
+static void ide_info_dialog(void);                  /* v292: какой образ винчестера вставлен и его размер */
+static void divmmc_info_dialog(void);
+static void divmmc_close(void);
+static void apply_divmmc(void);
+static void apply_zc(void);              /* v350: Z-Controller */
+static unsigned machine_cfg_word(void); /* v350: apply_zc проталкивает слово сам */
+static void apply_dmmode(void);
+static void apply_dmroot(void);          /* v355: пересобрать том с другим числом записей корня */
+static void apply_dmfat32(void);         /* v359: пересобрать том в другом формате */
+static int  card_write_ok(void);         /* v409: примет ли карта запись (одна точка решения) */
+static const char* note_dmfat(void);
+static const char* why_dmfat(void);
+static void rom_reapply_and_reset(void);   /* v342: общий хвост правок ПЗУ - его зовёт и apply_divmmc */
+static void dmmc_program(void);            /* v343: программирование карты DivMMC в фабрике */
+static void dmmc_pump(void);               /* v343: подача секторов карте по её запросу */
+static void dmmc_drain(void);              /* v423: вычерпать вспышку запросов до GS */
+static void dmmc_poke(void);               /* v424: один запрос карты между сэмплами звука */
+static uint8_t divmmc_mount(const char* path);
+static void gs_speed_dialog(void);
+/* v366: «в смонтированную папку DivMMC писали, том устарел». Пересобирает служба, а не тот, кто
+   писал: менять раскладку кластеров посреди файловой операции нельзя. */
+static int  g_dm_dirty = 0;
+static int  dm_path_inside(const char* p);          /* путь лежит внутри смонтированной папки? */
+static void zdisk_dialog(void);                     /* v358: своё окно Z-диска (#77/#57) */                  /* v298: честный прибор темпа General Sound */
+extern void     gs_set_clock_hz(uint32_t hz);       /* v336: частота карты - параметр, меняется на лету */
+extern unsigned gs_get_clock_hz(void);
+static void trd_create_dialog(void);                /* v228: создать пустой образ TRD */
+static void image_view_dialog(void);                /* v228: посмотреть каталог образа TRD/SCL */
 static void mkdir_path(const char* path);   /* create missing folders in a "0:/a/b/c" path */
 static uint64_t count_tree(char* path);      /* total bytes under a folder (progress denominator) */
 static int copy_move_run(char* src, char* dst, int isdir, uint64_t total, int removesrc, const char* title);
@@ -742,9 +1773,15 @@ static uint32_t fdt[MAXFILES];          /* (FAT date<<16)|time, for chronologica
 static int   fcount = 0, bcursor = 0, btop = 0, sd_mounted = 0;
 static int   sortmode = 0;              /* 0=NAME 1=DATE 2=SIZE 3=EXT */
 static int   g_sort_desc = 0;           /* 0=ascending (default), 1=descending; Alt+F3 toggles, F3 (mode change) resets to asc */
-static int   g_menu_open = 0;           /* a modal dropdown is on screen: suppress list/marquee redraws beneath it */
+/* g_menu_open declared above */
 static int   g_menu_restructure = 0;   /* set on a machine switch: the Machine submenu changed its item set -> menu_value_changed does a full re-render with recomputed box geometry */
+static unsigned g_snow_seen = 0;       /* v349: у каких машин в ini нашёлся СВОЙ ключ snow (бит на машину) */
 static int   g_menu_f12 = 0;           /* set when F12 pressed inside a menu -> close the whole navigator on menu exit */
+/* v0.15.348: F12 - глобальный выход. Флаг живёт от нажатия до возврата на верхний уровень; пока он
+   поднят, ожидатель клавиш отдаёт Escape не дожидаясь ничего, и вложенные окна закрываются сами.
+   Счётчик - предохранитель от цикла, который Escape игнорирует (см. шапку правки). */
+static int   g_ui_abort = 0;
+static int   g_ui_abort_n = 0;
 static int   g_menu_close = 0;          /* set by an action (machine picker) to close the whole menu on return -> back to the navigator */
 static int   g_suppress_browser_draw = 0;  /* a modal/progress window owns the screen: auto-advance may start the next
                                               track but must NOT touch the file list or move the browser cursor */
@@ -761,14 +1798,50 @@ static int   g_mute          = 0;        /* KP* global mute: 1 = whole audio mix
    pentagon flag), so tuning them can NEVER disturb ZX 128K. Baked defaults = owner-tuned (Atarin good).
    These belong to the machine; when more cores arrive they become a per-machine set. */
 static int   opt_pintv       = 299;      /* Pentagon INT line (owner-tuned 299) */
-static int   opt_pinth       = 318;      /* Pentagon INT start hc (owner-tuned 318) */
-static int   opt_paper_h     = 0;        /* paper H within frame (owner-tuned 0) */
+static int   opt_pinth       = 326;      /* 🥇 Pentagon INT start hc. 12.08 владелец выставил 326 и
+                                            бордюр сошёлся с центральным экраном. Это ЭТАЛОННОЕ число:
+                                            MiSTer ula.sv:170 даёт INT на hc_next==326, Sizif — то же.
+                                            Прежние 318 = 326 − 8, ровно один старый восьмипиксельный
+                                            квант бордюра: значение подбиралось под грубую сетку, которой
+                                            больше нет. До правки гашения (B0126, сдвиг на +12) эталонное
+                                            326 не работало — геометрия была кривая, и владелец это
+                                            проверил свипом: подходящего значения не было НИ ОДНОГО. */
+static int   opt_paper_h     = 2;        /* paper H within frame. 12.08: владелец выставил 2 вместе с
+                                            INT H = 326 — граница бордюр/бумага сошлась, разрыв полоски
+                                            в тайминговой демке ушёл. */
 static int   opt_paper_v     = 60;       /* paper V within frame (owner-tuned 60) */
+static int   opt_io_cont     = 0;        /* B0156: I/O contention phase delay (0..7 clk) */
+static int   opt_bord_phase  = 5;        /* B0156: Border quantization phase (0..15) */
+static int   opt_bord_delay  = 0;        /* B0156: Border subpixel delay (0..3 px) */
+static int   opt_pap_delay   = 0;        /* B0156: Paper delay pipeline (0..15 px) */
+static int   opt_sincl_inth  = 0;        /* B0156: Sinclair INT start timing offset (-128..+127) */       /* paper V within frame (owner-tuned 60) */
 /* (per-machine store g_mp[] + mp_store/mp_load live below, after N_MACHINES is defined) */
 /* Step 15 GLOBAL DISPLAY layer - machine-INDEPENDENT (owner: crop + output-window position adjust
    regardless of which machine is loaded). One set, applied to whatever the display shows. */
-static int   opt_scr_x       = 256;      /* whole-frame H position on HDMI (fb_line_disp HMARGIN) */
-static int   opt_scr_y       = 58;       /* whole-frame V position on HDMI (fb_line_disp VMARGIN) */
+static int   opt_scr_x       = 256;      /* MENU VIEW of the current machine's Screen X (see opt_mscr_*) */
+static int   opt_scr_y       = 58;       /* MENU VIEW of the current machine's Screen Y */
+/* v0.15.157: PER-MACHINE screen position (owner's spec: every machine's submenu shifts ITS output
+   inside the HDMI window, both axes, both directions). Stored per machine, centered defaults:
+   ZX machines 384x302 x2 -> 256/58; NES 256x240 x2 -> 384/120. opt_scr_x/y is just the menu VIEW
+   of the current machine's pair (synced by scr_view_sync; apply_scr writes view -> store + reg). */
+/* v0.15.174: положение и масштаб переехали в g_mp[] (единый пер-машинный набор) - здесь остались
+   только ВИДЫ для меню (opt_scr_x/y/sx/sy) и компилируемые дефолты для миграции старого ini. */
+/* v0.15.169 PER-MACHINE integer SCALE (owner: "position and scale per machine, in the machine's
+   settings"). Was a compile-time parameter (XSH/YSH shift) in fb_line_disp, so it could not be an
+   option at all and non-power-of-2 was impossible; CE21 makes it the live register SCR_SCALE.
+   Defaults: ZX 384x302 x2 = 768x604 (the proven look, unchanged); NES 256x240 x4/x3 = 1024x720 -
+   fills the height exactly and gives pixel aspect 1.33 (authentic is 1.25; x3/x3=768x720 is truer
+   per pixel but narrow, x5/x3=1280x720 stretches too wide). */
+static int   opt_scr_sx      = 2;        /* MENU VIEW of the current machine's scale X */
+static int   opt_scr_sy      = 2;        /* MENU VIEW of the current machine's scale Y */
+/* v0.15.170: the compiled defaults kept separately, because an ini written BEFORE per-machine scale
+   existed carries a position tuned for the old x2 - restoring it on top of a new scale default leaves
+   the picture off-centre. A machine whose scale keys are absent from the ini goes back to BOTH. */
+static const int SCR_DEF_X[5]  = {256,256,256,256,128};
+static const int SCR_DEF_Y[5]  = { 58, 58, 58, 58,  0};
+static const int SCR_DEF_SX[5] = {2,2,2,2,4};
+static const int SCR_DEF_SY[5] = {2,2,2,2,3};
+static int   g_ini_scale_seen[5] = {0,0,0,0,0};
 static int   opt_crop_l      = 0;        /* crop left  (source cols trimmed from left) */
 static int   opt_crop_r      = 0;        /* crop right */
 static int   opt_crop_t      = 0;        /* crop top   (source rows trimmed from top) */
@@ -790,7 +1863,8 @@ static int   playing_idx     = -1;       /* flist index of the currently-playing
 static char  play_dir[80]    = "";       /* folder (curpath) where the current playback started (auto-advance scope) */
 static int   opt_pausemusic  = 0;        /* 0=NO (game runs in background, audio muted by FIFO mux) 1=YES (HALT when music plays over a game) */
 static int   opt_launchsnd   = 0;        /* launch a program while music plays: 0=MACHINE (suspend music, machine audible, resume via menu/cursor) 1=MUSIC (keep music, machine muted) */
-static int   opt_bootnav     = 1;        /* show the navigator at boot: 1=YES (default) 0=NO (boot to the machine; F12 opens the navigator) */
+static int   opt_bootnav     = 1;
+static char  g_nesboot[192]  = "0:/NES/TANK1990.NES";   /* v159: cart to auto-load when booting into the NES machine (ini nes_boot=path; empty = none) */        /* show the navigator at boot: 1=YES (default) 0=NO (boot to the machine; F12 opens the navigator) */
 static int   halt_src = 0;               /* HALT bitmask: bit0=manual Pause, bit1=auto music-halt, bit2=SD-op freeze; machine halted while nonzero */
 static int   opt_tapesound   = 1;        /* Step 14.2: 1=YES hear the tape loading sound, 0=NO real-time load but muted */
 static int   opt_tapemute    = 0;        /* 1=mute the MACHINE audio (the ZX ULA reproduces EAR on its own beeper) while a tape loads; independent of Tape Sound */
@@ -836,17 +1910,111 @@ static const char* const CH_LAUNCH[]= {"MACHINE","MUSIC"};
 /* Step 15 scaffold: the machine list. ZX 128K runs today; the Pentagon rows are placeholders until the
    proven Pentagon core is imported (then opt_defmachine drives the boot machine + a live switch). CH_MACHINE
    = display labels; MACHINE_TAG = stable ini keys (index reordering must not break saved configs). */
-static const char* const CH_MACHINE[]  = {"ZX 128K", "PENTAGON 1024K", "ZX SPECTRUM 48K (Atlas)", "ZX SPECTRUM 48K (MiSTer)"};
-static const char* const MACHINE_TAG[] = {"zx128",   "pent1024",         "zx48",                    "zx48mr"};
+static const char* const CH_MACHINE[]  = {"ZX 128K (Atlas)", "PENTAGON 1024K (Atlas)", "ZX SPECTRUM 48K (Atlas)", "ZX SPECTRUM 48K (MiSTer)", "NES (NESTang)"};   /* every machine labeled with its source core (Atlas / MiSTer / NESTang) */
+static const char* const MACHINE_TAG[] = {"zx128",   "pent1024",         "zx48",                    "zx48mr",                  "nes"};
 static const char* const CH_ULATIM[]   = {"EARLY (TYPE 1)", "LATE (TYPE 2)"};
+static const char* const CH_REGION[]   = {"NTSC 60Hz", "PAL 50Hz", "DENDY 50Hz"};
+/* v0.15.189 РЕГИОН NES (владелец: "игра идёт быстрее, чем задумано; музычка быстрее").
+   Ощущение верное, и причина не в кварце: nesclk = 21.500 МГц против эталонных 21.477272, это
+   +0.106 % - не услышать. Мы шли на NTSC ~60 Гц (замерено по счётчику записей кадра в DDR: 59.5 к/с),
+   а Денди - это 50 Гц, то есть игра и музыка на нём медленнее примерно на 20 %. Ядро поддерживает
+   все три режима по-настоящему (ppu.v:137: NTSC 241..260 со skip, PAL 241..310, Денди 291..310) и при
+   смене sys_type сбрасывает себя само (nes.v:161), так что переключение честное, а не косметическое. */
+static const char* const CH_SVCROM[]   = {"OFF", "NMI", "ALWAYS"};   /* v252: NMI = магическая кнопка
+                                            (страница по Ctrl+Alt+Ins, снятие по RETN - ядро B0101);
+                                            ALWAYS = страница в окне постоянно (нужно диагностическим ПЗУ). */
+/* v0.15.302: с какой страницы ПЗУ машина стартует после сброса. AUTO = как решает ядро (128/Пентагон
+   страница 0, 48К страница 1). Остальные позиции = «положить содержимое этого слота ещё и в
+   стартовую страницу» (см. rom_load_set: номер стартовой страницы зашит в ядре, выбрать её можно
+   только перекладкой содержимого). */
+/* v0.15.305: «AUTO» само по себе не отвечает на вопрос владельца «а с какой страницы машина стартует
+   сейчас?». Номер стартовой страницы - свойство ЯДРА и МАШИНЫ (rom_boot_page: 128/Пентагон - 0,
+   48К - 1), поэтому строку дописывает rom_slots_ui_sync при каждой пересборке меню. Буфер, а не
+   константа, именно поэтому. */
+static char g_rombus_auto[16] = "AUTO";
+static const char* const CH_DOSSVC[]   = {"OFF", "AUTO", "ON"};   /* v388: страница ПЗУ под TR-DOS -
+                                            OFF = слот 2 всегда (как до B0146); ON = как настоящий
+                                            Пентагон ({DOS,7FFD[4]}); AUTO = ON только когда в слоте 3
+                                            реально стоит вход менеджера (см. g_svc_entry). */
+static const char* const CH_ROMBUS[]   = {g_rombus_auto, "SLOT 0", "SLOT 1", "SLOT 2", "SLOT 3"};
 static const char* const CH_SNOW[]     = {"OFF", "ON"};   /* v145 ULA snow (idx1 = ON = faithful default) */
-#define N_MACHINES 4
+static const char* const CH_DMROOT[]   = {"2048 (esxDOS)", "512 (LFN browser)"};   /* v355 */
+static const char* const CH_DMFAT[]    = {"FAT16", "FAT32"};                       /* v359 */
+static const char* const CH_DMWRITE[]  = {"OFF", "IMAGE"};                         /* v405 */
+static const char* const CH_SAA[]      = {"AUTO", "ON", "OFF"};  /* v217 SAA1099 на порте #FF, см. apply_saa */
+static const char* const CH_GS[]       = {"OFF", "ON"};   /* v265 General Sound (карта на ARM, ловушка #BB/#B3) */
+/* v281 ОБЪЁМ ОЗУ КАРТЫ - настройка СОВМЕСТИМОСТИ. Прошивка отвечает софту числом страниц (команда
+   #23): 128К даёт 3 (базовая версия, Mod Player сверяет её буквально и иначе печатает «GS NOT
+   PRESENT»), 512К даёт 15 (X-Player адресует сэмплы индексом 3, которого у 128К нет). Смена требует
+   перезапуска карты: память она мерит один раз при инициализации.
+   🥇 v0.15.299 ПУНКТ «4M» БЫЛ ЛОЖЬЮ И ЗАМЕНЁН НА «2M». Номер страницы карта задаёт одним портом
+   #00, и он ШЕСТИБИТНЫЙ - и в живом апстриме (`cores/zx-mister/rtl/gs.v`), и в прошивке gs105b.
+   Значит страниц бывает 0..63, нулевая - ПЗУ, и потолок ОЗУ = 63 x 32 КБ = 2016 КБ. Измерено
+   хостовым стендом по ячейке NUMPG, которую карта заполняет САМА: 128К -> 3, 512К -> 15, 1М -> 31,
+   2М -> 62, и 4М -> ТОЖЕ 62. То есть выбранные 4 МБ до карты не доходили никогда. */
+static const char* const CH_RAMSIZE[]  = {"128K", "256K", "512K", "1024K"};
+/* Что кладём в MACHINE_CFG [16:14] - маску ОТСУТСТВУЮЩИХ старших бит номера банка (7FFD d5/d7/d6).
+   Поле ИНВЕРТНОЕ нарочно: ноль = все биты на месте = 1024К, то есть прежнее поведение, и прошивка,
+   которая про это поле не знает, получает ровно старую машину. Маску считаем ЗДЕСЬ, а не в ядре:
+   готовые три бита складываются в ту же LUT, что и условие окна 0xC000, и правка ядра стоит НОЛЬ
+   LUT (дизайн стоит на 91 % и на мультиплексоре объёма один раз не разместился).
+   Смысл настройки: сколько СТАРШИХ бит порта 7FFD выбирают банк. Недостающего бита у машины просто
+   НЕТ - он ИГНОРИРУЕТСЯ, как на плате без этих микросхем. Это НЕ то же самое, что выбрать машину
+   "ZX 128K": там бит5 порта снова становится БЛОКИРОВКОЙ страничности, и софт, который его пишет
+   (Wild Player пишет 7FFD=0x20), намертво замораживает окно 0xC000 - проверено на железе 10.08. */
+static const unsigned    RAMSIZE_CFG[] = {7u, 6u, 4u, 0u};   /* 128К / 256К / 512К / 1024К */
+static const char* const CH_GSRAM[]    = {"128K", "512K", "1M", "2M"};
+static const char* const CH_IDE[]      = {"OFF", "ON"};   /* v283 NEMO-IDE, образ из <тег>.idefile */
+static const char* const CH_DIVMMC[]   = {"OFF", "ON"};   /* v327 DivMMC */
+static const char* const CH_DMMODE[]   = {"FOLDER", "IMAGE"}; /* v327 folder=FAT synth; image=hdf/raw */
+static const char* const CH_IDEDEV[]   = {"MASTER", "MASTER+SLAVE"};  /* v292: nchoices ставится в рантайме */
+/* v304 МЫШЬ KEMPSTON. ON = порты в машине есть, но координаты стоят: это честное состояние
+   «мышь воткнута, но её никто не двигает» - место под будущую настоящую мышь PS/2 и способ
+   проверить, что софт видит интерфейс. KEYPAD = мышь водит цифровой блок (см. kmouse_eval). */
+static const char* const CH_KMOUSE[]   = {"OFF", "ON", "KEYPAD"};
+static const unsigned    GSRAM_KB[]    = {128u, 512u, 1024u, 2048u};   /* v299: 4096 -> 2048, см. CH_GSRAM */
+/* 🥇 v0.15.336 ЧАСТОТА КАРТЫ GS - ОПЦИЯ, ПОТОМУ ЧТО ЭТАЛОНЫ РАСХОДЯТСЯ И ЦЕНА РАЗНАЯ.
+   Прошивка gs105b к частоте не привязана: MiSTer гоняет её на 28 МГц, UnrealSpeccy на 24 (в коде
+   так и написано `//12`), MAME NeoGS на 10. Прерывание у всех остаётся 37.5 кГц - частота говорит
+   ровно одно: сколько тактов карта успевает между прерываниями.
+   ЗАЧЕМ ЭТО ВЛАДЕЛЬЦУ. На 12 МГц (как у настоящей карты) наша карта впритык успевает и считать
+   звук, и отвечать машине. На смене паттерна MOD-плеера кольцо квантов пустеет, карта уходит в
+   QTFAULT (её прерывание возвращается БЕЗ EI), сэмплы не защёлкиваются, ЦАП держит уровень - это
+   и есть слышимый затык. Разгон снимает его с запасом. Измерено свипом по периоду опроса
+   мейлбокса (у нас насос идёт раз в 333 мкс) и по времени ARM:
+       12 МГц - музыка чиста только до 62 мкс опроса,  цена 1.00x   как настоящая карта
+       14 МГц - до 400 мкс,                            1.08x        минимальная доплата
+       18 МГц - до 1000 мкс,                           1.31x   <-   ДЕФОЛТ: троекратный запас
+       24 МГц - до 650 мкс,                            1.55x        запас под эффекты, дороже
+   36 МГц в меню НЕТ намеренно: числа те же, что у 24, а цена 2.15x - платить не за что.
+   КОГДА ТРОГАТЬ: 12 - если софт мерит скорость карты сам или нужна точная копия железа; 18 -
+   всегда, если не мешает; 24 - если при активной работе с эффектами (#38/#39) прибор GS SPEED
+   всё-таки проседает. Смена работает НА ЛЕТУ, перезапуск карты не нужен (в отличие от объёма
+   ОЗУ: его прошивка мерит один раз при старте, а частоту не мерит вовсе). */
+static const char* const CH_GSCLK[]    = {"12 MHZ", "14 MHZ", "18 MHZ", "24 MHZ"};
+static const unsigned    GSCLK_HZ[]    = {12000000u, 14000000u, 18000000u, 24000000u};
+/* 🥇 УМОЛЧАНИЕ - 12 МГц, КАК У НАСТОЯЩЕЙ КАРТЫ, и вот почему это ПОПРАВКА, а не осторожность.
+   Свипы по частоте (12/14/18/24/36 МГц) ставились ДО того, как заработала очередь ответов, и тогда
+   на 12 МГц оставалась сыпь: около 1215 коротких аварий кольца за минуту на настоящем модуле. На
+   этом основании 18 МГц выбирались умолчанием. После починки очереди ответов ТОТ ЖЕ стенд на том же
+   модуле даёт НОЛЬ аварий и на 12, и на 18 - то есть выигрыша от разгона на хосте показать нечем,
+   а плата у нас без владельца не проверяется. Платить за недоказанный выигрыш 31 % процессорного
+   времени на кристалле, где карта делит ядро с машиной, видео, картой памяти и навигатором, нельзя.
+   Разгон остаётся ОПЦИЕЙ - если владелец всё-таки услышит артефакты, поднимать до 18. */
+#define GSCLK_DEF 0                                                    /* 12 МГц, как у настоящей карты */
+static const char* const CH_DRIVE[]    = {"A", "B", "C", "D"};   /* v220 в какой привод Beta Disk монтировать образ */
+static const char* const CH_DISKWR[]   = {"READ ONLY", "WRITE"};  /* v223 запись на образ; не сохраняется в ini */
+#define N_MACHINES 5
+#define MACH_PENT1024 1                 /* v352: индекс Пентагона в g_mp[]/MACHINE_TAG[] - у него нет снега */
 /* v0.15.144 per-core PCAP-reload (MiSTer-style): each machine names the FPGA CORE that implements it.
    Atlas is ONE bitstream that does 128 / Pentagon / 48-Atlas via MACHINE_CFG; the MiSTer native-48 ULA
    is a SEPARATE bitstream. Switching to a machine whose core != the running core makes the ARM PCAP-
    reload that core's .bit.bin from SD (see pl_reload). Cores live at 0:/CORES/<NAME>.BIT.BIN. */
-static const char* const CH_MACHINE_CORE[N_MACHINES] = {"ATLAS", "ATLAS", "ATLAS", "MISTER48"};
-static const char* g_cur_core = "ATLAS";               /* the core currently in the PL; set from VERSION at boot */
+static const char* const CH_MACHINE_CORE[N_MACHINES] = {"ATLAS", "ATLAS", "ATLAS", "MISTER48", "NES"};
+static const char* g_cur_core = "ATLAS";               /* ядро, которое СЕЙЧАС в ПЛИС. v340: на старте - из слова
+                                                          семейства MACHINE_ID (0x60), дальше его ставит pl_reload
+                                                          по пути залитого файла, сверенному с тем же словом.
+                                                          Из VERSION оно берётся только запасным путём. */
 static const char* machine_core(int m){ return (m>=0 && m<N_MACHINES) ? CH_MACHINE_CORE[m] : "ATLAS"; }
 static void core_path(char* out, const char* name){    /* build "0:/CORES/<NAME>.BIT.BIN" */
     const char* pre="0:/CORES/"; const char* suf=".BIT.BIN"; int i=0,j;
@@ -855,27 +2023,416 @@ static void core_path(char* out, const char* name){    /* build "0:/CORES/<NAME>
     for(j=0; suf[j];  j++) out[i++]=suf[j];
     out[i]=0;
 }
+/* 🥇 ЯДРО В ПЛИС ОПОЗНАЁТСЯ ПО ТОМУ, ЧТО В НЕЙ РЕАЛЬНО ЛЕЖИТ, А НЕ ПО НОМЕРУ ВЕРСИИ (v0.15.339,
+   уточнено в v0.15.340). Отказ у владельца 13.08: в ПЛИС стояло ядро MiSTer-48, а прошивка считала
+   его Atlas -> apply_machine видел «нужное ядро уже стоит», PCAP-перезагрузку не делал, и выбор
+   ZX 128K оставлял в ПЛИС чужое ядро, пока меню показывало Atlas.
+   ⚠ ФОРМУЛИРОВКА ПРИЧИНЫ ПОПРАВЛЕНА ПО РЕПОЗИТОРИЮ. В первой редакции этого комментария стояло
+   «у ядра MISTER48 подняли VERSION с 0x0059 до 0x0131». Такого числа в дереве нет вовсе:
+   sources/bulbulator_zx_ddr_top.v:409 под `ifdef MISTER48_CORE` по-прежнему 0xB01B0059, а 0x0130 -
+   это Atlas (:417). Проверяемая причина того же отказа: MISTER48.BIT.BIN, собранный БЕЗ дефайна
+   MISTER48_CORE (build.tcl:79 даёт его только цели `mister48`), отдаёт номер Atlas, и догадка по
+   номеру честно называла его Atlas. Ложную гочу оставлять нельзя - следующий пойдёт чинить
+   несуществующий конфликт номеров в RTL (проект уже платил за отменённую гочу «err не обнуляется»).
+   ПРАВИЛО, ДВА ИСТОЧНИКА:
+     1) MACHINE_ID (0x60) - слово СЕМЕЙСТВА, зашитое в топе ядра и не зависящее от номера сборки;
+     2) путь файла, который положили МЫ САМИ (меню, fs cmd 9, откат к заводскому ПЗУ).
+   Совпали - берём имя; разошлись (под каноническим именем лежит чужое ядро) - верим ЖЕЛЕЗУ.
+   Следствие: ПЕРЕНУМЕРАЦИЕЙ ядра переключение машин сломать больше нельзя. А вот ПЕРЕИМЕНОВАНИЕМ
+   файла на карте - можно, только иначе, и это надо знать: core_path() строит имя из таблицы
+   CH_MACHINE_CORE, поэтому ATLAS.BIT.BIN -> ATLAS_B0131.BIT.BIN даст f_open FR_NO_FILE, rc = 0xB0xx,
+   и смена машины пройдёт БЕЗ перезагрузки ядра (идентичность при этом не портится). */
+static const char* core_id_from_path(const char* path){
+    static char buf[24];                      /* хранилище живёт весь сеанс: g_cur_core — указатель, не копия */
+    const char* b; int i = 0;
+    if(!path) return 0;
+    b = path;
+    for(const char* p = path; *p; p++) if(*p=='/' || *p=='\\' || *p==':') b = p+1;   /* basename */
+    for(; b[i] && b[i]!='.' && i < (int)sizeof(buf)-1; i++){ char c = b[i]; if(c>='a'&&c<='z') c -= 32; buf[i] = c; }
+    buf[i] = 0;
+    if(!i) return 0;                          /* путь без имени файла — идентичность не трогаем */
+    for(int m=0; m<N_MACHINES; m++) if(!cicmp(buf, CH_MACHINE_CORE[m])) return CH_MACHINE_CORE[m];
+    return buf;   /* имя вне таблицы (наш отладочный битстрим, залитый мейлбоксом): считаем ядро ЧУЖИМ.
+                     Тогда первый же выбор машины честно перельёт канонический 0:/CORES/<ЯДРО>.BIT.BIN —
+                     лишняя перезагрузка ядра дешевле, чем владелец с ядром, которого он не выбирал.
+                     Хочешь оставить свой битстрим жить — клади его под каноническим именем ядра. */
+}
+/* 🥇 СЛОВО СЕМЕЙСТВА ЯДРА (MACHINE_ID, 0x60) - ЕДИНСТВЕННЫЙ ПРИЗНАК, НЕ ЗАВИСЯЩИЙ ОТ НОМЕРА СБОРКИ.
+   Регистр только на чтение, значение зашито в топе ядра и от билда к билду НЕ меняется:
+     sources/bulbulator_zx_ddr_top.v:544  0x00805A58 = 'ZX' + вариант 0x80 (Atlas: 128 / 48 / Пентагон)
+     sources/bulbulator_zx_ddr_top.v:542  0x004D5A58 = 'ZX' + вариант 'M'  (ядро MiSTer-48, ifdef MISTER48_CORE)
+     sources/bulbulator_nes_top.v:37      0x00014E45 = 'NE' + 1            (NES)
+   Незнакомое слово - НЕ ошибка (чужое или старое ядро): возвращаем 0, и решает вызывающий. */
+static const char* core_id_from_machid(uint32_t mid){
+    switch(mid){
+        case 0x00805A58u: return "ATLAS";
+        case 0x004D5A58u: return "MISTER48";
+        case 0x00014E45u: return "NES";
+        default:          return 0;
+    }
+}
+static int core_is_canonical(const char* name){    /* имя из таблицы CH_MACHINE_CORE, а не наш отладочный битстрим */
+    if(!name) return 0;
+    for(int m=0; m<N_MACHINES; m++) if(!cicmp(name, CH_MACHINE_CORE[m])) return 1;
+    return 0;
+}
+/* Догадка по VERSION - ЗАПАСНОЙ путь: только на старте и только если ядро не отдало ЗНАКОМОГО
+   MACHINE_ID (старое ядро без слова семейства). Битстрим там клала BootROM из BOOT.BIN, пути нет.
+   ⚠ МИНА: номера ядер идут по ОДНОМУ журналу сборок, литералы разные -
+   sources/bulbulator_zx_ddr_top.v:409 = 0xB01B0059 (MiSTer-48), :407 = 0xB01B005B (гибрид),
+   :417 = 0xB01B0130 (Atlas). По номеру семейство однозначно НЕ определяется: Atlas-сборка с
+   номером 0x0059 была бы названа MiSTer-48. Поэтому первым спрашиваем MACHINE_ID
+   (core_id_from_machid выше), а этот список нужен только ядрам, где слова семейства нет.
+   RTL для этого править НЕ надо - регистр 0x60 существует с самого control_plane (axi_ctl.v:313,
+   IDX_MACHID; значение приходит параметром MACHINE_ID). */
+static const char* core_id_from_version(uint32_t ver){
+    uint32_t cv = ver & 0xFFFFu;
+    if((cv & 0xFF00u) == 0xCE00u) return "NES";        /* у NES своё пространство — ловится маской, не списком */
+    if(cv == 0x0059u)             return "MISTER48";   /* известные версии ядра MiSTer-48 */
+    return "ATLAS";                                    /* всё остальное — ядро Atlas (общий счётчик сборок) */
+}
 /* PER-MACHINE store: each machine's own intrinsic set {INT v/h, paper h/v, crop l/r/t/b}, saved to the
    ini and reloaded on machine switch (owner: config keeps each machine's options; switching loads that
    machine's params, not only the core). crop is per-machine because machines output different line
    counts (Pentagon 320 vs 128K 311). opt_* = the LIVE working copy of the current machine (the menu
    edits it); mp_store/mp_load sync it. Screen X/Y stays GLOBAL (monitor centring). */
-typedef struct { int pint_v, pint_h, paper_h, paper_v, crop_l, crop_r, crop_t, crop_b, ula_late; } mach_params;
+/* v0.15.174: ONE per-machine parameter set. Screen position/scale and the joystick maps used to live in
+   separate flat arrays with their own ini keys (mscr_x<N>, joymap1/joymap2) - three different storage
+   styles for the same kind of data. Everything a machine owns now sits here and is written into that
+   machine's own "<tag>.<key>" ini section, next to paper/crop/INT.
+   Joystick defaults are in the PLATFORM bit order (0=R 1=L 2=D 3=U 4=A/Fire 5=B 6=Select 7=Start).
+   Only non-extended PS/2 codes are usable: joymap_capture() drops 0xE0/0xF0 frames, so an arrow key
+   arrives as its bare code (which is also the numpad code) - fine, but it cannot be told apart. */
+typedef struct { int pint_v, pint_h, paper_h, paper_v, crop_l, crop_r, crop_t, crop_b, ula_late;
+                 int scr_x, scr_y, scr_sx, scr_sy;      /* HDMI window position + integer upscale */
+                 int numjoy;                            /* v176: NumPad as joystick (UAE-style toggle) */
+                 int jsrc[2];                           /* v176: источник каждого игрока (см. CH_JOYSRC) */
+                 uint8_t joy[2][8];                     /* [player][bit] = raw PS/2 make code, 0 = unbound */
+                 int jtype[2];
+                 int socd;                              /* v206: режим противоположных направлений */
+                 char romset[ROMSET_PATHL];   /* v384: ИМЯ в 0:/ROMS/ ЛИБО полный путь (см. rom_path_make) */
+                 int svcrom;
+                 int dossvc; /* v388: страница ПЗУ под TR-DOS - 0 OFF / 1 AUTO / 2 ON. Дефолт задан
+                                ЯВНО в g_mp[] (.dossvc = 1): позиционные инициализаторы до этого поля
+                                не доходят, а нулём был бы тихий OFF у всех машин. */
+                 int saa;   /* v217: SAA1099 на #FF - 0 AUTO / 1 ON / 2 OFF */
+                 int gs;    /* v265: General Sound - 0 OFF / 1 ON */
+                 int ramsize; /* v314: объём ОЗУ машины - индекс CH_RAMSIZE (3 = 1024К) */
+                 int gsram; /* v281: ОЗУ карты GS - 0 128К / 1 512К / 2 1М / 3 2М (v299) */
+                 int snow;  /* v349: снег ULA - свойство МАШИНЫ (у Пентагона его нет, MiSTer-48 бит
+                               игнорирует). Дефолт задан явно ниже: .snow = 1 */
+                 int zc;    /* v350: Z-Controller - вкл/выкл на машину */
+                 int zcmode; /* v379: 0 FOLDER / 1 IMAGE */
+                 int zcfat32; /* v379: 0 FAT16 / 1 FAT32 (default 1) */
+                 int zcroot;  /* v379: 0 2048 / 1 512 */
+                 int zcturbo; /* v382: 1 Turbo 28MHz / 0 Standard 3.5MHz */
+                 char zcfile[96]; /* v379: path; empty = default 0:/DIVMMC/ or 0:/SDCARD.IMG */
+                 int gsclk; /* v336: частота карты GS - индекс CH_GSCLK. Дефолт задан ЯВНО в g_mp[]
+                               (.gsclk = GSCLK_DEF): позиционные инициализаторы до этого поля не
+                               доходят, а нулём было бы 12 МГц - то есть тихий откат к прежнему
+                               поведению у всех, кто не правил ini. */
+                 int ide;   /* v292: NEMO-IDE - 0 OFF / 1 ON (переключатель интерфейса) */
+                 int idedev;/* v292: 0 MASTER / 1 MASTER+SLAVE (см. ide_slave_present) */
+                 char rom[ROM_PG_N][ROMSET_NAMEL];  /* v302: персональный файл каждой страницы ПЗУ.
+                                       "" = страницу задаёт набор (или заводское ПЗУ битстрима).
+                                       Храним ИМЯ по той же причине, что и romset: список строится
+                                       обходом карты, и его порядок меняется от состава каталога. */
+                 int rombus;        /* v302: 0 AUTO (как в ядре), 1..4 = машина стартует со слота 0..3 */
+                 int rommode;       /* v384: раскладка страниц файла набора - 0 AUTO (по содержимому) / 1 MANUAL */
+                 int rommap[ROM_PG_N]; /* v384: MANUAL: rommap[слот] = номер страницы В ФАЙЛЕ, -1 = не грузить.
+                                          Дефолт -1 ставит config_load: позиционные инициализаторы g_mp[]
+                                          сюда не доходят, а нуль означал бы «все слоты со страницы 0». */
+                 int kmouse;        /* v304: мышь Kempston - 0 OFF / 1 ON / 2 KEYPAD (см. opt_kmouse) */
+                 char idefile[96];  /* v292: путь к образу .hdf. ПУСТО = дефолт 0:/HDD.HDF - так карта
+                                       без ключа в ini поднимается ровно как раньше. Храним ПУТЬ, а не
+                                       индекс, по той же причине, что и romset: карту могли переставить,
+                                       а выбор владельца обязан это пережить. */
+                 int divmmc; /* v327: DivMMC 0 OFF / 1 ON */
+                 int dmmode; /* v327: 0 FOLDER / 1 IMAGE */
+                 char dmfile[96]; /* v327: path; empty = 0:/DIVMMC or 0:/DIVMMC.IMG */
+                 } mach_params;        /* v207: ИМЯ файла набора ПЗУ в 0:/ROMS/ ("" = вшитое в битстрим).
+                                                           Хранится ИМЯ, а не индекс: список строится обходом карты и
+                                                           его порядок меняется от состава каталога. */           /* v0.15.199: ТИП джойстика каждого игрока (см. CH_JTYPE) */
+#define JOY_ZX_P1  {0x74,0x6B,0x72,0x75,0x73,0x6C,0x69,0x7A} /* NumPad: R6 L4 D2 U8 F5; extra bits 7/1/3 */
+#define JOY_ZX_P2  {0,0,0,0,0,0,0,0}                         /* ZX has one Kempston port, no synthetic P2 */
+#define JOY_NES_P1 {0x23,0x1C,0x1B,0x1D,0x42,0x3B,0x29,0x5A} /* WASD + K=A J=B Space=Select Enter=Start */
+#define JOY_NES_P2 {0x74,0x6B,0x72,0x75,0x4B,0x4C,0x66,0x71} /* numpad/arrows + L=A ;=B Bksp=Select Del=Start */
 static mach_params g_mp[N_MACHINES] = {
-    /* [0] zx128    */ { 248, 0,   0,  0,  0,0,0,0, 0 },   /* INT ignored by RTL (pentagon=0) */
-    /* [1] pent1024 */ { 299, 318, 0, 60,  0,0,0,0, 0 },   /* owner-tuned Pentagon defaults */
-    /* [2] zx48     */ { 248, 0,   0,  0,  0,0,0,0, 0 },   /* Atlas 48K = real Type 1/Early */
-    /* [3] zx48mr   */ { 248, 0,   0,  0,  0,0,0,0, 0 },   /* MiSTer native-48 core (separate .bit, PCAP-reloaded) */
+    /* [0] zx128    */ { 248, 0,   0,  0,  0,0,0,0, 0,  256, 58, 2,2, 0, {0,0}, {JOY_ZX_P1,  JOY_ZX_P2 }, {0,0}, 0, .gsclk = GSCLK_DEF, .snow = 1, .zcfat32 = 1, .zcturbo = 1, .dossvc = 1 },
+    /* v352: снега у Пентагона нет в железе - дефолт OFF (у 128/48 остаётся ON, там он настоящий) */
+    /* [1] pent1024 */ { 299, 318, 0, 60,  0,0,0,0, 0,  256, 58, 2,2, 0, {0,0}, {JOY_ZX_P1,  JOY_ZX_P2 }, {0,0}, 0, .gsclk = GSCLK_DEF, .snow = 0, .zcfat32 = 1, .zcturbo = 1, .dossvc = 1 },
+    /* [2] zx48     */ { 248, 0,   0,  0,  0,0,0,0, 0,  256, 58, 2,2, 0, {0,0}, {JOY_ZX_P1,  JOY_ZX_P2 }, {0,0}, 0, .gsclk = GSCLK_DEF, .snow = 1, .zcfat32 = 1, .zcturbo = 1, .dossvc = 1 },
+    /* [3] zx48mr   */ { 248, 0,   0,  0,  0,0,0,0, 0,  256, 58, 2,2, 0, {0,0}, {JOY_ZX_P1,  JOY_ZX_P2 }, {0,0}, 0, .gsclk = GSCLK_DEF, .snow = 1, .zcfat32 = 1, .zcturbo = 1, .dossvc = 1 },
+    /* [4] nes      */ { 0,   0,  63, 24,  0,0,0,0, 0,  128,  0, 4,3, 1, {0,0}, {JOY_NES_P1, JOY_NES_P2}, {0,0}, 0, .gsclk = GSCLK_DEF, .snow = 1, .zcfat32 = 1, .zcturbo = 1, .dossvc = 1 },
 };
+
+/* v210 platform policy.  An old global/per-machine ini may carry QAOP, Sinclair P2, or even a NES
+   map into a ZX profile.  Preserve every existing NumPad binding chosen by the owner, remove every
+   non-NumPad binding, and replace an old all-keyboard map with the NumPad default.  An intentionally
+   empty map stays empty.  NES is never touched. */
+static void zx_joy_profile_sanitize(int m){
+    if(m < 0 || m >= 4) return;
+    int bound = 0, kept = 0;
+    for(int b=0;b<8;b++){
+        uint8_t c = g_mp[m].joy[0][b];
+        if(c) bound++;
+        if(c && is_numpad(c)) kept++;
+        else if(c) g_mp[m].joy[0][b] = 0;
+        g_mp[m].joy[1][b] = 0;
+    }
+    if(bound && !kept){
+        static const uint8_t def[8] = JOY_ZX_P1;
+        for(int b=0;b<8;b++) g_mp[m].joy[0][b] = def[b];
+    }
+    g_mp[m].jsrc[0] = 0; g_mp[m].jsrc[1] = 0;
+    g_mp[m].jtype[0] = 0; g_mp[m].jtype[1] = 0;
+}
+static void joy_policy_migrate(void){ for(int m=0;m<4;m++) zx_joy_profile_sanitize(m); }
+
+/* Screen position/scale is deliberately NOT touched here: it has its own view+apply pair
+   (scr_view_sync / apply_scr) and a second writer of the same view is exactly the bug fixed in v170. */
+/* v292: обе функции нужны уже здесь - профиль машины хранит и состояние винчестера, а тела лежат
+   рядом с остальной службой NEMO-IDE, ниже по файлу. */
+static int  ide_slave_present(void);
+static void ide_close(void);
 static void mp_store(int m){ if(m<0||m>=N_MACHINES) return;
+    if(m < 4){                                      /* ZX: only P1 Kempston on NumPad */
+        opt_jsrc1=0; opt_jsrc2=0; opt_jtype1=0; opt_jtype2=0;
+        for(int b=0;b<8;b++){
+            if(!is_numpad(g_joymap[0][b])) g_joymap[0][b]=0;
+            g_joymap[1][b]=0;
+        }
+    }
     g_mp[m].pint_v=opt_pintv; g_mp[m].pint_h=opt_pinth; g_mp[m].paper_h=opt_paper_h; g_mp[m].paper_v=opt_paper_v;
     g_mp[m].crop_l=opt_crop_l; g_mp[m].crop_r=opt_crop_r; g_mp[m].crop_t=opt_crop_t; g_mp[m].crop_b=opt_crop_b;
-    g_mp[m].ula_late=opt_ulalate; }
+    g_mp[m].ula_late=opt_ulalate; g_mp[m].numjoy=opt_numjoy;
+    g_mp[m].jsrc[0]=opt_jsrc1; g_mp[m].jsrc[1]=opt_jsrc2;
+    g_mp[m].jtype[0]=opt_jtype1; g_mp[m].jtype[1]=opt_jtype2;    /* v199 */
+    g_mp[m].socd = opt_socd;                                     /* v206 */
+    /* v207: набор ПЗУ храним ИМЕНЕМ. Индекс 0 = BUILT-IN = пустая строка. */
+    { int i=0; const char* s = (opt_romset>0 && opt_romset<g_rs_n) ? g_rs_name[opt_romset] : "";
+      for(; s[i] && i<(int)sizeof(g_mp[m].romset)-1; i++) g_mp[m].romset[i]=s[i];
+      g_mp[m].romset[i]=0; }
+    g_mp[m].svcrom = opt_svcrom;                                 /* v207; v252: 0 OFF / 1 NMI / 2 ALWAYS */
+    g_mp[m].dossvc = (opt_dossvc >= 0 && opt_dossvc <= 2) ? opt_dossvc : 1;   /* v388 */
+    g_mp[m].rombus = (opt_rombus >= 0 && opt_rombus <= (int)ROM_PG_N) ? opt_rombus : 0;   /* v302 */
+    g_mp[m].saa    = (opt_saa >= 0 && opt_saa <= 2) ? opt_saa : 0;  /* v217 */
+    g_mp[m].gs     = opt_gs ? 1 : 0;                                /* v265 */
+    g_mp[m].snow   = opt_snow ? 1 : 0;                              /* v349: снег - свойство машины */
+    g_mp[m].zc     = opt_zc ? 1 : 0;                                /* v350 */
+    g_mp[m].gsram  = (opt_gsram >= 0 && opt_gsram <= 3) ? opt_gsram : 1;   /* v281 */
+    g_mp[m].gsclk  = (opt_gsclk >= 0 && opt_gsclk <= 3) ? opt_gsclk : GSCLK_DEF;   /* v336 */
+    g_mp[m].ramsize = (opt_ramsize >= 0 && opt_ramsize <= 3) ? opt_ramsize : 3;   /* v314 */
+    g_mp[m].ide    = opt_ide ? 1 : 0;                                       /* v292 */
+    g_mp[m].idedev = (opt_idedev && ide_slave_present()) ? 1 : 0;           /* v292: без второго образа только MASTER */
+    g_mp[m].divmmc = opt_divmmc ? 1 : 0;                                    /* v327 */
+    g_mp[m].dmmode = opt_dmmode ? 1 : 0;                                    /* v327 */
+    g_mp[m].kmouse = (opt_kmouse >= 0 && opt_kmouse <= 2) ? opt_kmouse : 0;  /* v304 */
+    for(int pl=0;pl<2;pl++) for(int b=0;b<8;b++) g_mp[m].joy[pl][b]=g_joymap[pl][b]; }
 static void mp_load (int m){ if(m<0||m>=N_MACHINES) return;
+    zx_joy_profile_sanitize(m);
     opt_pintv=g_mp[m].pint_v; opt_pinth=g_mp[m].pint_h; opt_paper_h=g_mp[m].paper_h; opt_paper_v=g_mp[m].paper_v;
     opt_crop_l=g_mp[m].crop_l; opt_crop_r=g_mp[m].crop_r; opt_crop_t=g_mp[m].crop_t; opt_crop_b=g_mp[m].crop_b;
-    opt_ulalate=g_mp[m].ula_late; }
+    opt_ulalate=g_mp[m].ula_late; opt_numjoy=g_mp[m].numjoy;
+    opt_jsrc1=g_mp[m].jsrc[0]; opt_jsrc2=g_mp[m].jsrc[1];
+    opt_jtype1=g_mp[m].jtype[0]; opt_jtype2=g_mp[m].jtype[1];    /* v199 */
+    opt_socd = g_mp[m].socd;                                     /* v206 */
+    /* v207: имя набора ПЗУ -> индекс в текущем списке. Файла больше нет на карте = молча BUILT-IN
+       (имя в ini НЕ трём: карту могли просто вынуть, и терять настройку из-за этого нельзя). */
+    opt_romset = 0;
+    if(g_mp[m].romset[0]) for(int i=1;i<g_rs_n;i++) if(!cicmp(g_rs_name[i], g_mp[m].romset)){ opt_romset=i; break; }
+    opt_svcrom = (g_mp[m].svcrom > 2) ? 2 : g_mp[m].svcrom;      /* v207; v252: три позиции */
+    opt_dossvc = (g_mp[m].dossvc >= 0 && g_mp[m].dossvc <= 2) ? g_mp[m].dossvc : 1;   /* v388 */
+    /* v302: стартовый слот - тоже собственность профиля. Чужое значение из ini не пускаем: 0 = AUTO,
+       то есть ровно прежнее поведение ядра, и старый конфиг без ключа поднимается как раньше. */
+    opt_rombus = (g_mp[m].rombus >= 0 && g_mp[m].rombus <= (int)ROM_PG_N) ? g_mp[m].rombus : 0;
+    /* v384: режим и таблица раскладки живут только в профиле (их правит модальный диалог, не стрелки),
+       поэтому здесь их не в VIEW-копию, а просто обезвреживаем чужие значения из ini. */
+    g_mp[m].rommode = g_mp[m].rommode ? 1 : 0;
+    for(uint32_t s=0; s<ROM_PG_N; s++)
+        if(g_mp[m].rommap[s] < -1 || g_mp[m].rommap[s] >= (int)ROM_PG_N) g_mp[m].rommap[s] = -1;
+    opt_saa    = (g_mp[m].saa >= 0 && g_mp[m].saa <= 2) ? g_mp[m].saa : 0;  /* v217 */
+    opt_gs     = g_mp[m].gs ? 1 : 0;
+    opt_snow   = g_mp[m].snow ? 1 : 0;                              /* v349: снег берём из профиля */
+    opt_zc     = g_mp[m].zc ? 1 : 0;                                /* v350 */
+    opt_zcmode = g_mp[m].zcmode ? 1 : 0;
+    opt_zcfat32= g_mp[m].zcfat32 ? 1 : 0;
+    opt_zcroot = g_mp[m].zcroot ? 1 : 0;
+    opt_zcturbo= (g_mp[m].zcturbo == 0) ? 0 : 1;                                        /* v265 */
+    opt_gsram  = (g_mp[m].gsram >= 0 && g_mp[m].gsram <= 3) ? g_mp[m].gsram : 1;   /* v281 */
+    /* v336: частота карты - собственность профиля, и она обязана уехать в саму карту ЗДЕСЬ. Смена
+       машины не перезапускает GS, поэтому без этой строки карта осталась бы на частоте прежней
+       машины, а меню показывало бы частоту новой - ровно тот разрыв «интерфейс врёт», от которого
+       заведены vnote/vwhy. */
+    opt_gsclk  = (g_mp[m].gsclk >= 0 && g_mp[m].gsclk <= 3) ? g_mp[m].gsclk : GSCLK_DEF;   /* v336 */
+    gs_set_clock_hz(GSCLK_HZ[opt_gsclk]);
+    opt_ramsize = (g_mp[m].ramsize >= 0 && g_mp[m].ramsize <= 3) ? g_mp[m].ramsize : 3;   /* v314 */
+    opt_ide    = g_mp[m].ide ? 1 : 0;                                              /* v292 */
+    opt_idedev = (g_mp[m].idedev && ide_slave_present()) ? 1 : 0;                  /* v292 */
+    opt_divmmc = g_mp[m].divmmc ? 1 : 0;                                           /* v327 */
+    opt_dmmode = g_mp[m].dmmode ? 1 : 0;                                           /* v327 */
+    opt_kmouse = (g_mp[m].kmouse >= 0 && g_mp[m].kmouse <= 2) ? g_mp[m].kmouse : 0;  /* v304 */
+    g_km_last  = 0xFFFFFFFFu;   /* у новой машины своё разрешение мыши - слово обязано уехать заново */
+    ide_close();   /* v292: образ - собственность ПРОФИЛЯ. У новой машины свой путь, поэтому старый
+                      файл закрываем здесь, а служба откроет нужный на следующем проходе. */
+    divmmc_close();   /* v327: DivMMC path is per-machine too */
+    g_jmx_cur[0]=0; g_jmx_cur[1]=0;      /* смена машины - матрица чужая, состояние инжекта сбросить */
+    for(int pl=0;pl<2;pl++) for(int b=0;b<8;b++) g_joymap[pl][b]=g_mp[m].joy[pl][b];
+    g_joy_last=0xFFFFFFFFu; }                 /* new map -> force JOY_STATE to be re-pushed */
+/* labels + player count of the CURRENT machine (used by the wizard and by nothing else) */
+/* v0.15.176 NUMPAD AS JOYSTICK (владелец выбрал вариант UAE; нужен на ВСЕХ машинах, поэтому строка
+   есть в подменю каждой). Выключено - цифровой блок как раньше принадлежит оболочке (Vol+/-, выделение)
+   и его же можно назначить на джойстик. Включено - блок принадлежит ТОЛЬКО джойстику: оболочка и
+   модальные диалоги его игнорируют, поэтому второй игрок не двигает курсор и не крутит громкость.
+   Стрелки не участвуют: с v175 это отдельные коды (|0x80), их у навигатора никто не забирает. */
+static int is_numpad(uint32_t c){          /* тело; fwd-объявление выше, рядом с joy_key_down */
+    switch(c){
+        case 0x70u: case 0x69u: case 0x72u: case 0x7Au: case 0x6Bu:   /* KP0 KP1 KP2 KP3 KP4 */
+        case 0x73u: case 0x74u: case 0x6Cu: case 0x75u: case 0x7Du:   /* KP5 KP6 KP7 KP8 KP9 */
+        case 0x71u: case 0x79u: case 0x7Bu: case 0x7Cu:               /* KP.  KP+  KP-  KP*  */
+        case 0xCAu: case 0xDAu: return 1;                              /* KP/ и KP-Enter (расширенные) */
+        default: return 0;
+    }
+}
+/* v0.15.188 ЗВУК НЕ ОТДАЁМ ДЖОЙСТИКУ (владелец ещё в постановке спрашивал: "надо ли переключать
+   передачу цифровой клавиатуры машине? там же у нас громкость, мьют?").
+   Приборно найдено инжектом клавиш: на NES включён «NumPad as joystick», и гейт отдавал джойстику
+   ВЕСЬ блок - вместе с KP+/KP-/KP*, поэтому громкость и мьют пропадали совсем (ни в игре, ни в
+   навигаторе, ни в меню). Правило теперь точное и машино-агностичное: три звуковые клавиши остаются
+   у оболочки, ПОКА они не назначены в карте джойстика этой машины. Свободное назначение сохранено:
+   привязал KP+ к кнопке - она уходит джойстику, как любая другая. В штатных картах их нет. */
+static int joy_code_bound(uint32_t c){
+    if(!c) return 0;
+    for(int p=0;p<2;p++) for(int b=0;b<8;b++) if(g_joymap[p][b] == (uint8_t)c) return 1;
+    return 0;
+}
+static int numpad_is_joy(uint32_t c){
+    if(kmouse_owns_numpad()) return 0;             /* v304: блок сейчас у мыши, а не у джойстика */
+    if(!opt_numjoy || !is_numpad(c)) return 0;
+    if((c==SC_KPPLUS || c==SC_KPMINUS || c==SC_KPMUL) && !joy_code_bound(c)) return 0;
+    return 1;
+}
+/* ==== v0.15.304 МЫШЬ KEMPSTON НА ЦИФРОВОЙ КЛАВИАТУРЕ =========================================
+   Задача владельца: мышиного софта на Спектруме много (браузер Z-Player 4.1, ART Studio, Sprite
+   Magic, файловые менеджеры), а физической мыши у нас нет - без неё музыку живым плеером с образа
+   не запустить вообще. Порты #FADF/#FBDF/#FFDF делает ядро (`sources/kempston_mouse.v`, B0116),
+   а «руку» подставляет оболочка.
+
+   ПОЧЕМУ ЦИФРОВОЙ БЛОК, А НЕ СТРЕЛКИ: стрелки принадлежат навигатору всегда (с v175 у них свои
+   коды |0x80, и отбирать их нельзя), а цифровой блок у нас УЖЕ переключаемый - NumLock решает, чей
+   он (v180). Мышь просто становится третьим возможным владельцем того же блока.
+
+   Раскладка - тот же геометрический смысл, что у клавиатурного джойстика:
+       8 вверх, 2 вниз, 4 влево, 6 вправо, 7/9/1/3 - четыре диагонали;
+       0 и 5 - ЛЕВАЯ кнопка, KP-Enter и KP-точка - ПРАВАЯ.
+   KP+ / KP- / KP* не трогаем вовсе: это громкость и мьют оболочки (правило v188, владелец про них
+   спрашивал отдельно). Ни одна клавиша штатной карты джойстика при этом не «занята» насовсем -
+   карта остаётся в профиле машины и оживает, как только блок вернут джойстику.
+
+   УСКОРЕНИЕ. Без него курсором по экрану не находишься: точка за нажатие - это сотни нажатий на
+   ширину экрана, а сразу быстрый шаг не даёт попасть в пункт меню. Поэтому две фазы, как у
+   тайпматика клавиатуры: короткое нажатие = РОВНО ОДИН шаг (и это не зависит от темпа главного
+   цикла - иначе на разных сборках «щелчок» давал бы разное расстояние), удержание дольше паузы =
+   повтор с постоянным темпом и РАСТУЩИМ шагом. */
+#define KM_TICK_C   (COUNTS_PER_SECOND/125u)   /* 8 мс между отсчётами: настоящая мышь PS/2 рапортует
+                                                  100 раз в секунду, то есть темп реалистичный и
+                                                  софтом воспринимается как обычное движение */
+#define KM_HOLD_US   220000u                   /* пауза перед разгоном. Короче - одиночный щелчок
+                                                  начинает уезжать; длиннее - управление вязкое */
+#define KM_RAMP_US   800000u                   /* за столько удержания шаг вырастает от 1 до предела */
+#define KM_STEP_MAX  8                         /* 8 точек за отсчёт = 1000 точек/с. Столько же даёт
+                                                  настоящая мышь на быстром движении, а экран
+                                                  шириной 256 отсчётов пролетается за четверть секунды */
+static int      g_km_cap  = -1;        /* LOAD_CAPS бит6; перечитывается при каждой смене ядра */
+static uint32_t g_km_x = 128, g_km_y = 0;   /* X != Y НАМЕРЕННО: по несовпадению координат софт
+                                               отличает живую мышь от плавающей шины (то же
+                                               начальное значение стоит и в фабрике) */
+static uint8_t  g_km_btn = 0;
+static XTime    g_km_hold_t = 0;       /* когда началось непрерывное удержание направления (0 = нет) */
+static XTime    g_km_tick_t = 0;       /* когда двигали в последний раз */
+static uint32_t g_km_last = 0xFFFFFFFFu;    /* последнее отданное фабрике слово (не гоняем шину зря) */
+static int kmouse_owns_numpad(void){
+    /* Владелец блока РОВНО ОДИН - и мышь берёт его только пока фокус в МАШИНЕ. Открыт навигатор или
+       меню - цифровые клавиши снова принадлежат оболочке, иначе ими нельзя было бы ни листать
+       список, ни набирать числа в диалогах. */
+    return (opt_kmouse == 2) && !osd_on && !browser_on;
+}
+static int km_dn(uint32_t c){ return g_kd[c] ? 1 : 0; }
+static void kmouse_eval(void){
+    if(g_km_cap < 0) g_km_cap = (LOAD_CAPS_R & LOADCAP_KMOUSE) ? 1 : 0;
+    if(!g_km_cap) return;                       /* ядро без портов мыши - писать некуда */
+    if(kmouse_owns_numpad()){
+        int up = km_dn(0x75) | km_dn(0x6C) | km_dn(0x7D);      /* 8, 7, 9 */
+        int dw = km_dn(0x72) | km_dn(0x69) | km_dn(0x7A);      /* 2, 1, 3 */
+        int lf = km_dn(0x6B) | km_dn(0x6C) | km_dn(0x69);      /* 4, 7, 1 */
+        int rt = km_dn(0x74) | km_dn(0x7D) | km_dn(0x7A);      /* 6, 9, 3 */
+        int dx = rt - lf;
+        int dy = up - dw;      /* у мыши Kempston Y растёт «от себя», то есть ВВЕРХ по экрану */
+        uint8_t b = 0;
+        if(km_dn(0x70) || km_dn(0x73)) b |= 1u;   /* KP0 и KP5 - левая кнопка */
+        if(km_dn(0xDA) || km_dn(0x71)) b |= 2u;   /* KP-Enter (E0 5A свёрнут в 0xDA) и KP-точка - правая */
+        g_km_btn = b;
+        XTime now; XTime_GetTime(&now);
+        if(!dx && !dy){
+            g_km_hold_t = 0;                      /* отпустили - разгон начинается заново */
+        } else if(!g_km_hold_t){
+            g_km_x = (g_km_x + (uint32_t)dx) & 0xFFu;   /* короткое нажатие = РОВНО один шаг */
+            g_km_y = (g_km_y + (uint32_t)dy) & 0xFFu;   /* координаты 8-битные, сворачиваются - как у железа */
+            g_km_hold_t = now; g_km_tick_t = now;
+        } else if((uint64_t)(now - g_km_tick_t) >= (uint64_t)KM_TICK_C){
+            uint64_t held = ((uint64_t)(now - g_km_hold_t)) * 1000000u / (uint64_t)COUNTS_PER_SECOND;
+            if(held >= KM_HOLD_US){
+                uint64_t r = held - KM_HOLD_US;
+                int step = 1 + (int)((r * (uint64_t)(KM_STEP_MAX - 1)) / (uint64_t)KM_RAMP_US);
+                if(step > KM_STEP_MAX) step = KM_STEP_MAX;
+                g_km_x = (g_km_x + (uint32_t)(dx * step)) & 0xFFu;
+                g_km_y = (g_km_y + (uint32_t)(dy * step)) & 0xFFu;
+                g_km_tick_t = now;
+            }
+        }
+    } else {
+        /* Фокус ушёл в оболочку (или режим не клавиатурный): кнопки ОТПУСКАЕМ. Иначе нажатая перед
+           открытием навигатора кнопка осталась бы зажатой у машины на всё время работы в
+           оболочке - та же болезнь, от которой в v256 появился zx_release_all. */
+        g_km_btn = 0; g_km_hold_t = 0;
+    }
+    uint32_t w = (opt_kmouse ? 0x80000000u : 0u)
+               | ((uint32_t)(g_km_btn & 7u) << 16)
+               | ((g_km_y & 0xFFu) << 8)
+               | (g_km_x & 0xFFu);
+    if(w != g_km_last){ KM_CTL = w; g_km_last = w; }
+}
+
+/* v0.15.178 (владелец: "когда навигатор не работает, все клавиши кроме F1-F12 должны уходить в машину").
+   Это принцип «фокус в игре» (в RetroArch - Game Focus): при закрытой оболочке ARM оставляет себе ТОЛЬКО
+   функциональные клавиши, всё остальное принадлежит машине. Заодно снимается давняя жалоба про Space,
+   который ставил плеер на паузу прямо во время игры, и про numpad +/- на громкости.
+   Машина клавиши при этом не теряет: у ZX они идут в матрицу через ФАБРИКУ (always-tap FIFO + гейт),
+   у NES - через JOY_STATE, который joymap_eval() успевает пересчитать ДО этой отсечки.
+   Ctrl+Alt+Del, F11 и Ins декодирует сама фабрика - они работают независимо от этого правила. */
+/* v179: клавиши, которые оболочка слушает ВСЕГДА, даже когда фокус в игре:
+   - 0xE1/0x14/0x77 - последовательность клавиши Pause (пауза машины нужна именно во время игры);
+   - KP+ / KP- / KP* - громкость и выделение, но ТОЛЬКО пока цифровой блок не отдан джойстику
+     (владелец: "там же у нас громкость, мьют"). Отдал блок джойстику - громкость живёт в OSD. */
+static int is_shell_always(uint32_t c){
+    if(c==0xE1u || c==0x14u || c==0x77u) return 1;
+    if(!opt_numjoy && (c==SC_KPPLUS || c==SC_KPMINUS || c==SC_KPMUL)) return 1;
+    return 0;
+}
+static int is_shell_fkey(uint32_t c){
+    switch(c){
+        case SC_F1: case SC_F2: case SC_F3: case SC_F4:  case SC_F5:  case SC_F6:
+        case SC_F7: case SC_F8: case SC_F9: case SC_F10: case SC_F11: case SC_F12: return 1;
+        default: return 0;
+    }
+}
+static const char* const* joybtn_tab(void){ return (opt_defmachine==4) ? JOYBTN_NES : JOYBTN_ZX; }
+static int joy_players(void){ int m=(opt_defmachine>=0&&opt_defmachine<5)?opt_defmachine:0; return MACHINE_PLAYERS[m]; }
 static const char* const CH_012[] = {"0","1","2"};
+/* v176: источник каждого игрока. PAD-варианты станут выбираемыми, когда фабрика поднимет
+   LOAD_CAPS bit1/bit2; до тех пор apply_jsrc зажимает выбор на KEYBOARD. */
+static const char* const CH_JOYSRC[] = {"KEYBOARD","PAD 1","PAD 2","KEYBOARD+PAD"};
+
 /* ---- pause/now-playing BANNER state (independent overlay) ---- */
 static char  g_app_path[180] = "";       /* full SD path of the last-loaded snapshot (game/demo) */
 static int   g_app_stopped   = 0;        /* 1 = the loaded app was hard-reset (F11): keep the name, show STOP */
@@ -898,7 +2455,11 @@ static FATFS g_fs;
    media I/O failure drops the volume and F5 remounts it, so a yanked card cannot wedge the OSD loop.
    FR_NO_FILE/FR_NO_PATH are ordinary selection mistakes, however: unmounting for them made one bad
    JTAG/autoload path falsely turn a healthy card into "NO CARD" until a full restart. */
-static void sd_unmount(void){ f_mount(0, "0:/", 0); sd_mounted = 0; }
+/* v0.15.293: том уходит - значит уходят и ВСЕ открытые на нём файлы. Образ винчестера этого не
+   знал: g_ide_open оставался единицей поверх мёртвой файловой системы, служба NEMO считала диск
+   вставленным и уже никогда не переоткрывала его (ide_open уходит в ранний возврат), то есть
+   вынутая карта убивала IDE до перезагрузки. */
+static void sd_unmount(void){ ide_close(); f_mount(0, "0:/", 0); sd_mounted = 0; tv_fs_touch(); }
 static void sd_drop_on_io_error(FRESULT r){
     if(r==FR_DISK_ERR || r==FR_INT_ERR || r==FR_NOT_READY) sd_unmount();
 }
@@ -907,8 +2468,12 @@ static int   sel_scroll = 0;         /* marquee offset of the selected (long) na
 static XTime last_scroll = 0;
 static XTime last_probe  = 0;   /* throttle the no-card-detect remount poll (EBAZ has no CD line) */
 
-static void itoa_u(int v, char* o){ char t[8]; int q=0; if(!v){o[0]='0';o[1]=0;return;}
-    while(v&&q<7){t[q++]='0'+v%10;v/=10;} int p=0; while(q)o[p++]=t[--q]; o[p]=0; }
+/* v0.15.293: печатаем ВСЕ 32 бита без знака. Было `int` и семь цифр: у размера образа винчестера
+   (миллионы секторов) и у счётчика обслуженных команд старшие разряды молча отваливались, то есть
+   прибор врал ровно там, где по нему судят о работе диска. Все наши числа неотрицательны (диапазоны
+   меню начинаются с нуля), поэтому знак не нужен, а 10 цифр покрывают 4294967295. */
+static void itoa_u(uint32_t v, char* o){ char t[10]; int q=0; if(!v){o[0]='0';o[1]=0;return;}
+    while(v&&q<10){t[q++]=(char)('0'+v%10u);v/=10u;} int p=0; while(q)o[p++]=t[--q]; o[p]=0; }
 static int  is_root(void){ return curpath[0]=='0'&&curpath[1]==':'&&curpath[2]=='/'&&curpath[3]==0; }
 
 static int cicmp(const char* a, const char* b){      /* case-insensitive string compare */
@@ -967,6 +2532,7 @@ static void remap_playing_idx(void){
 }
 
 static void sd_scan(void){               /* mount once + read curpath into flist[] */
+    tv_fs_touch();
     fcount = 0;   /* keep bcursor/btop: only a directory change resets the cursor, so a re-open (F5) lands where you were */
     for(int i=0;i<MAXFILES;i++) fsel[i]=0;   /* a fresh listing invalidates the old tags (indices change) */
     if(!sd_mounted){
@@ -986,6 +2552,7 @@ static void sd_scan(void){               /* mount once + read curpath into flist
         if(f_opendir(&dir, curpath) != FR_OK){ sd_unmount(); return; }   /* really gone -> NO CARD */
     }
     int _kbscan=0;
+    g_flist_trunc = 0;
     while(fcount < MAXFILES && (rr=f_readdir(&dir, &fno)) == FR_OK && fno.fname[0]){
         if((_kbscan++ & 63)==0) KBD_HB=1;                     /* Step 15: pet the deadman during a big dir walk so the OSD key gate never drops mid-scan */
         if(!opt_showhidden){                                  /* hide hidden/system + dotfiles (macOS .DS_Store, ._x, .Trashes, .Spotlight junk) */
@@ -1004,6 +2571,11 @@ static void sd_scan(void){               /* mount once + read curpath into flist
     if(rr != FR_OK){ sd_unmount(); return; }   /* error mid-enumeration -> card gone, don't show a partial list */
     sort_entries();
     remap_playing_idx();                                   /* keep playing_idx on the playing track after the re-sort */
+    /* v0.15.202: упёрлись в предел? Проверяем, есть ли за ним ещё записи, и честно помечаем. */
+    if(fcount >= MAXFILES){
+        FILINFO fx;
+        if(f_readdir(&dir, &fx) == FR_OK && fx.fname[0]) g_flist_trunc = 1;
+    }
     if(bcursor>=fcount) bcursor = fcount ? fcount-1 : 0;   /* keep the remembered cursor in range if the dir shrank */
     if(btop>bcursor) btop=bcursor;
     if(bcursor>=btop+BROWS) btop=bcursor-(BROWS-1);
@@ -1035,6 +2607,133 @@ static FRESULT fs_rmrf(char* p, int depth){
     }
     return f_unlink(p);                                        /* now-empty dir, or a plain file */
 }
+/* v0.15.166: пока оболочка ЖДЁТ клавишу (открытое OSD, меню, диалог, визард), главный цикл не крутится
+   и fs_service() не вызывается - задокументированная гоча «при открытом меню мейлбокс молчит». Из-за неё
+   удалённая навигация из JTAG-КВМ умирала на первом же F12: навигатор открывался, и следующий инжект уже
+   никто не читал. Здесь обслуживаем ТОЛЬКО команду 11 (инжект клавиши): она не трогает ни FatFs, ни PL,
+   ни экран, поэтому безопасна из любого модального цикла и не создаёт рекурсии. Тяжёлые команды
+   (2/6/9/10) по-прежнему выполняются только из главного цикла. */
+static void kbd_inj_pump(void){
+    if(g_fs_cmd != 11u) return;
+    g_fs_cmd = 0; g_fs_done = 0; g_fs_err = 0;
+    if((g_kinj_w + 1u - g_kinj_r) > KINJ_N){ g_fs_err = 0xF1u; g_fs_done = 0xE; return; }
+    g_kinj[g_kinj_w % KINJ_N] = (g_fs_len & 0x2FFu);
+    g_kinj_w++;
+    g_fs_n = (uint32_t)(g_kinj_w - g_kinj_r);
+    g_fs_done = 1;
+}
+
+/*==================================================================================================
+  v0.15.297 ПОФАЗНЫЙ СЕКУНДОМЕР ГЛАВНОГО ЦИКЛА - PH_TIMER_V297 (временный прибор, не фича)
+
+  ЗАЧЕМ. Карта General Sound тактируется не кварцем, а тем, что успевает посчитать ARM: её очередь
+  сэмплов глубиной 4096 (85 мс при 47996 Гц), и пока главный цикл занят чем-то другим, эмулятор
+  карты СТОИТ - в Z-Player это видно как «9 МГц вместо 12», а на слух как замирание звука. Общий
+  g_loop_max_us говорит только, ЧТО проход был долгим; здесь записывается, КАКАЯ фаза его съела.
+
+  ЧЕМ МЕРЯЕМ. Тактами процессора (счётчик PMU CCNT, одна инструкция mrc), а не XTime_GetTime:
+  глобальный таймер лежит в области устройств, его чтение стоит десятки наносекунд, а отметок на
+  проход больше десятка - секундомер начал бы искажать то, что меряет. Делений в горячем пути нет
+  вовсе (у Cortex-A9 нет целочисленного деления, это вызов библиотеки): копим ТАКТЫ, в микросекунды
+  переводит хост. Счётчик 32-битный, на 666 МГц переполняется за 6.4 с - разность беззнаковых это
+  переживает, а фаза длиной 6 с уже не «фаза».
+
+  КУДА ПИШЕМ. Накопители - обычные кэшируемые статики (запись в некэшируемый мейлбокс стоит дорого
+  и сама исказила бы замер), а в мейлбокс таблица переливается раз в 512 проходов. Кольцо провалов
+  пишется сразу - оно редкое, и именно оно отвечает на вопрос «раз в сколько секунд».
+==================================================================================================*/
+#define PH_DISK 0    /* дисковод: обслуживание запроса контроллера (без чтения самой карты) */
+#define PH_CARD 1    /* из него - ЧИСТОЕ чтение сектора образа с SD-карты */
+#define PH_SYNC 2    /* сброс метаданных FAT в простое (f_sync) */
+#define PH_NET  3    /* Ethernet */
+#define PH_GS   4    /* gs_service: прокачка звука карты General Sound */
+#define PH_IDE  5    /* NEMO-IDE */
+#define PH_FS   6    /* файловая служба мейлбокса */
+#define PH_PLAY 7    /* файловый плеер оболочки */
+#define PH_TAPE 8    /* лента */
+#define PH_NAV  9    /* навигатор и бегущие строки */
+#define PH_KBD  10   /* вычерпывание FIFO клавиатуры (и всё, что запускают клавиши) */
+#define PH_MISC 11   /* остальное тело прохода: джойстик, светодиоды, ROM-трап */
+#define PH_N    12
+/* Зеркало в мейлбоксе. 0x5400 выбран после 0x3200..0x51FF (трасса NEMO-IDE) - первый свободный. */
+#define PH_M_MAX   ((volatile uint32_t*)(KMB+0x5400u))   /* худшее время фазы, ТАКТЫ */
+#define PH_M_GT1   ((volatile uint32_t*)(KMB+0x5440u))   /* сколько раз фаза стоила дольше 1 мс */
+#define PH_M_SUM   ((volatile uint32_t*)(KMB+0x5480u))   /* суммарно, такты/64 */
+#define PH_M_CALL  ((volatile uint32_t*)(KMB+0x54C0u))   /* сколько раз фаза выполнялась */
+#define PH_M_CPUM  (*(volatile uint32_t*)(KMB+0x5900u))  /* тактов процессора в микросекунде */
+#define PH_M_MS    (*(volatile uint32_t*)(KMB+0x5904u))  /* мс с момента обнуления таблицы */
+#define PH_M_PASS  (*(volatile uint32_t*)(KMB+0x5908u))  /* проходов главного цикла */
+#define PH_M_EVW   (*(volatile uint32_t*)(KMB+0x54F0u))  /* кольцо провалов: указатель записи */
+#define PH_M_EVN   (*(volatile uint32_t*)(KMB+0x54F4u))  /* провалов всего */
+#define PH_M_UNDR  (*(volatile uint32_t*)(KMB+0x54F8u))  /* сэмплов тишины отдано вместо звука карты */
+#define PH_M_UNGP  (*(volatile uint32_t*)(KMB+0x54FCu))  /* эпизодов такой тишины (замираний) */
+#define PH_M_EV    ((volatile uint32_t*)(KMB+0x5500u))   /* 64 записи по 4 слова: фаза, мкс, мс, замираний */
+#define PH_EV_CAP  64u
+extern volatile uint32_t g_gs_under, g_gs_ungap;         /* считает потребитель звука (player.c) */
+static uint32_t g_ph_max[PH_N], g_ph_gt1[PH_N], g_ph_call[PH_N];
+static uint64_t g_ph_sum[PH_N];   /* 64 бита: округление на каждом интервале съедало 18% времени */
+static uint32_t g_ph_last = 0, g_ph_cpum = 666, g_ph_1ms = 666000u, g_ph_3ms = 1998000u;
+static XTime    g_ph_t0 = 0;
+static inline uint32_t ph_ccnt(void){
+    uint32_t v; __asm__ volatile("mrc p15, 0, %0, c9, c13, 0" : "=r"(v)); return v;
+}
+static void ph_reset(void){
+    for(int i=0;i<PH_N;i++){ g_ph_max[i]=0; g_ph_gt1[i]=0; g_ph_sum[i]=0; g_ph_call[i]=0;
+                             PH_M_MAX[i]=0; PH_M_GT1[i]=0; PH_M_SUM[i]=0; PH_M_CALL[i]=0; }
+    for(uint32_t i=0;i<PH_EV_CAP*4u;i++) PH_M_EV[i]=0;
+    PH_M_EVW=0; PH_M_EVN=0; g_gs_under=0; g_gs_ungap=0;
+    XTime_GetTime(&g_ph_t0);
+    g_ph_last = ph_ccnt();
+}
+static void ph_init(void){
+    uint32_t v;
+    __asm__ volatile("mrc p15, 0, %0, c9, c12, 0" : "=r"(v));
+    v |= 1u | 4u;    /* E: счётчики идут; C: обнулить счётчик тактов */
+    v &= ~8u;        /* D=0: считаем ТАКТЫ, а не такты/64 - нужна микросекундная точность */
+    __asm__ volatile("mcr p15, 0, %0, c9, c12, 0" :: "r"(v));
+    v = 0x80000000u; /* разрешить сам CCNT */
+    __asm__ volatile("mcr p15, 0, %0, c9, c12, 1" :: "r"(v));
+    /* Глобальный таймер тикает на половине частоты процессора - отсюда и такты в микросекунде. */
+    g_ph_cpum = (uint32_t)((2ull * (uint64_t)COUNTS_PER_SECOND) / 1000000ull);
+    if(g_ph_cpum < 100u) g_ph_cpum = 666u;
+    g_ph_1ms = g_ph_cpum * 1000u;
+    g_ph_3ms = g_ph_cpum * 3000u;
+    ph_reset();
+}
+/* Закрыть интервал и записать его в счёт фазы `slot`. Единственная точка учёта. */
+/* v0.15.308: короткий насос приёма для ДОЛГИХ фаз оболочки. Тело - ниже, рядом с самим насосом
+   флагов General Sound; объявление нужно здесь, потому что первым его зовёт служба дисковода. */
+static void gs_wq_kick(void);
+static void ph_mark(int slot){
+    uint32_t now = ph_ccnt();
+    uint32_t d   = now - g_ph_last;
+    g_ph_last = now;
+    g_ph_call[slot]++;
+    g_ph_sum[slot] += d;
+    if(d > g_ph_max[slot]) g_ph_max[slot] = d;
+    if(d > g_ph_1ms){
+        g_ph_gt1[slot]++;
+        if(d > g_ph_3ms){                 /* провал: очередь карты держит всего 85 мс, 3 мс уже видно */
+            uint32_t i = PH_M_EVW % PH_EV_CAP;
+            XTime t; XTime_GetTime(&t);
+            PH_M_EV[i*4u+0u] = (uint32_t)slot;
+            PH_M_EV[i*4u+1u] = d / g_ph_cpum;                                   /* мкс */
+            PH_M_EV[i*4u+2u] = (uint32_t)(((uint64_t)(t - g_ph_t0) * 1000ull) / (uint64_t)COUNTS_PER_SECOND);
+            PH_M_EV[i*4u+3u] = g_gs_ungap;                                      /* замираний к этому мигу */
+            PH_M_EVW = i + 1u; PH_M_EVN++;
+        }
+    }
+}
+/* Перелить накопители в мейлбокс. Зовётся редко: некэшируемая запись дорога. */
+static void ph_flush(void){
+    XTime t; XTime_GetTime(&t);
+    for(int i=0;i<PH_N;i++){ PH_M_MAX[i]=g_ph_max[i]; PH_M_GT1[i]=g_ph_gt1[i];
+                             PH_M_SUM[i]=(uint32_t)(g_ph_sum[i] >> 6); PH_M_CALL[i]=g_ph_call[i]; }
+    PH_M_CPUM = g_ph_cpum;
+    PH_M_MS   = (uint32_t)(((uint64_t)(t - g_ph_t0) * 1000ull) / (uint64_t)COUNTS_PER_SECOND);
+    PH_M_UNDR = g_gs_under;
+    PH_M_UNGP = g_gs_ungap;
+}
 static void fs_service(void){
     uint32_t cmd = g_fs_cmd;
     if(cmd == 0) return;                       /* cheap poll: nothing requested */
@@ -1046,6 +2745,12 @@ static void fs_service(void){
     char p1[256], p2[256];
     { int i=0; for(; i<(int)sizeof(p1)-1 && g_fs_path[i];  i++) p1[i]=g_fs_path[i];  p1[i]=0; }
     { int i=0; for(; i<(int)sizeof(p2)-1 && g_fs_path2[i]; i++) p2[i]=g_fs_path2[i]; p2[i]=0; }
+
+    /* v366: пишущие команды по смонтированной папке DivMMC делают том устаревшим. 2 WRITE,
+       3 DELETE, 4 RENAME, 5 MKDIR, 6 COPY, 7 APPEND - у RENAME и COPY цель во ВТОРОМ пути. */
+    if(cmd==2u || cmd==3u || cmd==4u || cmd==5u || cmd==6u || cmd==7u){
+        if(dm_path_inside(p1) || dm_path_inside(p2)) g_dm_dirty = 1;
+    }
 
     if(cmd == 1){                              /* ---- LIST: enumerate dir p1 into g_fs_out ---- */
         g_fs_n = 0; g_fs_out[0] = 0;
@@ -1075,6 +2780,9 @@ static void fs_service(void){
 
     if(cmd == 2){                              /* ---- WRITE: FS_BUF_ADDR[0..g_fs_len) -> file p1 ---- */
         FIL f; UINT bw; FRESULT rr;             /* dow -data staged the bytes in the NON-CACHEABLE window */
+        /* v256: создать недостающие каталоги пути. Без этого f_open отвечает FR_NO_PATH (5), и
+           это читается как сбой записи, хотя не хватает лишь пути. */
+        fs_mkpath(p1);
         if((rr=f_open(&f, p1, FA_WRITE|FA_CREATE_ALWAYS)) != FR_OK){ g_fs_err=(uint32_t)rr; g_fs_done=0xE; return; }
         const uint8_t* src = (const uint8_t*)FS_BUF_ADDR;
         uint32_t left = g_fs_len, off = 0; int ok = 1;
@@ -1120,10 +2828,70 @@ static void fs_service(void){
         return;
     }
 
+    if(cmd == 12){                             /* ---- v170 READ: file p1 -> FS_BUF_ADDR, up to g_fs_len bytes ----
+                                                  The mailbox could WRITE/COPY/RENAME but never READ, so a host could
+                                                  not even look at bulbulator.ini to see why a setting behaved oddly. */
+        FIL f; UINT br; FRESULT rr;
+        uint32_t cap = g_fs_len ? g_fs_len : 65536u;
+        if(cap > 4u*1024u*1024u) cap = 4u*1024u*1024u;
+        if((rr=f_open(&f, p1, FA_READ)) != FR_OK){ g_fs_err=(uint32_t)rr; g_fs_done=0xE; return; }
+        uint8_t* dst = (uint8_t*)FS_BUF_ADDR;
+        uint32_t off = 0; int ok = 1;
+        while(off < cap){
+            UINT chunk = ((cap-off) > 32768u) ? 32768u : (UINT)(cap-off);
+            if((rr=f_read(&f, dst+off, chunk, &br)) != FR_OK){ ok=0; break; }
+            off += br;
+            if(br < chunk) break;                  /* end of file */
+            if((off & 0x3FFFFu)==0) KBD_HB=1;
+        }
+        f_close(&f);
+        g_fs_n = off;                              /* bytes actually read */
+        if(ok){ g_fs_done = 1; } else { g_fs_err=(uint32_t)rr; g_fs_done=0xE; }
+        return;
+    }
+
+    if(cmd == 13){                             /* ---- v0.15.428 WRITE-AT: FS_BUF[0..g_fs_len) -> p1 @ offset(p2, десятичное) ----
+                                                  Точечная правка большого файла (починка FAT образа). Без CREATE: файла нет -
+                                                  отказ; за конец файла не удлиняем (мина f_lseek за EOF, см. CLAUDE.md). */
+        FIL f; UINT bw; FRESULT rr; uint32_t off = 0, n = g_fs_len;
+        for(int i = 0; p2[i] >= '0' && p2[i] <= '9'; i++) off = off * 10u + (uint32_t)(p2[i] - '0');
+        if(n == 0 || n > 4u*1024u*1024u){ g_fs_err = 0xF3u; g_fs_done = 0xE; return; }
+        if((rr = f_open(&f, p1, FA_WRITE)) != FR_OK){ g_fs_err=(uint32_t)rr; g_fs_done=0xE; return; }
+        if((FSIZE_t)off + n > f_size(&f)){ f_close(&f); g_fs_err = 0xF4u; g_fs_done = 0xE; return; }
+        if((rr = f_lseek(&f, off)) != FR_OK){ f_close(&f); g_fs_err=(uint32_t)rr; g_fs_done=0xE; return; }
+        rr = f_write(&f, (const void*)FS_BUF_ADDR, n, &bw);
+        f_close(&f);
+        g_fs_n = bw;
+        if(rr == FR_OK && bw == n){ g_fs_done = 1; } else { g_fs_err = rr ? (uint32_t)rr : 0xF5u; g_fs_done = 0xE; }
+        return;
+    }
+
     if(cmd == 10){                             /* ---- v146 NES LOAD: parse .nes p1 -> stream PRG/CHR into NES core BRAM ---- */
         int rc = nes_load(p1);
         g_fs_n = rc;
         if(rc == 0){ g_fs_done = 1; } else { g_fs_err = (uint32_t)rc; g_fs_done = 0xE; }
+        return;
+    }
+
+    if(cmd == 11){                             /* ---- v0.15.165 KEY INJECT в ОБОЛОЧКУ: g_fs_len = {release<<9 | code} ----
+                                                  Хост (JTAG-КВМ, смоук-тест) кладёт скан-код PS/2 set-2 в очередь,
+                                                  которую читает kbd_data_read(). Нажатие = два вызова: код, затем
+                                                  0x200|код. bit8 (empty) всегда сбрасываем - слово ВАЛИДНО. */
+        uint32_t nxt = g_kinj_w + 1u;
+        if((nxt - g_kinj_r) > KINJ_N){ g_fs_err = 0xF1u; g_fs_done = 0xE; return; }   /* очередь переполнена */
+        g_kinj[g_kinj_w % KINJ_N] = (g_fs_len & 0x2FFu);   /* [9]=release, [7:0]=code, bit8=0 */
+        g_kinj_w = nxt;
+        g_fs_n = (uint32_t)(g_kinj_w - g_kinj_r);          /* сколько слов ждёт в очереди */
+        g_fs_done = 1;
+        return;
+    }
+
+    if(cmd == 13){                             /* ---- v0.15.234 NET START: поднять сеть и веб-КВМ ----
+                                                  Отдельной командой, а НЕ в загрузке: неудачный подъём сети
+                                                  не должен стоять между включением платы и навигатором. */
+        uint32_t st = net_init();
+        g_fs_n = st;                           /* 1 = порт слушает; иначе старший байт - код отказа */
+        if(st & 1u){ g_fs_done = 1; } else { g_fs_err = (st >> 8) & 0xFFu; g_fs_done = 0xE; }
         return;
     }
 
@@ -1207,6 +2975,13 @@ static void fs_service(void){
 }
 static const char* sort_label(void){
     switch(sortmode){ case 1: return "DATE"; case 2: return "SIZE"; case 3: return "EXT"; default: return "NAME"; }
+}
+/* v250: буква режима сортировки для рамки панели - как в DN 2.11: строчная = прямой порядок,
+   ЗАГЛАВНАЯ = обратный. Буквы по названиям наших полей, чтобы совпадали с заголовком колонки. */
+static char sort_ind_ch(void){
+    char c;
+    switch(sortmode){ case 1: c='d'; break; case 2: c='s'; break; case 3: c='e'; break; default: c='n'; }
+    return g_sort_desc ? (char)(c - 'a' + 'A') : c;
 }
 static void draw_vline(int x,int y0,int y1){ for(int y=y0;y<y1;y++) setpix(x,y); }
 /* (BROWS is defined up near MAXFILES) */
@@ -1369,7 +3144,20 @@ static void fmt_mmss(unsigned s, char* o){       /* seconds -> "M:SS" / "MM:SS" 
 }
 /* row 22 status line: DN playback status while music plays (>/|| + name + M:SS/M:SS + progress bar), else file count + sort */
 static void dn_draw_status(void){
+    if((g_modal_level > 0 || g_menu_open) && !g_status_force) return;
     dn_fill(1,22,DN_COLS-2,1,DNK_PANEL_BG);
+    /* v0.15.305: удержанное сообщение (результат заливки ПЗУ и прочее, что нельзя терять) рисуем
+       ВМЕСТО обычного содержимого, пока не истечёт окно. Проверка стоит ПОСЛЕ очистки строки -
+       иначе под коротким сообщением остался бы хвост прежнего текста. */
+    if(g_hold_msg[0]){
+        XTime now; XTime_GetTime(&now);
+        if(now - g_hold_t < (XTime)(COUNTS_PER_SECOND*STATUS_HOLD_S)){
+            int l=slen(g_hold_msg), x=(DN_COLS-l)/2; if(x<1) x=1;
+            dn_puts(x,22,g_hold_msg,DNK_HEADER,DNK_PANEL_BG);
+            return;
+        }
+        g_hold_msg[0] = 0;                  /* окно вышло - строка возвращается к своей обычной работе */
+    }
     if(player_active()){
         dn_put_glyph(2,22, player_paused()?GLYPH_PAUSE:GLYPH_PLAY, DNK_MUSIC, DNK_PANEL_BG);
         { const char* mp=g_music_path; int ml=slen(mp), W=39, so=(ml>W)?g_status_scroll:0;  /* leave col 43 blank -> 1-char gap before the play-mode glyph at 44 */
@@ -1392,6 +3180,7 @@ static void dn_draw_status(void){
 static char g_tape_name[NAMELEN+1] = "";
 static void dn_draw_tape_status(void);
 static void status_scroll_tick(void){            /* marquee the full track/tape path in the status bar when it doesn't fit */
+    if(g_modal_level > 0 || g_menu_open) return;
     int is_tape = (g_tape_on != 0);
     int is_music = player_active() && !is_tape;
     if(!is_music && !is_tape){ if(g_status_scroll){ g_status_scroll=0; g_status_started=0; g_status_last=0; } return; }
@@ -1449,12 +3238,17 @@ static void sort_changed(void){   /* SORT changed from a menu value-item: re-sor
 }
 /* ---- DN status line (bottom row): always-present active-key hints, DN-style (hotkey red, label gray).
    Context-sensitive: the browser shows its keys, a modal dialog swaps in its own, then restores. ---- */
+/* v219: сколько колонок в конце строки НЕ занимать подсказками - там имя вставленной дискеты.
+   Резерв вычитается из ширины ДО раскладки, иначе последняя подсказка залезала бы под имя. */
+static int g_kbar_reserve = 0;
 static void dn_keybar(const char* const items[][2], int n){
+    clip_push_full();                       /* строка 24 вне рамки окна, а ставит её сам диалог */
     dn_fill(0,DN_ROWS-1,DN_COLS,1,DNK_MENU_BG);
+    int cols = DN_COLS - g_kbar_reserve; if(cols < 20) cols = 20;
     int iw[16], total=0;                                  /* item widths: key + space + label */
     for(int i=0;i<n && i<16;i++){ iw[i]=slen(items[i][0])+1+slen(items[i][1]); total+=iw[i]; }
-    int gaps=n+1, base=(DN_COLS-total)/gaps; if(base<1) base=1;   /* spread the slack across n+1 gaps (edges + between) */
-    int extra=(DN_COLS-total)-base*gaps; if(extra<0) extra=0;
+    int gaps=n+1, base=(cols-total)/gaps; if(base<1) base=1;   /* spread the slack across n+1 gaps (edges + between) */
+    int extra=(cols-total)-base*gaps; if(extra<0) extra=0;
     int x=0;
     for(int i=0;i<n && i<16;i++){
         x += base + (i<extra?1:0);                        /* sprinkle the remainder into the first gaps */
@@ -1462,16 +3256,60 @@ static void dn_keybar(const char* const items[][2], int n){
         dn_puts(x+slen(items[i][0])+1, DN_ROWS-1, items[i][1], DNK_MENU_FG, DNK_MENU_BG);
         x += iw[i];
     }
+    clip_pop();
 }
 static int g_kbar_mod = 0;   /* which F-key hint bar is shown now: 0=normal, 1=Ctrl, 2=Alt */
+/* v219: имя вставленного образа в правом конце нижней строки. Владелец: «когда подключаем
+   образ, пусть пишется имя образа». Держим ЗДЕСЬ, а не в отдельной строке: свободных строк в
+   раскладке DN нет, а правый конец подсказок всё равно пустует. */
+/* v220: метка строится по ВСЕМ приводам: A:ИМЯ B:ИМЯ ... Длинные имена режем, чтобы четыре
+   привода уместились в конце строки; полное имя всё равно видно в самом навигаторе. */
+static int dn_disk_str(char* out, int cap){
+    int mounted = 0; for(int d=0;d<NDRV;d++) if(g_dopen[d] && g_dnm[d][0]) mounted++;
+    if(!mounted) { out[0] = 0; return 0; }
+    int per = (mounted >= 3) ? 8 : (mounted == 2 ? 12 : 14);   /* сколько знаков имени на привод */
+    int k = 0;
+    for(int d=0; d<NDRV; d++){
+        if(!g_dopen[d] || !g_dnm[d][0]) continue;
+        if(k && k < cap-1) out[k++] = ' ';
+        if(k < cap-3){ out[k++] = DRV_LTR[d]; out[k++] = ':'; }
+        int nl = slen(g_dnm[d]); if(nl > per) nl = per;
+        for(int i=0;i<nl && k<cap-1;i++) out[k++] = g_dnm[d][i];
+    }
+    out[k] = 0; return k;
+}
+static void dn_disk_tag(void){
+    char s[64]; int k = dn_disk_str(s, (int)sizeof(s));
+    if(!k) return;
+    int x = DN_COLS - k; if(x < 0) x = 0;
+    dn_puts(x, DN_ROWS-1, s, DNK_STATUS, DNK_MENU_BG);
+}
+/* сколько колонок займёт метка (0 = приводы пусты) - для резерва в раскладке подсказок */
+static int dn_disk_tag_w(void){
+    char s[64]; int k = dn_disk_str(s, (int)sizeof(s));
+    return k ? k + 1 : 0;
+}
 static void dn_keybar_browser(void){
     static const char* const it[8][2]={{"F1","Help"},{"F5","Copy"},{"F6","Ren"},{"F7","Dir"},{"F8","Del"},{"F9","Menu"},{"F12","Hide"},{"Esc","Back"}};
+    /* v248: метку образа в навигаторе НЕ рисуем (просьба владельца) - подсказки занимают всю
+       строку. Имя образа видно на экране машины рядом со значком дисковода. */
     dn_keybar(it,8); g_kbar_mod=0;
 }
 /* DN dynamic F-key bar: while Ctrl / Alt is held, show the modified commands (sort fields / reverse). */
 static void dn_keybar_browser_mode(int mod){
     if(mod==1){ static const char* const it[4][2]={{"Ctrl+F3","Sort Name"},{"Ctrl+F4","Sort Ext"},{"Ctrl+F5","Sort Size"},{"Ctrl+F6","Sort Date"}}; dn_keybar(it,4); }
+    /* v249: режим Alt был описан в комментарии к `g_kbar_mod`, но не реализован. Буквы - те же,
+       что помечены в заголовках меню (`~F~iles` и т.д.), чтобы подсказка не расходилась с делом. */
+    else if(mod==2){ static const char* const it[5][2]={{"Alt+F","Files"},{"Alt+P","Play"},{"Alt+T","Tape"},{"Alt+O","Options"},{"Alt+H","Help"}}; dn_keybar(it,5); }
     else dn_keybar_browser();
+}
+/* v250: индикатор сортировки в ЛЕВОМ ВЕРХНЕМ углу рамки панели (место из DN).
+   v251 (просьба владельца): буква стоит В САМОМ углу, то есть НА месте угловой линии рамки, а не
+   правее её. Путь центрируется и прижат не ближе колонки 2, так что до пути всё равно остаётся
+   пустое знакоместо. Цвет - как у заголовков колонок: буква и подсвеченный заголовок говорят об
+   одном и том же. */
+static void dn_sort_ind(void){
+    dn_putc(0, 1, (uint8_t)sort_ind_ch(), DNK_HEADER, DNK_PANEL_BG);
 }
 static void render_browser_dn(void){
     /* No full clear: the menu row, panel and key bar below cover the whole 640x400 canvas (no transparent flash). */
@@ -1481,12 +3319,14 @@ static void render_browser_dn(void){
     { char t[52]; int n=0; for(const char* p=curpath; *p && n<48; p++) t[n++]=*p; t[n]=0;   /* path in top border */
       int px=(DN_COLS-(n+2))/2; if(px<2) px=2;
       dn_putc(px,1,' ',DNK_CUR_FG,DNK_CUR_BG); dn_puts(px+1,1,t,DNK_CUR_FG,DNK_CUR_BG); dn_putc(px+1+n,1,' ',DNK_CUR_FG,DNK_CUR_BG); }
+    dn_sort_ind();                                           /* v250: буква сортировки в углу рамки */
     dn_draw_list();                                          /* dynamic panel content (headers + files + scrollbar + info) */
     dn_keybar_browser();                                     /* bottom status line: always-present key hints */
 }
 static void render_browser(void){ render_browser_dn(); }   /* single entry point - all call sites now draw DN */
 static void open_browser(void){
     sel_scroll=0; last_scroll=0; scroll_started=0; opt_on=0;
+    zx_release_all();                                 /* v256: не оставить машине зажатую клавишу */
     OSD_CTRL=(OSD_CTRL|2u)&~1u; osd_on=1; browser_on=1; osd_view=3;   /* DN browser on the colour layer (bit1); drop the 1bpp plane */
     render_browser();        /* INSTANT window before any SD I/O - a keypress always shows something */
     sdop_freeze_begin();     /* a blocking scan mid-tape-load would underrun the pulse FIFO */
@@ -1551,7 +3391,23 @@ static void wr_bank(int bank, const uint8_t* p){
    and the AY stops squealing. Then HALT + wait HALT_ACK to take the bus. (Per the CDC review:
    wait busy 0->1->0, never treat the first busy==0 as done - the wipe must not race the inject.)
    On an older bitstream (no bit2) this degrades to a brief delay + HALT (no reset). */
+/* v360: холодный сброс, ПОСЛЕ которого машина продолжает идти. Отличие от machine_reset ниже
+   одно, но существенное: тот в конце берёт шину (HALT) - он для инжекта, и оставленная в HALT
+   машина выглядела бы как зависшая. */
+static void machine_cold_restart(void){
+    if(opt_defmachine == 4){ NES_LDCTL = 0x4u; return; }
+    IJ_CTRL = 0x4;                                              /* RESET+wipe (CONTROL бит2) */
+    for(volatile uint32_t t=0; t<500000u;  t++) if(  IJ_STAT & 0x4u) break;   /* дождаться начала */
+    for(volatile uint32_t t=0; t<8000000u; t++) if(!(IJ_STAT & 0x4u)) break;  /* и конца */
+    IJ_CTRL = 0;                                                /* шину НЕ берём - машина идёт */
+}
 static void machine_reset(void){
+    if(opt_defmachine==4){                                      /* v164 NES: its own reset pulse (NESLDCTL bit2); the ZX
+                                                                   CONTROL handshakes below are stubs on the NES top and
+                                                                   only burn multi-second timeouts (dead F11) */
+        NES_LDCTL = 0x4u;
+        return;
+    }
     IJ_CTRL = 0x4;                                              /* request RESET+wipe (CONTROL bit2) */
     for(volatile uint32_t t=0; t<500000u;  t++) if(  IJ_STAT & 0x4u) break;   /* wait busy asserted */
     for(volatile uint32_t t=0; t<8000000u; t++) if(!(IJ_STAT & 0x4u)) break;  /* wait wipe+reset done */
@@ -1577,6 +3433,26 @@ static int pl_reload(const char* path){
     /* drain/flush the staged bitstream to DDR so the PCAP DMA engine reads the real bytes (the FS
        window is non-cacheable, but this also serialises the write buffer - Xilinx PCAP idiom). */
     Xil_DCacheFlushRange((INTPTR)FS_BUF_ADDR, total);
+
+    /* Isolate PS from PL AND assert the four PL fabric resets before reprogramming. The isolation alone
+       (v151) cut AXI writes MID-BURST: the PS-side S_AXI_HP0 FIFO kept a half-open write transaction, so
+       the NEXT core's video writer stalled after 1 burst (hpw=1: black/frozen screen after every core
+       switch). Asserting FPGA_RST_CTRL drops SAXIHPx ARESETN -> the HP FIFOs discard the half-open burst
+       (the FSBL boot flow does exactly this, which is why the FIRST core always worked). */
+    /* v158 QUIESCE: ask all PL DDR masters (video writer + display reader + OSD reader) to finish
+       their in-flight AXI transactions and go idle BEFORE isolating. This kills the half-open HP
+       transaction poison that froze video after core switches. Timeout-safe: on old cores without
+       the QUIESCE reg the write lands in a hole and STATUS bit3 stays 0 -> we proceed after ~20ms. */
+    *(volatile uint32_t*)(GP0+0x114) = 1u;
+    { volatile uint32_t t=0; while(((*(volatile uint32_t*)(GP0+0x08)) & 0x8u)==0u){ if(++t>2000000u) break; } }
+    SLCR_UNLOCK  = 0x0000DF0Du;
+    SLCR_LVLSHFT = 0u;
+    /* v156: do NOT assert FPGA_RST_CTRL here. Empirically (v153..v155) asserting it around the PCAP
+       left the S_AXI_HP write path dead after the reload (hpw stuck at 1 -> black screen with the
+       game actually running). The v152 isolation-only sequence reliably left video alive after the
+       boot-time core reload. Proper multi-switch robustness comes with the PL-side QUIESCE (planned). */
+    SLCR_LOCK    = 0x767B000Du;
+
     /* ---- PCAP reconfiguration (IRQs masked; NO PS reset, NO ps7_init) ---- */
     Xil_ExceptionDisable();
     DEVC_UNLOCK = 0x757BDF0Du;                       /* devcfg unlock */
@@ -1585,6 +3461,22 @@ static int pl_reload(const char* path){
     DEVC_CTRL = ctrl;
     DEVC_CTRL = ctrl | 0x40000000u;                   /* PROG_B high */
     DEVC_CTRL = ctrl & ~0x40000000u;                  /* PROG_B low pulse -> clears the PL */
+    g_cur_core = "?";                                 /* v339: с этого мига в ПЛИС ПУСТО. Отказ ниже (0xB5..0xB8)
+                                                         оставлял прошивку в уверенности, что старое ядро живо;
+                                                         «?» не совпадает ни с одним ядром, поэтому попытка
+                                                         перезалить ядро будет сделана заново.
+                                                         ⚠ ГРАНИЦА ОБЕЩАНИЯ, ЧЕСТНО (v340): второй шанс даёт
+                                                         только уход на ДРУГУЮ машину и обратно - повторный
+                                                         выбор ТОЙ ЖЕ машины даёт changed = 0 (applied
+                                                         выставляется безусловно, apply_machine ниже) и
+                                                         проходит мимо блока перезагрузки.
+                                                         ⚠ И ОТДЕЛЬНАЯ МИНА: после 0xB5..0xB8 ПЛИС очищена
+                                                         импульсом PROG_B, уровневые сдвигатели остались
+                                                         выключенными - ЛЮБОЕ обращение к фабрике (OSD,
+                                                         клавиатура, MACHINE_CFG) уходит в мёртвый AXI и
+                                                         вешает ARM. Программного лечения отсюда нет:
+                                                         рисовать сообщение - это тоже запись в фабрику.
+                                                         Восстановление - холодный старт. */
     { volatile uint32_t t=0; while((DEVC_STATUS & 0x10u)!=0u){ if(++t>2000000u){ Xil_ExceptionEnable(); return 0xB5; } } } /* INIT falls */
     DEVC_CTRL = ctrl | 0x40000000u;                   /* PROG_B high */
     { volatile uint32_t t=0; while((DEVC_STATUS & 0x10u)==0u){ if(++t>2000000u){ Xil_ExceptionEnable(); return 0xB6; } } } /* INIT rises */
@@ -1603,6 +3495,21 @@ static int pl_reload(const char* path){
     SLCR_LOCK    = 0x0000767Bu;
     Xil_ExceptionEnable();
     /* PL is up but blank (all GP0 regs at reset default). Caller must fabric_reinit_after_reload(). */
+    /* 🥇 ИДЕНТИЧНОСТЬ: ЧТО МЫ ПОЛОЖИЛИ, СВЕРЕННОЕ С ТЕМ, ЧТО ОТВЕТИЛА ФАБРИКА (v0.15.340).
+       Путь = НАМЕРЕНИЕ, и он один на все дороги (меню apply_machine, fs cmd 9, откат к заводскому
+       ПЗУ); MACHINE_ID (0x60) = ФАКТ. Пока они сходятся, разницы нет. Расходятся ровно в опасном
+       случае: под каноническим именем лежит ЧУЖОЕ ядро (0:/CORES/NES.BIT.BIN, собранный как ZX).
+       Тогда верим ЖЕЛЕЗУ - иначе проверка «а есть ли NES-ядро» (:4095) сверяет имя, которое сама
+       прошивка и составила, тавтология проходит, nes_load стримит картридж в регистры, которых у
+       ZX-ядра нет, и владелец получает чёрный экран без единого сообщения.
+       Имя ВНЕ таблицы (свой отладочный битстрим) оставляем как есть, даже если железо назвалось
+       знакомым семейством: пусть первый же выбор машины перельёт канонический файл. */
+    { const char* byp  = core_id_from_path(path);
+      const char* byid = core_id_from_machid(MACHINE_ID);
+      if(byid && byp && core_is_canonical(byp) && cicmp(byid, byp) != 0) g_cur_core = byid;
+      else if(byp)  g_cur_core = byp;
+      else if(byid) g_cur_core = byid;
+    }
     return 0;
 }
 /* v146: parse a .nes (iNES/NES2.0) and STREAM its PRG then CHR into the NES core's BRAM over the AXI
@@ -1616,19 +3523,44 @@ static int nes_load(const char* path){
     if((rr=f_read(&f,hdr,16,&br))!=FR_OK || br<16){ f_close(&f); return 0xC2; }
     nes_hdr_t h;
     if(nes_parse_header(hdr,&h)){ f_close(&f); return 0xC3; }          /* bad "NES\x1A" magic */
-    if(h.prg_bytes > 0x10000u || h.chr_bytes > 0x2000u){ f_close(&f); return 0xC6; } /* Round-1 BRAM: PRG<=64K, CHR<=8K */
+    /* v0.15.167: PRG до 128К (CE18 расширил BRAM). CHR по-прежнему 8К. При отказе печатаем
+       разобранный заголовок в g_fs_n - так узнаём номер маппера у 1200-in-1 и прочих. */
+    /* Отказ по размеру: перед выходом ПУБЛИКУЕМ разобранный заголовок в g_fs_out, чтобы хост (JTAG-КВМ,
+       смоук-тест) увидел номер маппера и размеры и понял, что именно мешает. Формат одной строкой:
+       "MAPPER=<n> PRG=<байт> CHR=<байт> MIRROR=<v|h> BAT=<0|1>". Раньше наружу шёл только код 0xC6,
+       поэтому узнать маппер незагружаемого рома (например 1200-in-1) было нечем. */
+    if(h.prg_bytes > 0x20000u || h.chr_bytes > 0x8000u){
+        int w=0; const char* hex="0123456789ABCDEF";
+        const char* k1="MAPPER=0x"; while(*k1) g_fs_out[w++]=*k1++;
+        g_fs_out[w++]=hex[(h.mapper>>4)&0xF]; g_fs_out[w++]=hex[h.mapper&0xF];
+        const char* k2=" PRG="; while(*k2) g_fs_out[w++]=*k2++;
+        { uint32_t v=h.prg_bytes; char d[12]; int n=0; if(!v) d[n++]='0'; while(v){ d[n++]=(char)('0'+(v%10u)); v/=10u; } while(n) g_fs_out[w++]=d[--n]; }
+        const char* k3=" CHR="; while(*k3) g_fs_out[w++]=*k3++;
+        { uint32_t v=h.chr_bytes; char d[12]; int n=0; if(!v) d[n++]='0'; while(v){ d[n++]=(char)('0'+(v%10u)); v/=10u; } while(n) g_fs_out[w++]=d[--n]; }
+        const char* k4=" MIRROR="; while(*k4) g_fs_out[w++]=*k4++;
+        g_fs_out[w++] = h.mirroring ? 'V' : 'H';
+        const char* k5=" REGION="; while(*k5) g_fs_out[w++]=*k5++;
+        g_fs_out[w++]=hex[h.region & 0xF];
+        const char* k6=" SUBMAP="; while(*k6) g_fs_out[w++]=*k6++;
+        g_fs_out[w++]=hex[h.submapper & 0xF];
+        const char* k7=" NES20="; while(*k7) g_fs_out[w++]=*k7++;
+        g_fs_out[w++] = h.is_nes20 ? '1' : '0';
+        g_fs_out[w++]='\n'; g_fs_out[w]=0;
+        g_fs_n = (uint32_t)h.mapper | ((uint32_t)(h.prg_bytes>>14) << 8) | ((uint32_t)(h.chr_bytes>>13) << 16);
+        f_close(&f); return 0xC6;
+    }
     NES_LDCTL = 0x1u | 0x8u;                                           /* loading=1, sel=PRG, rewind addr */
     if(h.trainer){ f_read(&f,buf,512,&br); }                           /* skip 512-byte trainer */
     for(uint32_t left=h.prg_bytes; left; ){                            /* stream PRG-ROM */
         UINT n=(left>512u)?512u:(UINT)left;
-        if((rr=f_read(&f,buf,n,&br))!=FR_OK || br!=n){ f_close(&f); return 0xC4; }
+        if((rr=f_read(&f,buf,n,&br))!=FR_OK || br!=n){ f_close(&f); NES_LDCTL = 0x0u; return 0xC4; }  /* v207: снять loading! иначе ядро в сбросе НАВСЕГДА */
         for(UINT i=0;i<n;i++) NES_LD = buf[i];
         left-=n; if((left & 0x1FFFu)==0) KBD_HB=1;                     /* pet deadman */
     }
     NES_LDCTL = 0x1u | 0x2u | 0x8u;                                    /* loading=1, sel=CHR, rewind addr */
     for(uint32_t left=h.chr_bytes; left; ){                            /* stream CHR-ROM (0 => CHR-RAM, nothing to load) */
         UINT n=(left>512u)?512u:(UINT)left;
-        if((rr=f_read(&f,buf,n,&br))!=FR_OK || br!=n){ f_close(&f); return 0xC5; }
+        if((rr=f_read(&f,buf,n,&br))!=FR_OK || br!=n){ f_close(&f); NES_LDCTL = 0x0u; return 0xC5; }  /* v207: то же */
         for(UINT i=0;i<n;i++) NES_LD = buf[i];
         left-=n;
     }
@@ -1637,6 +3569,854 @@ static int nes_load(const char* path){
     NES_MAP1 = (uint32_t)(h.flags >> 32);
     NES_LDCTL = 0x4u;                                                  /* loading=0, pulse reset_nes -> cold-boot the game */
     return 0;
+}
+/*=================================================================================================
+  v0.15.208 ДИСКОВОД: вставить образ TRD и подавать сектора контроллеру.
+  Модель MiSTer: фабрика просит LBA (512-байтовые блоки), хост отдаёт 512 байт. TRD - это
+  16 секторов по 256 байт на дорожку, поэтому size_code=1 и layout=0, а LBA от контроллера уже
+  посчитан в блоках по 512 байт от начала образа.
+=================================================================================================*/
+static int disk_any(void){ for(int d=0;d<NDRV;d++) if(g_dopen[d]) return 1; return 0; }
+/* v223: пересчитать бит защиты записи у всех приводов и перетолкнуть уровни текущего.
+   Вызывается из обработчика опции - иначе разрешение подействовало бы только на следующий образ. */
+static void disk_wp_refresh(void){
+    for(int d=0; d<NDRV; d++){
+        if(!g_dopen[d]) continue;
+        uint32_t lv = g_dlv[d] & ~(1u << 4);
+        if(!opt_diskwr || g_dscl[d] || g_dro[d]) lv |= (1u << 4);
+        g_dlv[d] = lv;
+    }
+    if(g_drv_live >= 0 && g_drv_live < NDRV && g_dopen[g_drv_live]){
+        g_fdc_lv = g_dlv[g_drv_live];
+        FDC_CTL = g_fdc_lv;
+    }
+}
+/* уровни привода: пусто = ready=0/wp=1, иначе размер образа + size_code=1 (16x256) + layout=0 */
+static uint32_t drv_levels(int d){ return g_dopen[d] ? g_dlv[d] : 0x00000010u; }
+static void disk_eject(int d){
+    if(d < 0 || d >= NDRV) return;
+    if(g_dopen[d]){ f_sync(&g_dfil[d]); f_close(&g_dfil[d]); g_dopen[d] = 0; }   /* v223: дописать до конца */
+    g_dnm[d][0] = 0; g_dpath[d][0] = 0; g_dsz[d] = 0; g_dscl[d] = 0; g_dscldat[d] = 0; g_dro[d] = 0; g_dlv[d] = 0x00000010u;
+    if(g_drv_live == d){ g_fdc_lv = 0x00000010u; FDC_CTL = g_fdc_lv; }
+    update_banner();                           /* v219: убрать имя у иконки */
+    if(browser_on && !g_menu_open) dn_keybar_browser();
+}
+/* v218: собрать дорожку 0 (каталог + инфо диска) для смонтированного SCL.
+   Раскладка записи каталога TRD: имя[8], тип[1], адрес[2], длина[2], секторов[1], нач.сектор,
+   нач.дорожка = 16 байт. У SCL те же первые 14 байт, а сектор/дорожку считаем нарастающим итогом
+   с дорожки 1 сектора 0 - как при записи на пустую дискету.
+   Инфо диска (смещение 0x8E0): +1 первый свободный сектор, +2 первая свободная дорожка,
+   +3 тип диска (0x16 = 80 дорожек, две стороны), +4 файлов, +5..6 свободных секторов,
+   +7 признак TR-DOS 0x10, +0x14 удалённых файлов, +0x15..0x1C метка.
+   Арифметика сверена на РЕАЛЬНОМ образе: у 1099test.trd (2 файла, 118 секторов) настоящий
+   инфо-сектор даёт «первый свободный 6/8, свободно 2426» - формулы ниже дают то же самое. */
+#define TRD_FULL_SZ  655360u        /* 80 дорожек x 2 стороны x 16 секторов x 256 = полная дискета */
+#define TRD_FREE_MAX 2544u          /* свободных секторов на чистой дискете (дорожка 0 - каталог) */
+static uint8_t scl_build(int d, uint32_t fsz){
+    UINT br = 0;
+    uint8_t h[9];
+    if(f_lseek(&g_dfil[d], 0) != FR_OK) return 0xD4;
+    if(f_read(&g_dfil[d], h, 9, &br) != FR_OK || br != 9) return 0xD4;
+    uint32_t n = h[8];
+    if(n == 0u || n > 128u) return 0xD6;               /* каталог TRD держит ровно 128 записей */
+    uint32_t dir = 9u + 14u * n;
+    if(fsz < dir) return 0xD7;
+    for(uint32_t i = 0; i < 4096u; i++) g_trk0[d][i] = 0;
+    uint32_t sec = 0, trk = 1, used = 0;
+    for(uint32_t i = 0; i < n; i++){
+        uint8_t e[14];
+        if(f_lseek(&g_dfil[d], 9u + 14u * i) != FR_OK) return 0xD8;
+        if(f_read(&g_dfil[d], e, 14, &br) != FR_OK || br != 14) return 0xD8;
+        uint8_t* ce = &g_trk0[d][i * 16u];
+        for(int k = 0; k < 14; k++) ce[k] = e[k];      /* первые 14 байт совпадают с TRD один-в-один */
+        ce[14] = (uint8_t)sec;
+        ce[15] = (uint8_t)trk;
+        used += e[13];
+        sec  += e[13];
+        trk  += sec / 16u;
+        sec  %= 16u;
+    }
+    /* Размер брать ТОЛЬКО из каталога: часть образов имеет лишний хвост 4/8 байт, и проверка по
+       размеру файла отвергла бы их на ровном месте. Обрезанный образ - другое дело, это отказ. */
+    if(dir + 256u * used > fsz) return 0xD9;
+    if(used > TRD_FREE_MAX)     return 0xDA;
+    uint8_t* inf = &g_trk0[d][0x8E0u];                    /* инфо диска: сектор 8 дорожки 0 */
+    inf[1] = (uint8_t)sec;
+    inf[2] = (uint8_t)trk;
+    inf[3] = 0x16u;                                    /* 80 дорожек, две стороны */
+    inf[4] = (uint8_t)n;
+    { uint32_t fr = TRD_FREE_MAX - used;
+      inf[5] = (uint8_t)(fr & 0xFFu); inf[6] = (uint8_t)(fr >> 8); }
+    inf[7] = 0x10u;                                    /* признак дискеты TR-DOS */
+    inf[0x14] = 0;                                     /* удалённых файлов нет */
+    for(int k = 0; k < 8; k++) inf[0x15 + k] = ' ';    /* метка: пробелы (в SCL её нет) */
+    g_dscldat[d] = dir;
+    return 0;
+}
+/* v0.15.224 БЕЗОПАСНОЕ ИЗВЛЕЧЕНИЕ. Выдернуть образ посреди обмена - значит потерять сектор,
+   который машина уже считает записанным, а при неудачном моменте порвать и каталог на образе.
+   Поэтому сначала ЖДЁМ простоя контроллера (незакрытый запрос сектора, выполнение команды, DRQ),
+   ограниченно по времени и ДООБСЛУЖИВАЯ начатое, и только потом дописываем буферы FatFs и закрываем
+   файл. Возвращает 0 = извлечён, 1 = контроллер так и не освободился (образ НЕ тронут). */
+static void disk_service(void);      /* fwd: безопасное извлечение дообслуживает начатый обмен */
+#define FDCS_BUSY 0x00080000u
+#define FDCS_DRQ  0x00200000u
+static uint8_t disk_eject_safe(int d){
+    if(d < 0 || d >= NDRV) return 1;
+    if(!g_dopen[d]) return 0;                       /* уже пусто - делать нечего */
+    int idle = 0;
+    for(int guard = 0; guard < 2000 && !idle; guard++){
+        uint32_t st = FDC_STAT;
+        if(!(st & (FDCS_RD | FDCS_WR | FDCS_BUSY | FDCS_DRQ))) { idle = 1; break; }
+        disk_service();                             /* дообслужить начатое, а не бросить его */
+        for(volatile int w = 0; w < 20000; w++){}
+        KBD_HB = 1;
+    }
+    if(!idle) return 1;                             /* честный отказ вместо порчи данных */
+    disk_eject(d);                                  /* внутри f_sync + f_close */
+    return 0;
+}
+static uint8_t disk_mount_drv(const char* path, int d){
+    if(d < 0 || d >= NDRV) return 0xD0;
+    disk_eject(d);
+    if(!sd_mounted || !path || !path[0]) return 0xD1;
+    /* v223: открываем на ЧТЕНИЕ И ЗАПИСЬ - иначе f_write вернул бы FR_DENIED, и разрешение записи
+       в меню ничего бы не дало. Если файл или карта только для чтения, честно откатываемся на
+       чтение и запоминаем это: тогда защита записи останется поднятой независимо от опции. */
+    uint8_t ro = 0;
+    if(f_open(&g_dfil[d], path, FA_READ | FA_WRITE) != FR_OK){
+        if(f_open(&g_dfil[d], path, FA_READ) != FR_OK) return 0xD2;
+        ro = 1;
+    }
+    uint32_t sz = (uint32_t)f_size(&g_dfil[d]);
+    /* v218: SCL опознаём ПО СОДЕРЖИМОМУ (подпись "SINCLAIR"), а не по расширению - имя файла
+       может быть любым, а ошибиться здесь значит выдать контроллеру мусор вместо каталога. */
+    uint8_t scl = 0;
+    {   uint8_t h[8]; UINT br = 0;
+        if(f_read(&g_dfil[d], h, 8, &br) == FR_OK && br == 8 &&
+           h[0]=='S'&&h[1]=='I'&&h[2]=='N'&&h[3]=='C'&&h[4]=='L'&&h[5]=='A'&&h[6]=='I'&&h[7]=='R') scl = 1; }
+    if(scl){
+        uint8_t rc = scl_build(d, sz);
+        if(rc){ f_close(&g_dfil[d]); return rc; }
+        sz = TRD_FULL_SZ;                      /* контроллеру показываем ПОЛНУЮ дискету 80T/DS */
+    } else {
+        /* TRD: кратен 256 (сектор), реальные образы 40/80 дорожек, одно/двухсторонние. Больше 1 МБ
+           контроллер не умеет (img_size 20 бит) - такой образ не берём, чтобы не врать геометрией. */
+        if(sz < 4096u || sz > 0x000FFFFFu || (sz & 0xFFu)){ f_close(&g_dfil[d]); return 0xD3; }
+        /* v0.15.417: TRD больше полной дискеты 80T/DS - это следы f_lseek за EOF, не формат.
+           Обрезаем до 640 КБ, иначе повторное монтирование закрепит 1 МБ как размер образа. */
+        if(sz > TRD_FULL_SZ){
+            if(!ro){
+                if(f_lseek(&g_dfil[d], TRD_FULL_SZ) != FR_OK || f_truncate(&g_dfil[d]) != FR_OK){
+                    f_close(&g_dfil[d]); return 0xD3;
+                }
+            }
+            sz = TRD_FULL_SZ;                 /* контроллеру - настоящая геометрия, даже если хвост ещё на карте */
+        }
+    }
+    g_dscl[d] = scl;
+    g_dopen[d] = 1; g_dsz[d] = sz; g_disk_secs = 0; g_disk_err = 0;
+    { int i=0; const char* b=path; for(const char* q=path; *q; q++) if(*q=='/') b=q+1;
+      for(; b[i] && i<(int)sizeof(g_dnm[d])-1; i++) g_dnm[d][i]=b[i]; g_dnm[d][i]=0; }
+    {   int i = 0;                                  /* v0.15.414: и полный путь - для окна настроек */
+        for(; path[i] && i < (int)sizeof(g_dpath[d])-1; i++) g_dpath[d][i] = path[i];
+        g_dpath[d][i] = 0; }
+    /* уровни: wp=1 (только чтение), ready=1, size_code=1 (16x256), layout=0, размер образа */
+    /* v223: бит4 = защита записи. Снимаем её только когда владелец разрешил запись И образ не SCL. */
+    g_dro[d] = ro;
+    g_dlv[d] = (sz << 12) | (0u << 9) | (1u << 6) | (1u << 5)
+             | (((opt_diskwr && !scl && !ro) ? 0u : 1u) << 4);
+    g_drv_last = d;
+    g_drv_live = d;                            /* уровни ниже выставляем именно этого привода */
+    g_fdc_lv = g_dlv[d];
+    FDC_CTL = g_fdc_lv;
+    FDC_CTL = g_fdc_lv | 3u;                   /* + импульс «образ вставлен» (защёлкивает геометрию) */
+    update_banner();                           /* v219: показать имя у иконки дисковода */
+    if(browser_on && !g_menu_open) dn_keybar_browser();
+    return 0;
+}
+/* Служба: пока контроллер просит сектор - читаем и вдвигаем. Вызывается из ГЛАВНОГО цикла (FatFs
+   не реентерабелен), с ограничением на проход, чтобы не залипнуть навсегда на битом образе. */
+#define DISK_LOG_N   (*(volatile uint32_t*)(KMB+0x40u))
+#define DISK_LOG(i)  (*(volatile uint32_t*)(KMB+0x44u+4u*(i)))
+/* Обёртка для вызовов из навигатора и автозапуска: монтируем в привод, выбранный в меню. */
+static uint8_t disk_mount(const char* path){ return disk_mount_drv(path, opt_drvsel); }
+/* v218: прочитать 512-байтовый блок образа по LBA. У TRD это прямое смещение. У SCL дорожка 0
+   берётся из синтезированного буфера, а данные - из файла со сдвигом на упакованный каталог;
+   чтение за концом данных даёт br=0, и вызывающий добьёт сектор нулями (пустая часть дискеты). */
+/* Файл образа открыт FA_WRITE. В FatFs f_lseek ЗА конец файла его УДЛИНЯЕТ
+   (create_chain + objsize = fptr). Оплачено 21.08: test.TRD 640K вырос в 1024K -
+   это потолок 20-битного адреса контроллера (img_size), а не геометрия TR-DOS.
+   Любой ход к файлу обязан оставаться внутри g_dsz, который защёлкнут при монтировании. */
+static int disk_lba_in(int d, uint32_t lba){
+    uint32_t off;
+    if(d < 0 || d >= NDRV || !g_dopen[d]) return 0;
+    if(lba > (0xFFFFFFFFu / 512u)) return 0;
+    off = lba * 512u;
+    return (off + 512u) <= g_dsz[d];
+}
+static void disk_keep_size(int d){
+    if(d < 0 || d >= NDRV || !g_dopen[d] || g_dscl[d]) return;
+    if((uint32_t)f_size(&g_dfil[d]) <= g_dsz[d]) return;
+    (void)f_lseek(&g_dfil[d], g_dsz[d]);
+    (void)f_truncate(&g_dfil[d]);
+}
+static int disk_read_lba(int d, uint32_t lba, uint8_t* buf, UINT* br){
+    *br = 0;
+    if(d < 0 || d >= NDRV || !g_dopen[d]) return 0;
+    if(!g_dscl[d] && !disk_lba_in(d, lba)){
+        for(uint32_t i = 0; i < 512u; i++) buf[i] = 0;
+        *br = 512u; return 1;            /* за концом образа - нули, файл не трогаем */
+    }
+    if(g_dscl[d]){
+        if(lba < 8u){                                   /* дорожка 0 = 8 блоков по 512 */
+            for(uint32_t i = 0; i < 512u; i++) buf[i] = g_trk0[d][lba * 512u + i];
+            *br = 512u; return 1;
+        }
+        if(f_lseek(&g_dfil[d], g_dscldat[d] + (lba - 8u) * 512u) != FR_OK) return 0;
+        return f_read(&g_dfil[d], buf, 512u, br) == FR_OK;
+    }
+    if(f_lseek(&g_dfil[d], lba * 512u) != FR_OK) return 0;
+    return f_read(&g_dfil[d], buf, 512u, br) == FR_OK;
+}
+static void disk_service(void){
+    if(!disk_any()) return;
+    for(int guard=0; guard<64; guard++){
+        uint32_t st = FDC_STAT;
+        /* v220: какой привод выбрал TR-DOS. sysreg[1:0] приходит в младших битах FDC_STAT. */
+        int d = (int)(st & 3u);
+        if(g_drv_live != d){
+            /* Привод сменился: перетолкнуть ЕГО уровни (готовность/защита/геометрия) и защёлкнуть
+               геометрию импульсом «вставлено» - у образов разный размер, и без этого контроллер
+               считал бы дорожки по чужой геометрии. Между операциями TR-DOS это безопасно. */
+            g_drv_live = d;
+            g_fdc_lv = drv_levels(d);
+            FDC_CTL = g_fdc_lv;
+            if(g_dopen[d]) FDC_CTL = g_fdc_lv | 3u;
+        }
+        /* v223 ЗАПИСЬ: контроллер просит забрать сектор, который записала машина. Вычитываем его
+           через FDC_STAT2 в режиме бита11 и кладём в файл. SCL и запрещённая запись отвечают
+           закрытием окна без сохранения - контроллер не морозится, а образ остаётся цел. */
+        if(st & FDCS_WR){
+            uint32_t lba_w = FDC_LBA(st);
+            /* v244 ФАНТОМ. Настоящий запрос приходит при поднятой занятости; после прерывания
+               команды занятость снята, а запрос остаётся висеть - его нельзя писать в файл.
+               Подтверждаем окном достаточной длины, чтобы не заморозить контроллер. */
+            if(!(st & FDCS_BUSY)){
+                g_ph_wr++;
+                uint32_t lvp = drv_levels(d);
+                FDC_CTL = lvp | 1u;
+                for(volatile int _w=0; _w<400; _w++){ }   /* окно > 2 периодов такта выборки */
+                FDC_CTL = lvp | 2u;
+                KBD_HB = 1;
+                continue;
+            }
+            /* v244 ОБА ЗАПРОСА СРАЗУ: подтверждение не различает их, и обслужив запись мы убьём
+               свежее чтение - тогда чтение-правка-запись пройдёт БЕЗ чтения. Отдаём чтение. */
+            if(st & FDCS_RD){ g_ph_both++; goto serve_read; }
+            /* v236: СТАТИЧЕСКИЙ и выровненный на 32. В шапке файла записано, что порча данных
+               уже была вызвана НАШИМИ невыровненными буферами f_read/f_write, а не драйвером -
+               локальный массив на стеке такой гарантии не даёт. */
+            static uint8_t wbuf[512] __attribute__((aligned(32)));
+            uint32_t lv = drv_levels(d);
+            /* Границы образа: кривой LBA не должен удлинять файл - это сломало бы геометрию дискеты. */
+            int allow = (g_dopen[d] && !g_dscl[d] && !g_dro[d] && opt_diskwr
+                         && (lba_w * 512u + 512u) <= g_dsz[d]);
+            g_fdc_lv = lv | FDC_RDMODE;
+            FDC_CTL = g_fdc_lv | 1u;                /* поднять sd_ack, адрес буфера в 0 */
+            (void)FDC_STAT2;                        /* дать слову осесть */
+            { uint32_t w = FDC_STAT2;               /* B0097: диапазон записанного машиной */
+              g_ba_raw = w;
+              g_rg_max = (w >>  8) & 0x1FFu;
+              g_rg_min = (w >> 17) & 0x1FFu; }
+            for(int i=0; i<512; i++){
+                (void)FDC_STAT2;                    /* холостое чтение: словам синхронизации осесть */
+                wbuf[i] = (uint8_t)(FDC_STAT2 & 0xFFu);
+                FDC_DATA = 0;                       /* шаг адреса (в этом режиме байт не пишется) */
+            }
+            FDC_CTL = g_fdc_lv | 2u;                /* окно закрыто */
+            g_fdc_lv = lv;
+            FDC_CTL = g_fdc_lv;                     /* снять режим вычитывания */
+            g_wr_events++;                      /* v235: сколько раз контроллер просил забрать сектор */
+            /* v245: ЛЁГКИЙ журнал - только адрес и начало сектора. Проходы по 512 байт, снимок
+               кольца и сверочное перечитывание убраны: они стоили 5-25 мс на сектор, а TR-DOS
+               за это время успевал дать Force Interrupt. Разбор закончен, приборы не нужны. */
+            if(g_wl_n < 12u){
+                g_wl_lba[g_wl_n]  = lba_w;
+                g_wl_head[g_wl_n] = ((uint32_t)wbuf[0] << 24) | ((uint32_t)wbuf[1] << 16)
+                                  | ((uint32_t)wbuf[2] << 8)  |  (uint32_t)wbuf[3];
+                g_wl_n++;
+            }
+            g_wr_lba = lba_w;
+            if(g_push_lba != lba_w) g_ph_lba++;    /* v244: подавали другой блок (счётчик, не запрет) */
+            /* v0.15.416: накладывать по диапазону ВСЕГДА, когда машина что-то записала.
+               Требование g_push_lba==lba_w ломало FORMAT: WRITE TRACK не читает сектор
+               заранее, а пишет нули с первого до конца дорожки. Защита от чужого хвоста
+               уже есть - на файл накладываются только байты [g_rg_min..g_rg_max],
+               остальное берётся свежим чтением файла. */
+            if(allow && g_rg_min <= g_rg_max){
+                static uint8_t mbuf[512] __attribute__((aligned(32)));
+                UINT mr = 0, bw = 0;
+                int rd_ok = (f_lseek(&g_dfil[d], lba_w * 512u) == FR_OK &&
+                             f_read(&g_dfil[d], mbuf, 512u, &mr) == FR_OK && mr == 512u);
+                if(!rd_ok){
+                    /* v246: НЕ ПИСАТЬ. Раньше при неудачном чтении блок всё равно записывался, а в
+                       буфере лежали нули или ПРОШЛЫЙ сектор - неудача чтения превращалась в порчу. */
+                    g_disk_err++;
+                } else {
+                    for(uint32_t i = g_rg_min; i <= g_rg_max && i < 512u; i++) mbuf[i] = wbuf[i];
+                    g_rg_used++;
+                if(f_lseek(&g_dfil[d], lba_w * 512u) != FR_OK ||
+                   f_write(&g_dfil[d], mbuf, 512u, &bw) != FR_OK || bw != 512u){
+                    g_disk_err++;
+                } else {
+                    g_disk_wrn++;
+                    disk_keep_size(d);
+                    g_dsync_due = 1;      /* v245: сбросим на карту В ПРОСТОЕ.
+                                                  Было: каждый сектор (v236) - иначе внешнее
+                                                  чтение образа видит старое содержимое, и это
+                                                  само по себе выглядит как «запись не работает» */
+                }
+                }                     /* v246: конец блока «чтение удалось» */
+                g_drv_last = d;
+            } else if(allow){
+                g_rg_skip++;                /* v243: машина не записала ни одного байта -
+                                               файл не трогаем, иначе затрём его нулями */
+            }
+            KBD_HB = 1;
+            continue;
+        }
+        if(!(st & FDCS_RD)) return;
+serve_read:
+        { }
+        uint32_t lba = FDC_LBA(st);
+        static uint8_t buf[512] __attribute__((aligned(32)));
+        UINT br = 0;
+        if(g_dopen[d]) g_drv_last = d;
+        ph_mark(PH_DISK);                       /* до сюда - разговор с контроллером */
+        int _rd_ok = disk_read_lba(d, lba, buf, &br);
+        ph_mark(PH_CARD);                       /* а это - чистое чтение образа с SD-карты */
+        /* v0.15.308: чтение сектора измерено в 1.25 мс - всё это время машина льёт в очередь
+           байты, а внутрь f_read вставить нечего. Забираем их СРАЗУ после, не дожидаясь фазы
+           звука: иначе гость без нужды стоит на поднятом флаге занятости целый проход. */
+        gs_wq_kick();
+        if(!_rd_ok){
+            g_disk_err++;
+            /* v244: окно подтверждения ДОЛЖНО быть шире двух периодов такта выборки контроллера
+               (~285 нс каждый), иначе импульс теряется целиком и запрос не снимется никогда. */
+            FDC_CTL = g_fdc_lv | 1u;
+            for(volatile int _w=0; _w<400; _w++){ }
+            FDC_CTL = g_fdc_lv | 2u;
+            continue;
+        }
+        for(UINT i=br; i<512u; i++) buf[i] = 0;     /* хвост за концом образа - нулями */
+        FDC_CTL = g_fdc_lv | 1u;                    /* поднять sd_ack, адрес буфера в 0 */
+        for(int i=0; i<512; i++) FDC_DATA = buf[i];
+        FDC_CTL = g_fdc_lv | 2u;                    /* сектор подан */
+        /* v239: запомнить поданное - сравним с вычитанным, когда контроллер отдаст сектор назад.
+           Обращений к ПЛИС не добавляем: копия делается в памяти. */
+        for(int i=0;i<512;i++) g_push_buf[i] = buf[i];
+        g_push_lba = lba;
+        /* Журнал для приборной отладки: {LBA, первый и последний байт сектора} - по нему видно,
+           что именно просили и что отдали, без символов и без пересборки прошивки. */
+        DISK_LOG(g_disk_secs % 12u) = (lba << 20) | ((uint32_t)buf[0] << 8) | buf[511];
+        g_disk_secs++;
+        DISK_LOG_N = g_disk_secs;
+        KBD_HB = 1;
+    }
+}
+/*=================================================================================================
+  v0.15.207 НАБОРЫ ПЗУ С КАРТЫ (0:/ROMS/) - задача владельца 03.08 «а то мы ром все от 128к
+  спектрума используем», выбор владельца: переключение в опциях машины + произвольная загрузка.
+
+  Порядок страниц в реальных файлах РАЗНЫЙ: пентагоновский 64-КБ BIOS с Gluk-ом это
+  [сервис, TR-DOS, 128-меню, 48 BASIC], а пара эмулятора - [128-меню, 48 BASIC]. Поэтому страницы
+  раскладываются по НАШИМ слотам ПО СОДЕРЖИМОМУ (подпись внутри страницы), а не по вере в порядок
+  файла: 0 = 128-меню, 1 = 48 BASIC, 2 = TR-DOS, 3 = сервисное. Не распознанные страницы кладутся
+  в свободные слоты в порядке файла - так набор из чужого клона тоже загрузится, просто без
+  автоматического TR-DOS.
+=================================================================================================*/
+static int rom_find(const uint8_t* p, uint32_t n, const char* s){   /* подстрока в странице ПЗУ */
+    int m = slen(s); if(m<=0 || (uint32_t)m>n) return 0;
+    for(uint32_t i=0; i + (uint32_t)m <= n; i++){
+        int k=0; while(k<m && p[i+k]==(uint8_t)s[k]) k++;
+        if(k==m) return 1;
+    }
+    return 0;
+}
+/* Слот по содержимому страницы. Подписи проверены на 10 реальных образах, а не придуманы:
+   128-редактор несёт "1986 Sinclair Research", 48 BASIC - "1982 Sinclair Research", а страница
+   TR-DOS - баннер вида "* TR-DOS Ver 6.11Q*" / "* TR-DOS Ver 5.03 *" / "*TR-DOS Ver 5.04TM*".
+   ⚠ Подпись TR-DOS обязана быть СТРОГОЙ ("TR-DOS Ver", а не просто "TR-DOS"): в наборе
+   PENT_128-1024_6.11q_FATALLx сервисное ПЗУ тоже содержит слово "TR-DOS" (сообщения "disk empty" /
+   "No disk"), и по слабой подписи в слот TR-DOS уехала бы СЕРВИСНАЯ страница - трап входил бы не
+   туда. Проверено на 11 реальных образах ДО железа: "TR-DOS Ver" опознаёт все четыре версии
+   TR-DOS (включая 5.04TM, у которого нет пробела после звёздочки) и ни одну сервисную. */
+static int rom_page_kind(const uint8_t* p){
+    if(rom_find(p, ROM_PG_SZ, "TR-DOS Ver"))          return 2;
+    if(rom_find(p, ROM_PG_SZ, "1986 Sinclair"))       return 0;
+    if(rom_find(p, ROM_PG_SZ, "1982 Sinclair"))       return 1;
+    return 3;
+}
+/* 🥇 v0.15.384 РАСПОЗНАВАТЕЛЬ ДЛЯ ЧЕЛОВЕКА - ОТДЕЛЬНЫЙ МОДУЛЬ, А НЕ ПРАВКА rom_page_kind.
+   Задание владельца 19.08: «надо как-то уметь показывать какие банки или содержимое в ром файле».
+   rom_page_kind выше отвечает на другой вопрос - «в КАКОЙ СЛОТ положить», и его ответ несёт раскладку
+   (слот 2 = трап TR-DOS, слот 3 = сервисная страница), поэтому его контракт остаётся неприкосновенным:
+   ни одна из подписей выше не тронута, ни один файл с карты не поедет в другой слот.
+   rom_page_ident() рядом узнаёт куда больше видов (TR-DOS с ВЕРСИЕЙ, Gluk, FATALL, Proteus, esxDOS,
+   WDC setup, диагностику, загрузчик с карты, пустую страницу, переделанные 48/128 по отпечатку входа)
+   и отдаёт КОРОТКУЮ ПОДПИСЬ для интерфейса. Его догадки по отпечатку раскладке не отдаются - в
+   колонке «поедет в слот» по-прежнему стоит слово rom_page_kind.
+   Стенд: arm/rom_ident_host_test.c (обычный gcc, плата не нужна) - прогон по 24 настоящим файлам. */
+#include "rom_ident.c"
+/* 🥇 v0.15.305 «ЭТО ВООБЩЕ ПЗУ СПЕКТРУМА?» - отдельный вопрос, и отвечать на него размером файла
+   нельзя. Оплачено: прошивка КАРТЫ General Sound (GS105B.ROM, ровно 65536 Б = 4 страницы по 16 КБ)
+   проходила размерный фильтр, попадала в список наборов машины, владелец её выбрал - и машина
+   закономерно не поднялась: это код для процессора САМОЙ КАРТЫ, у него своя карта памяти и свои порты.
+   Подписи rom_page_kind тут мало: страница без наших подписей (сервисное/диагностическое ПЗУ) -
+   законная, её нельзя отбрасывать вместе с чужой прошивкой.
+   Признак берём тот, который у ПЗУ Спектрума есть ВСЕГДА, а у прошивки чужой карты не бывает:
+   обращение к порту ULA #FE (`IN A,(#FE)` = DB FE - клавиатура/лента, `OUT (#FE),A` = D3 FE -
+   бордюр/бипер). Замерено на файлах, а не придумано: 128-меню 6+2, 48 BASIC 8+13, ESXDOS 4+1,
+   TR-DOS-страница есть и по подписи; во ВСЕХ ЧЕТЫРЁХ страницах gs105b - РОВНО НОЛЬ и того, и другого.
+   Порог 2 (а не 1) - защита от случайного совпадения байт в данных: в 16 КБ произвольного содержимого
+   одна пара встречается сама собой примерно в четверти случаев, две подряд - уже редкость, а у
+   настоящего ПЗУ их минимум пять. */
+static int rom_page_is_zx(const uint8_t* p){
+    if(rom_page_kind(p) != 3) return 1;              /* подпись сказала прямо: 128-меню / 48 BASIC / TR-DOS */
+    int n = 0;
+    for(uint32_t i=0; i+1 < ROM_PG_SZ; i++)
+        if((p[i]==0xDBu || p[i]==0xD3u) && p[i+1]==0xFEu && ++n >= 2) return 1;
+    return 0;
+}
+/* Название типа страницы для второй колонки диалогов выбора: владелец должен ВИДЕТЬ, что берёт,
+   а не узнавать это по неподнявшейся машине. */
+static const char* rom_kind_label(int k){
+    return (k==0) ? "128 MENU" : (k==1) ? "48 BASIC" : (k==2) ? "TR-DOS" : "ZX ROM";
+}
+static void rom_msg_set(const char* a, const char* b){   /* короткий однострочник для статуса */
+    int i=0; for(; a[i] && i<(int)sizeof(g_rom_msg)-1; i++) g_rom_msg[i]=a[i];
+    if(b) for(int j=0; b[j] && i<(int)sizeof(g_rom_msg)-1; j++) g_rom_msg[i++]=b[j];
+    g_rom_msg[i]=0;
+}
+/* v0.15.384: то же самое, но в буфер ПРЕДУПРЕЖДЕНИЙ. Успех его не затирает (см. хвост rom_load_set). */
+static void rom_warn_set(const char* a, const char* b){
+    int i=0; for(; a[i] && i<(int)sizeof(g_rom_warn)-1; i++) g_rom_warn[i]=a[i];
+    if(b) for(int j=0; b[j] && i<(int)sizeof(g_rom_warn)-1; j++) g_rom_warn[i++]=b[j];
+    g_rom_warn[i]=0;
+}
+/* v0.15.384 ПУТЬ К ФАЙЛУ ПЗУ. Раньше «0:/ROMS/» было вписано в двух местах, и файл из любой другой
+   папки (например 0:/zc/PROTEUS.ROM) достать было нельзя вообще. Теперь правило одно: есть в имени
+   '/' или ':' - это ПОЛНЫЙ ПУТЬ и берём его как есть; нет - это имя внутри 0:/ROMS/, как до сих пор.
+   Старые ini (там лежат чистые имена) читаются бит-в-бит как раньше. */
+static void rom_path_make(char* dst, int cap, const char* name){
+    int i=0, has=0;
+    for(int j=0; name[j]; j++) if(name[j]=='/' || name[j]==':'){ has=1; break; }
+    if(!has){ const char* pre="0:/ROMS/"; for(int j=0; pre[j] && i<cap-1; j++) dst[i++]=pre[j]; }
+    for(int j=0; name[j] && i<cap-1; j++) dst[i++]=name[j];
+    dst[i]=0;
+}
+/* Короткое имя для показа: строки слотов в меню узкие, полный путь в них не влезает и не нужен. */
+static const char* rom_base(const char* p){
+    const char* b=p; if(!p) return "";
+    for(int i=0; p[i]; i++) if(p[i]=='/' || p[i]==':') b = p+i+1;
+    return b;
+}
+/* v0.15.305 ПРОБА ФАЙЛА ПО СОДЕРЖИМОМУ. Читает файл постранично и отвечает на два вопроса сразу:
+   есть ли в нём хоть одна страница ПЗУ Спектрума (иначе файлу не место в списке) и какого типа его
+   ПЕРВАЯ страница (это и есть вторая колонка диалога выбора).
+   Свой буфер на 16 КБ, а не FS_BUF: там живут буфер файлового мейлбокса и окно расширенных банков
+   Пентагона (0x0FE00000 лежит внутри диапазона FS_BUF) - обход каталога не имеет права трогать
+   чужие данные. Опознанной странице радуемся сразу и файл дочитывать перестаём: у чужой прошивки
+   прочитаются все четыре страницы, у нормального набора - обычно одна. */
+static uint8_t g_rom_probe[ROM_PG_SZ];
+static int rom_file_probe(const char* name, uint32_t pages, uint8_t* first_kind){
+    char path[ROMSET_PATHL+16]; rom_path_make(path, (int)sizeof(path), name);
+    FIL f; if(f_open(&f, path, FA_READ) != FR_OK) return 0;
+    int zx = 0;
+    *first_kind = 3;
+    for(uint32_t p=0; p<pages; p++){
+        UINT br = 0;
+        if(f_read(&f, g_rom_probe, ROM_PG_SZ, &br) != FR_OK || br != (UINT)ROM_PG_SZ) break;
+        int k = rom_page_kind(g_rom_probe);
+        if(p == 0) *first_kind = (uint8_t)k;
+        if(rom_page_is_zx(g_rom_probe)){ zx = 1; break; }
+        KBD_HB = 1;                                 /* deadman: чтение с карты - заметное время */
+    }
+    f_close(&f);
+    return zx;
+}
+/* v0.15.384 ПОЛНАЯ ПОСТРАНИЧНАЯ ПРОБА ОДНОГО ФАЙЛА - источник таблицы в диалоге «ROM file and banks».
+   Отличие от rom_file_probe выше: тот отвечает на вопрос СПИСКА («пускать ли файл в перечень») и
+   потому обрывает чтение на первой же опознанной странице; здесь нужны ВСЕ страницы - владелец
+   смотрит, что в файле лежит. Буфер тот же g_rom_probe (16 КБ, и НЕ FS_BUF: внутри FS_BUF лежит окно
+   расширенных банков Пентагона 0x0FE00000). Дороже - до 64 КБ чтения с карты, поэтому зовётся ровно
+   при смене файла в диалоге, а не при каждой перерисовке. */
+static int rom_set_probe(const char* name, uint32_t* size, uint32_t* npg,
+                         uint8_t* ids, uint8_t* kinds, char labels[][20]){
+    if(size) *size = 0;
+    if(npg)  *npg  = 0;
+    for(uint32_t s=0; s<ROM_PG_N; s++){
+        if(ids)    ids[s]   = 0;
+        if(kinds)  kinds[s] = 3;
+        if(labels) labels[s][0] = 0;
+    }
+    if(!name || !name[0]) return 0;
+    if(!sd_mounted){ if(f_mount(&g_fs,"0:/",1)!=FR_OK) return 0; sd_mounted=1; }
+    char path[ROMSET_PATHL+16]; rom_path_make(path, (int)sizeof(path), name);
+    FIL f; if(f_open(&f, path, FA_READ) != FR_OK) return 0;
+    uint32_t sz = (uint32_t)f_size(&f);
+    if(size) *size = sz;
+    /* 🥇 v0.15.386 ГОДНОСТЬ РАЗМЕРА РЕШАЕМ ЗДЕСЬ, А НЕ ПОСЛЕ НАЖАТИЯ OK. rom_read_file требует
+       размер, КРАТНЫЙ 16 КБ и не больше четырёх страниц. Проба, которая молча брала первые четыре
+       страницы ЛЮБОГО файла, показывала «65536 bytes = 4 pages» на битстриме в 1.2 МБ и обещала
+       заливку, которую заливка потом отвергала (ROM SIZE BAD); а 8192-байтный ESXMMC.BIN выглядел
+       как «файла нет вовсе». Отказ отдаём с УЖЕ ЗАПОМНЕННЫМ размером - диалогу нужно назвать причину. */
+    if(sz == 0 || (sz % ROM_PG_SZ) || sz > ROM_PG_SZ*ROM_PG_N){ f_close(&f); return 0; }
+    uint32_t n = sz / ROM_PG_SZ;
+    uint32_t done = 0;
+    for(uint32_t p=0; p<n; p++){
+        UINT br = 0;
+        if(f_read(&f, g_rom_probe, ROM_PG_SZ, &br) != FR_OK || br != (UINT)ROM_PG_SZ) break;
+        if(kinds) kinds[p] = (uint8_t)rom_page_kind(g_rom_probe);
+        int id = rom_page_ident(g_rom_probe, labels ? labels[p] : 0, 20);
+        if(ids) ids[p] = (uint8_t)id;
+        done++;
+        KBD_HB = 1;                                  /* deadman: 64 КБ с карты - заметное время */
+    }
+    f_close(&f);
+    if(npg) *npg = done;
+    return done ? 1 : 0;
+}
+/* Обход 0:/ROMS/. НЕ трогает flist/curpath навигатора (sd_scan для этого не годится - он владеет
+   глобальным списком и курсором). Возвращает число пунктов, включая BUILT-IN. */
+static int romset_scan(void){
+    /* Диалог ROM может открыться после временной ошибки карты, когда старый список ещё виден, но
+       sd_mounted уже сброшен. Само открытие списка является явным запросом пользователя к карте:
+       пробуем смонтировать её снова. Старый список не разрушаем, пока каталог реально не открыт. */
+    if(!sd_mounted){
+        if(f_mount(&g_fs,"0:/",1)!=FR_OK) return g_rs_n;
+        sd_mounted=1;
+    }
+    DIR dir; FILINFO fno;
+    if(f_opendir(&dir, "0:/ROMS") != FR_OK) return g_rs_n;   /* каталога нет - оставляем последний список */
+    /* 🥇 v0.15.305 ФИЛЬТР ПО СОДЕРЖИМОМУ, А НЕ ПО РАЗМЕРУ. Здесь стоял комментарий «v301: прошивку
+       КАРТЫ не пускаем», под которым НЕ БЫЛО НИКАКОГО КОДА: пускали любой файл, кратный 16 КБ, и
+       прошивка карты General Sound (ровно 4 страницы) исправно попадала в список ПЗУ машины.
+       Теперь размер - только предварительная отбраковка (страницами по 16 КБ ПЗУ быть обязано),
+       а решает проба содержимого: файл без единой страницы ПЗУ Спектрума в список не идёт.
+       По имени не фильтруем принципиально - имя владелец волен дать любое. */
+    g_rs_n = 1;                                     /* [0] = BUILT-IN всегда на месте */
+    for(int i=1;i<=ROMSET_MAX+1;i++){ g_rs_name[i] = 0; g_rs_pages[i] = 0; g_rs_kind[i] = 3; }
+    int guard=0;
+    while(g_rs_n <= ROMSET_MAX){
+        if(f_readdir(&dir, &fno) != FR_OK || !fno.fname[0]) break;
+        if(fno.fattrib & (AM_DIR|AM_SYS|AM_HID)) continue;
+        if(fno.fsize < ROM_PG_SZ || fno.fsize > ROM_PG_SZ*ROM_PG_N) continue;   /* не набор ПЗУ */
+        if(fno.fsize % ROM_PG_SZ) continue;                                     /* размер кратен 16 КБ */
+        uint8_t kind = 3;
+        if(!rom_file_probe(fno.fname, (uint32_t)(fno.fsize / ROM_PG_SZ), &kind)) continue;  /* чужой код */
+        int i=0; for(; fno.fname[i] && i<ROMSET_NAMEL-1; i++) g_rs_buf[g_rs_n-1][i]=fno.fname[i];
+        g_rs_buf[g_rs_n-1][i]=0;
+        g_rs_name[g_rs_n] = g_rs_buf[g_rs_n-1];
+        /* v302: число страниц запоминаем ПРИ ОБХОДЕ. Выбор файла в СЛОТ показывает только
+           одностраничные файлы: слот - это ровно одна страница на 16 КБ, и предлагать туда
+           набор на 64 КБ значило бы обещать раскладку, которой у слота нет. */
+        g_rs_pages[g_rs_n] = (uint8_t)(fno.fsize / ROM_PG_SZ);
+        g_rs_kind[g_rs_n]  = kind;                  /* v305: тип первой страницы - вторая колонка диалогов */
+        g_rs_n++;
+        if((++guard & 63)==0) KBD_HB=1;             /* deadman: каталог может быть длинным */
+    }
+    f_closedir(&dir);
+    return g_rs_n;
+}
+/* v0.15.302: какую страницу ПЗУ машина читает СРАЗУ ПОСЛЕ СБРОСА - свойство ЯДРА, а не наше
+   пожелание. atlas_core/memory.v:
+       romPage = trdos ? 2'd2 : service_en ? 2'd3 : (model ? {1'b0, port7FFD[4]} : 2'b01),
+   а port7FFD после сброса = 0. Значит 128/Пентагон (model=1) стартуют со СТРАНИЦЫ 0, а 48К
+   (model=0) - со страницы 1: там romPage прибит намертво, порта 7FFD у машины нет вовсе. */
+static int rom_boot_page(int m){ return (m>=2 && m<=3) ? 1 : 0; }
+static int rom_slots_any(int m){                    /* назначен ли машине хоть один персональный слот */
+    if(m<0 || m>=N_MACHINES) return 0;
+    for(uint32_t s=0; s<ROM_PG_N; s++) if(g_mp[m].rom[s][0]) return 1;
+    return 0;
+}
+static void rom_pg_forget(void){                    /* в страницах снова заводское - показывать нечего */
+    for(uint32_t s=0; s<ROM_PG_N; s++) g_pg_file[s][0] = 0;
+    g_boot_alien = 0;                               /* v303: заводское ПЗУ = стартовая страница СВОЯ */
+}
+/* Прочитать файл из 0:/ROMS/ в dst. want != 0 - размер обязан быть РОВНО want (это слот: одна
+   страница), want == 0 - берём файл целиком, размер кратен 16 КБ и не длиннее lim (это набор).
+   Возвращает число прочитанных байт, 0 = отказ (код в *ec, чтобы вызывающий назвал причину). */
+static uint32_t rom_read_file(const char* name, uint8_t* dst, uint32_t want, uint32_t lim, uint8_t* ec){
+    char path[ROMSET_PATHL+16]; rom_path_make(path, (int)sizeof(path), name);
+    FIL f; if(f_open(&f, path, FA_READ) != FR_OK){ *ec = 0xE2; return 0; }
+    uint32_t sz = (uint32_t)f_size(&f);
+    if(want ? (sz != want) : (sz < ROM_PG_SZ || sz > lim || (sz % ROM_PG_SZ))){
+        f_close(&f); *ec = 0xE3; return 0;
+    }
+    uint32_t got = 0;
+    while(got < sz){
+        UINT br = 0, wn = (sz - got > 32768u) ? 32768u : (UINT)(sz - got);
+        if(f_read(&f, dst + got, wn, &br) != FR_OK || br == 0){ f_close(&f); *ec = 0xE4; return 0; }
+        got += br; KBD_HB = 1;
+    }
+    f_close(&f);
+    return got;
+}
+static const char* const ROM_SLOT_FAIL[ROM_PG_N] = {
+    "ROM SLOT 0 FAIL: ", "ROM SLOT 1 FAIL: ", "ROM SLOT 2 FAIL: ", "ROM SLOT 3 FAIL: " };
+static const char* const ROM_SLOT_DIG[ROM_PG_N] = { "0", "1", "2", "3" };
+/* 🥇 v0.15.384 РАСКЛАДКА AUTO - ОДНА ФУНКЦИЯ НА ЗАЛИВКУ И НА ПОКАЗ. Диалог обязан показывать ровно то,
+   что заливка СДЕЛАЕТ; две копии одного алгоритма разошлись бы при первой же правке, и интерфейс начал
+   бы врать в самом чувствительном месте. Алгоритм не изменён ни на байт по сравнению с v252:
+     - сначала каждая страница по СОДЕРЖИМОМУ в свой слот (первая занявшая - её);
+     - у многостраничного файла слоты 1..3 добиваются остатком В ПОРЯДКЕ ФАЙЛА;
+     - слот 0 (загрузочный для 128/1024) заполняется ТОЛЬКО по содержимому - иначе машина стартует с
+       неопознанной страницы и уходит непонятно куда (это и был отказ v252).
+   pg[слот] = номер страницы в файле, -1 = слоту источника нет. */
+static void rom_auto_map(const uint8_t* kinds, uint32_t npg, int* pg){
+    int used[ROM_PG_N];
+    for(uint32_t s=0; s<ROM_PG_N; s++){ pg[s] = -1; used[s] = 0; }
+    for(uint32_t p=0; p<npg && p<ROM_PG_N; p++){
+        int k = (int)kinds[p];
+        if(k>=0 && k<(int)ROM_PG_N && pg[k] < 0){ pg[k] = (int)p; used[p] = 1; }
+    }
+    if(npg > 1)
+        for(uint32_t s=1; s<ROM_PG_N; s++){
+            if(pg[s] >= 0) continue;
+            for(uint32_t p=0; p<npg && p<ROM_PG_N; p++) if(!used[p]){ pg[s] = (int)p; used[p] = 1; break; }
+        }
+}
+/* v0.15.384 РУЧНАЯ РАСКЛАДКА (владелец: «выбирать из разных вариантов любого ром файла»).
+   g_mp[m].rommap[слот] = номер страницы В ФАЙЛЕ, -1 = слот не грузить (оставить как есть). Страницу,
+   которой в файле нет, молча считаем «не грузить»: файл могли подменить более коротким. */
+static void rom_manual_map(int m, uint32_t npg, int* pg){
+    for(uint32_t s=0; s<ROM_PG_N; s++){
+        int v = (m>=0 && m<N_MACHINES) ? g_mp[m].rommap[s] : -1;
+        pg[s] = (v >= 0 && v < (int)npg) ? v : -1;
+    }
+}
+/* v0.15.302 ОДИН ОБЩИЙ ПРОХОД ЗАЛИВКИ. Источников у страницы теперь два, и порядок между ними
+   жёсткий:
+     1) файл НАБОРА (name) - раскладывается по четырём страницам ПО СОДЕРЖИМОМУ, ровно как с v207;
+     2) персональный файл слота (g_mp[m].rom[s]) - ПЕРЕКРЫВАЕТ то, что дал набор.
+   Всё пишется в ОДНОМ окне loading=1: пока оно поднято, машину держит в сбросе сама фабрика, и Z80
+   физически не может исполнить полузаписанное ПЗУ. Дробить на несколько окон нельзя - каждое окно
+   это ещё один сброс машины на ровном месте.
+   Сверка приборная: 0x144 ROM_LDCNT = сколько байт ДЕЙСТВИТЕЛЬНО легло в BRAM (ФАКТ), обратное
+   чтение ROM_LDADDR - вторая, независимая проверка (НАМЕРЕНИЕ: адрес бежит и тогда, когда запись
+   никуда не идёт). Отказ называет НОМЕР СЛОТА - иначе владельцу нечего чинить. */
+static uint8_t rom_load_set(const char* name){
+    if(!(LOAD_CAPS_R & LOADCAP_ROM)){ rom_msg_set("ROM PORT ABSENT", 0); return 0xE0; }
+    if(!sd_mounted) return 0xE1;
+    int m = (opt_defmachine>=0 && opt_defmachine<N_MACHINES) ? opt_defmachine : 0;
+    if((!name || !name[0]) && !rom_slots_any(m)) return 0xE1;      /* грузить нечего */
+    g_rom_warn[0] = 0;                              /* v384: оговорки этой заливки, а не прошлой */
+
+    uint8_t* setbuf  = (uint8_t*)FS_BUF_ADDR;      /* некэшируемое окно: чтение ARM-ом когерентно */
+    uint8_t* slotbuf = setbuf + ROM_PG_SZ*ROM_PG_N;/* по 16 КБ на слот - ещё 64 КБ. Расширенные банки
+                                                      Пентагона начинаются с 0x0FE00000, эти 128 КБ
+                                                      от начала FS_BUF (0x0F900000) их не задевают. */
+    const uint8_t* src[ROM_PG_N]; const char* srcname[ROM_PG_N];
+    for(uint32_t s=0; s<ROM_PG_N; s++){ src[s]=0; srcname[s]=0; }
+    uint8_t ec = 0; uint32_t npg = 0; int slotfail = 0;
+
+    /* ---- 1. НАБОР ЦЕЛИКОМ (поведение v207/v252 не менялось) ---- */
+    if(name && name[0]){
+        uint32_t sz = rom_read_file(name, setbuf, 0, ROM_PG_SZ*ROM_PG_N, &ec);
+        if(!sz){ rom_msg_set(ec==0xE2 ? "ROM OPEN FAIL: " : ec==0xE3 ? "ROM SIZE BAD: " : "ROM READ FAIL: ", name);
+                 return ec; }
+        npg = sz / ROM_PG_SZ;
+        int pg[ROM_PG_N]; uint8_t kinds[ROM_PG_N];
+        for(uint32_t p=0; p<ROM_PG_N; p++) kinds[p] = 3;
+        for(uint32_t p=0; p<npg && p<ROM_PG_N; p++) kinds[p] = (uint8_t)rom_page_kind(setbuf + p*ROM_PG_SZ);
+        /* v0.15.384 РЕЖИМ РАСКЛАДКИ - СВОЙСТВО МАШИНЫ (ключ <тег>.rommode).
+             AUTO   - ровно тот алгоритм, что жил здесь с v207/v252, теперь одной функцией rom_auto_map:
+                      её же зовёт диалог, поэтому показанное и сделанное разойтись не могут.
+                      Одностраничный файл в AUTO остаётся ДОПОЛНЕНИЕМ (отдельный TR-DOS, сервисное ПЗУ):
+                      уходит в свой слот по подписи и страниц 0/1 не трогает.
+             MANUAL - таблица владельца «слот <- страница файла» (задание 19.08: «выбирать из разных
+                      вариантов любого ром файла»). Здесь одностраничный файл можно положить в ЛЮБОЙ слот.
+           Ключа в старых ini нет -> rommode = 0 -> AUTO, то есть прежнее поведение бит-в-бит. */
+        if(g_mp[m].rommode == 1) rom_manual_map(m, npg, pg);
+        else                     rom_auto_map(kinds, npg, pg);
+        for(uint32_t s=0; s<ROM_PG_N; s++)
+            if(pg[s] >= 0){ src[s] = setbuf + (uint32_t)pg[s]*ROM_PG_SZ; srcname[s] = name; }
+    }
+    /* ---- 2. ПЕРСОНАЛЬНЫЕ СЛОТЫ: перекрывают набор ---- */
+    for(uint32_t s=0; s<ROM_PG_N; s++){
+        if(!g_mp[m].rom[s][0]) continue;
+        uint8_t* d = slotbuf + s*ROM_PG_SZ;
+        if(!rom_read_file(g_mp[m].rom[s], d, ROM_PG_SZ, ROM_PG_SZ, &ec)){
+            rom_msg_set(ROM_SLOT_FAIL[s], g_mp[m].rom[s]);   /* НАЗЫВАЕМ СЛОТ: «что-то не легло» нечинибельно */
+            g_pg_file[s][0] = 0; slotfail = 1;
+            continue;                    /* один битый файл не должен ронять заливку остальных страниц */
+        }
+        src[s] = d; srcname[s] = g_mp[m].rom[s];
+    }
+    /* ---- 2b. v342: ПЗУ DivMMC ПЕРЕКРЫВАЕТ СТРАНИЦУ 2, пока DivMMC включён ----
+       Своей памяти под ПЗУ esxDOS у нас нет: BRAM в обрез, поэтому карта читает свои 8 КБ из
+       НИЖНЕЙ половины страницы ПЗУ 2 (memory.v:390). Страница свободна ровно потому, что при
+       DivMMC = ON бета-диск выключен и TR-DOS в неё не встаёт (взаимоисключение выше).
+       Файл обязан быть РОВНО 16384 Б - слотовый читатель требует точного размера, а настоящий
+       ESXMMC.BIN 8192; дополнение нулями безвредно, верхние 8 КБ в этом режиме не адресуются. */
+    if(opt_divmmc && (LOAD_CAPS_R & LOADCAP_DIVMMC) && ROM_PG_N > 2){
+        uint8_t* d = slotbuf + 2u*ROM_PG_SZ;
+        uint8_t ec2 = 0;
+        if(rom_read_file("ESXMMC.ROM", d, ROM_PG_SZ, ROM_PG_SZ, &ec2)){
+            src[2] = d; srcname[2] = "ESXMMC.ROM";
+        } else {
+            rom_warn_set("DIVMMC ROM MISSING: 0:/ROMS/", "ESXMMC.ROM");   /* v384: успехом не затирается */
+        }
+    }
+    /* ---- 3. СТРАНИЦА, С КОТОРОЙ МАШИНА СТАРТУЕТ ----
+       Выбрать её иначе, чем ПЕРЕКЛАДКОЙ СОДЕРЖИМОГО, нельзя: номер страницы после сброса зашит в
+       ядре (см. rom_boot_page), а ядро в этой задаче не трогаем. Поэтому копия содержимого
+       выбранного слота ДОПОЛНИТЕЛЬНО кладётся в ту физическую страницу, которую машина читает при
+       сбросе. Сам слот при этом остаётся на своём месте - иначе перестали бы работать трап TR-DOS
+       (страница 2) и сервисная страница (3), у которых номер тоже зашит в ядре. Ровно это и нужно
+       одиночному ПЗУ вроде FATAL: файл лежит в своём слоте, а машина по сбросу стартует с него. */
+    /* Берём значение ИЗ ПРОФИЛЯ, а не из живой opt_rombus: рядом отсюда же читаются имена слотов
+       (g_mp[m].rom), и два источника правды на одну раскладку - это будущее расхождение. */
+    int bus = (g_mp[m].rombus>=1 && g_mp[m].rombus<=(int)ROM_PG_N) ? g_mp[m].rombus-1 : -1;
+    int bp  = rom_boot_page(m);
+    const uint8_t* bootsrc = 0; const char* bootname = 0;
+    if(bus >= 0 && bus != bp){
+        if(src[bus]){ bootsrc = src[bus]; bootname = srcname[bus]; }
+        else { rom_msg_set("ROM BOOT SLOT IS EMPTY", 0); slotfail = 1; }
+    }
+    /* 🥇 v0.15.303 ВОЗВРАТ В AUTO ОБЯЗАН ВЕРНУТЬ СТРАНИЦУ СЕБЕ. Копия чужого слота лежит в стартовой
+       странице ФИЗИЧЕСКИ, а заливка ниже пропускает страницу без источника (`if(!p) continue`).
+       Поэтому «AUTO» при пустом src[bp] означало: машина по-прежнему стартует с чужого ПЗУ, а меню
+       уверяет, что стартует как обычно. Это ровно случай владельца (FATAL в слот 3, потом обратно).
+       Источник ищем по старшинству: набор или персональный слот (src[bp] заполнен выше) -> заводское
+       ПЗУ с карты. Нужную страницу в BUILTIN.ROM выбираем ПО СОДЕРЖИМОМУ - тем же классификатором,
+       что и всегда (стартовая страница у нас либо 128-меню, либо 48 BASIC). Вернуть нечем - НЕ
+       МОЛЧИМ: пункт меню сказал бы AUTO, а в странице осталось бы чужое. */
+    if(!bootsrc && g_boot_alien && !src[bp]){
+        uint8_t* restbuf = slotbuf + ROM_PG_SZ*ROM_PG_N;      /* ещё 64 КБ: всего 192 КБ от начала FS_BUF */
+        uint8_t  rec = 0;
+        uint32_t rsz = rom_read_file("BUILTIN.ROM", restbuf, 0, ROM_PG_SZ*ROM_PG_N, &rec);
+        int found = -1;
+        for(uint32_t q=0; q < rsz/ROM_PG_SZ && found < 0; q++)
+            if(rom_page_kind(restbuf + q*ROM_PG_SZ) == bp) found = (int)q;
+        if(found >= 0){ src[bp] = restbuf + (uint32_t)found*ROM_PG_SZ; srcname[bp] = "BUILTIN.ROM"; }
+        else { rom_msg_set("BOOT PAGE NOT RESTORED: NO SOURCE", 0); slotfail = 1; }
+    }
+    { int any=0; for(uint32_t s=0; s<ROM_PG_N; s++) if(src[s]) any=1;
+      if(!any){ rom_msg_set("ROM NO PAGES", 0); return 0xE5; } }
+
+    /* 🥇 v0.15.384 ЧЕСТНОЕ ПРЕДУПРЕЖДЕНИЕ О НЕЗАПОЛНЕННОМ СЛОТЕ. Страница без источника ниже
+       ПРОПУСКАЕТСЯ (`if(!p) continue`), то есть в ней физически остаётся ПРЕЖНЕЕ содержимое BRAM -
+       страница чужого, прошлого набора. Молчать об этом нельзя: ровно так «PENTGLUK без 128-меню»
+       выглядел как полный успех. Пишем в буфер ПРЕДУПРЕЖДЕНИЙ - строка успеха его не затрёт. */
+    if(name && name[0] && (npg > 1 || g_mp[m].rommode == 1)){
+        char dg[2*ROM_PG_N]; int dn = 0;
+        for(uint32_t s=0; s<ROM_PG_N; s++)
+            if(!src[s] && !(bootsrc && s == (uint32_t)bp)){
+                if(dn) dg[dn++] = ',';
+                dg[dn++] = (char)('0' + s);
+            }
+        if(dn){ dg[dn] = 0; rom_warn_set("ROM SLOTS KEPT OLD CONTENT: ", dg); }
+    }
+    ROM_LDCTL = 0x1u | 0x8u;                        /* loading=1 (машина в сбросе), адрес и счётчик в ноль */
+    uint8_t err = 0; int errslot = -1; uint32_t done = 0;
+    for(uint32_t s=0; s<ROM_PG_N; s++){
+        const uint8_t* p = (bootsrc && s == (uint32_t)bp) ? bootsrc  : src[s];
+        const char*    n = (bootsrc && s == (uint32_t)bp) ? bootname : srcname[s];
+        if(!p) continue;                            /* страницу без источника оставляем как есть */
+        ROM_LDADDR = s * ROM_PG_SZ;
+        for(uint32_t b=0; b<ROM_PG_SZ; b++){
+            ROM_LD = p[b];
+            if((b & 0x1FFFu) == 0) KBD_HB = 1;      /* deadman: 64 КБ по одному байту - это заметное время */
+        }
+        done += ROM_PG_SZ;
+        if(ROM_LDCNT != done){ err = 0xE6; if(errslot < 0) errslot = (int)s; g_pg_file[s][0] = 0; }
+        else if((ROM_LDADDR & 0xFFFFu) != ((s * ROM_PG_SZ + ROM_PG_SZ) & 0xFFFFu)){
+            err = 0xE7; if(errslot < 0) errslot = (int)s; g_pg_file[s][0] = 0; }
+        else { /* легло - запоминаем ИМЯ ФАЙЛА, чьё содержимое реально в этой странице */
+            const char* nb = rom_base(n ? n : "");  /* v384: полный путь в узкую строку меню не влезает */
+            int i=0; for(; nb[i] && i<ROMSET_NAMEL-1; i++) g_pg_file[s][i] = nb[i];
+            g_pg_file[s][i] = 0; }
+    }
+    ROM_LDCTL = 0x0u;                               /* loading=0 -> фабрика отпускает сброс машины */
+    /* v303: запоминаем, ЧЕМ занята стартовая страница. Не удалось вернуть (источника нет) - признак
+       остаётся поднятым, и следующая попытка снова будет её возвращать. */
+    if(!err){ if(bootsrc) g_boot_alien = 1; else if(src[bp]) g_boot_alien = 0; }
+    if(err){ rom_msg_set("ROM VERIFY FAIL, SLOT ", errslot>=0 ? ROM_SLOT_DIG[errslot] : "?"); return err; }
+    g_rom_loaded = 1;
+    /* Трап включаем ТОЛЬКО если в слоте 2 лежит страница, опознанная как настоящая TR-DOS. Слот,
+       заполненный «остатком» в порядке файла (или чужим файлом из ini), - неизвестная страница, и
+       трап уводил бы машину в неё. */
+    g_trdos_ok = (src[2] && rom_page_kind(src[2]) == 2) ? 1 : 0;
+    /* Многостраничный файл = законченный набор: отсутствующая service-страница должна выключить
+       старый признак, иначе после PENTGLUK -> PENT128_504 меню продолжало предлагать ЧУЖОЕ service
+       ROM, физически оставшееся в незаписанном слоте 3. Одностраничный файл остаётся дополнением:
+       отдельный TR-DOS не должен отменять уже загруженную service-страницу и наоборот. */
+    if(npg > 1) g_svc_ok = (src[3] != 0) ? 1 : 0;
+    else if(src[3]) g_svc_ok = 1;
+    /* 🥇 v0.15.388 МЕХАНИЗМ ВХОДА В МЕНЕДЖЕР ЗАМЕРЯЕМ ЗДЕСЬ, пока страница ещё в руках. Штатный
+       BIOS настоящего пентагона входит в свой файловый менеджер сбросом бита 4 порта #7FFD при
+       вставленном TR-DOS, и попадает НЕ в конкретный адрес, а в поле из 12 нулей по 0x3FF0..0x3FFB,
+       за которым стоит вход 0x3FFC = DI; JP (F3 C3). Проверяем МЕХАНИЗМ, а не имя программы: у
+       FATALL и Proteus он есть, у Gluk и диагностических ПЗУ там FF (их вход - NMI). Признак живёт
+       по тем же правилам, что g_svc_ok: многостраничный файл его переписывает (в том числе в нуль),
+       одностраничное дополнение - только если само принесло страницу 3. */
+    { const uint8_t* p3 = src[3];
+      int ent = 0;
+      if(p3){
+          ent = (p3[0x3FFC] == 0xF3 && p3[0x3FFD] == 0xC3) ? 1 : 0;
+          for(uint32_t q = 0x3FF0; ent && q < 0x3FFC; q++) if(p3[q]) ent = 0;
+      }
+      if(npg > 1 || p3) g_svc_entry = ent; }
+    if(!slotfail){                                  /* причину отказа сообщением об успехе не затираем */
+        /* v0.15.384: и ПРЕДУПРЕЖДЕНИЕ тоже не затираем - оно сильнее строки успеха. Иначе владелец
+           читает «ROM SET: PENTGLUK.ROM» там, где слот 0 остался с чужим ПЗУ. */
+        if(g_rom_warn[0])        rom_msg_set(g_rom_warn, 0);
+        else if(name && name[0]) rom_msg_set(g_trdos_ok ? "ROM SET + TR-DOS: " : "ROM SET: ", rom_base(name));
+        else                     rom_msg_set(g_trdos_ok ? "ROM SLOTS + TR-DOS" : "ROM SLOTS LOADED", 0);
+    }
+    return 0;
+}
+/* Применить набор ТЕКУЩЕЙ машины: залить выбранный или вернуть заводское ПЗУ.
+   v254 (владелец: «переключение рома никогда не должно вызывать ребута машины»): заводское ПЗУ
+   сначала ищем НА КАРТЕ файлом `BUILTIN.ROM` и грузим тем же портом заливки, что и любой набор -
+   ядро при этом не трогается вовсе. Перезалив ядра через PCAP остаётся ЗАПАСНЫМ путём: файла нет -
+   поведение прежнее, и плата по-прежнему поднимается без карты. Файл собирается из `rom128.hex`
+   прошитого ядра; страницы раскладывает по содержимому тот же классификатор (у заводского набора их
+   две: `1986 Sinclair` = 128-меню в слот 0 и `1982 Sinclair` = 48 BASIC в слот 1), поэтому TR-DOS и
+   сервисной страницы у него нет - это свойство самого ПЗУ, а не способа загрузки. */
+static uint8_t romset_apply(void){
+    int m = (opt_defmachine>=0 && opt_defmachine<N_MACHINES) ? opt_defmachine : 0;
+    if(!(LOAD_CAPS_R & LOADCAP_ROM)) return 0;                 /* ядро без порта (NES, MiSTer-48) */
+    if(g_mp[m].romset[0]) return rom_load_set(g_mp[m].romset);
+    /* v0.15.302: слоты БЕЗ набора - это тоже полноценная конфигурация ПЗУ (именно так поднимается
+       одиночный FATAL). Базой берём BUILTIN.ROM, если он есть на карте: тогда страницы, которые
+       слот не покрыл, гарантированно заводские, а не остаток прошлого набора. Файла нет - кладём
+       только слоты поверх того, что уже лежит в BRAM. */
+    if(rom_slots_any(m)){
+        FIL f;
+        if(f_open(&f, "0:/ROMS/BUILTIN.ROM", FA_READ) == FR_OK){ f_close(&f); return rom_load_set("BUILTIN.ROM"); }
+        return rom_load_set("");
+    }
+    if(!g_rom_loaded){ g_trdos_ok = 0; return 0; }             /* и так заводское - делать нечего */
+    /* v254: заводское ПЗУ с карты - без PCAP и без перезагрузки ядра. */
+    { FIL f;
+      if(f_open(&f, "0:/ROMS/BUILTIN.ROM", FA_READ) == FR_OK){
+          f_close(&f);
+          if(rom_load_set("BUILTIN.ROM") == 0){
+              g_rom_loaded = 0;                                /* в окне снова заводское содержимое */
+              rom_pg_forget();                                 /* v302: показывать в слотах нечего */
+              rom_msg_set("ROM: BUILT-IN (FROM CARD)", 0);   /* ревью: было UTF-8 «с карты», а шрифт оболочки CP866 - на экране каша */
+              return 0;
+          }
+      } }
+    { char cp[40]; core_path(cp, machine_core(m));             /* запасной путь: перезалить ядро */
+      if(pl_reload(cp) == 0){ g_rom_loaded = 0; g_trdos_ok = 0; rom_pg_forget(); rom_msg_set("ROM: BUILT-IN RESTORED", 0);
+                              fabric_reinit_after_reload(); return 0; } }
+    rom_msg_set("ROM: RELOAD FAILED", 0);
+    return 0xE7;
 }
 /* .z80 RLE: 'ED ED cnt val'; clen==0xFFFF -> 16384 raw bytes. `avail` = source bytes remaining in the
    file from src, so a truncated/malformed page can never read past end-of-file (clamps raw + RLE). */
@@ -1765,7 +4545,10 @@ static void load_sna(const uint8_t* d,int len){
    }
 
    /* Check if the running core is already NES. If not, switch machine to NES and reload core.
-      This prevents redundant PCAP reloading of the FPGA if the core is already in the PL. */
+      This prevents redundant PCAP reloading of the FPGA if the core is already in the PL.
+      v0.15.340: проверка снова означает ровно то, что написано. Имя ядра после перезагрузки сверено
+      со словом семейства MACHINE_ID (см. pl_reload), поэтому случай «в 0:/CORES/NES.BIT.BIN лежит
+      ZX-ядро» ловится здесь сообщением, а не чёрным экраном и стримом картриджа в чужие регистры. */
    if (opt_defmachine != 4 || cicmp(g_cur_core, "NES") != 0) {
        opt_defmachine = 4;
        apply_machine();
@@ -1860,6 +4643,38 @@ static void load_sna(const uint8_t* d,int len){
     apply_halt();                                               /* inject_finish did IJ_CTRL=0; re-assert HALT if a manual pause is still held */
 }
 
+/* ---- v0.15.152: launch a .nes from the browser (RetroPie flow: Enter on the cart -> play) ----
+   Mirror of load_snapshot for the NES machine: make sure the NES core is in the PL (machine #4 ->
+   apply_machine pl_reloads 0:/CORES/NES.BIT.BIN), then stream the cart into its BRAM (nes_load,
+   which also computes the NESTang mapper_flags from the iNES header) and hand the screen over. */
+static void ensure_nes_core(void){
+    if (opt_defmachine != 4) {                          /* NES = machine #4 in CH_MACHINE/CH_MACHINE_CORE */
+        if (opt_defmachine >= 0 && opt_defmachine < 4) opt_defspec = opt_defmachine;  /* remember the Spectrum to come back to */
+        opt_defmachine = 4;
+        apply_machine();                                /* pl_reload NES.BIT.BIN + fabric reinit */
+    }
+}
+static void nes_launch(void){
+    char path[180]; int p=0;                            /* curpath(<=79) + '/' + NAMELEN(96) + NUL */
+    for(int i=0;curpath[i] && p<160;i++) path[p++]=curpath[i];
+    if(p && path[p-1]!='/') path[p++]='/';
+    for(int i=0;flist[bcursor][i] && p<179;i++) path[p++]=flist[bcursor][i];
+    path[p]=0;
+    if(!sd_mounted) return;
+    ensure_nes_core();
+    if(player_active() && opt_launchsnd==0) player_suspend();   /* launching a game while music plays */
+    OSD_CTRL&=~3u; osd_on=0; browser_on=0; osd_view=0;          /* hand the screen to the game */
+    { int i=0; for(; path[i] && i<179; i++) g_app_path[i]=path[i]; g_app_path[i]=0; }
+    { int q=0; for(; path[q] && q<191; q++) g_src_path[q]=path[q]; g_src_path[q]=0; }
+    g_app_stopped=0;
+    update_banner();
+    nes_load(path);                                     /* parse iNES -> mapper_flags + PRG/CHR stream + reset */
+    kbd_state_clear();                                  /* v0.15.192: Enter, которым запустили игру, не должен
+                                                           уехать в машину «зажатым» - загрузка длится сотни мс,
+                                                           и её отпускание легко теряется. Реально удерживаемая
+                                                           клавиша вернётся тайпматиком через ~90 мс. */
+}
+
 /* ---- music auto-play: playable test, play-by-index (cursor follows), auto-advance on EOF ---- */
 static int is_music_ext(int idx){
     if(idx<0 || idx>=fcount || fisdir[idx]) return 0;
@@ -1952,7 +4767,11 @@ static int      g_phase = 0, g_bit_idx = 7, g_half = 0;
 static uint32_t g_pilot_left = 0, g_byte_idx = 0, g_tape_done = 0;
 static uint64_t g_tape_total_T = 1, g_tape_elapsed_T = 0;   /* whole-tape duration + played T-states: percent denominator only */
 
-static int      g_tape_drain = 0;          /* 1 = no more pulses to push; wait for the FIFO to fully replay, THEN release */
+/* v0.15.203: VOLATILE. Флаг меняется в одном месте, а читается в пампе ленты; на -O0 это сходило с
+   рук, но main.c переведён на -O2, где компилятор вправе закешировать его в регистре и больше не
+   перечитывать - лента тогда зависнет на дренаже. Совет консулов отдельно отметил: из читаемых
+   асинхронно именно он был единственным не-volatile (g_dbg[] волатилен). */
+static volatile int g_tape_drain = 0;          /* 1 = no more pulses to push; wait for the FIFO to fully replay, THEN release */
 static uint32_t g_tape_last_pct = 999;     /* throttle the status redraw to % changes (no tearing) */
 static uint32_t g_music_last_pct = 0xFFFFFFFFu, g_music_last_sec = 0xFFFFFFFFu;  /* music progress/time throttle */
 /* ---- Step 14.2b: format-agnostic SEGMENT model (TAP standard blocks + TZX turbo/pulse/pause blocks) ---- */
@@ -1982,7 +4801,7 @@ static uint32_t tp_u24(uint32_t o){ return (o+2u<g_tap_len)?(g_tapbuf[o]|((uint3
 static void close_osd(void);
 static void update_banner(void);
 static volatile int g_bytefeed_en __attribute__((used)) = 0;  /* fabric byte-inject: DEAD on B0049 */
-static volatile uint32_t g_tier0_diag __attribute__((used)) = 0;  /* reject point: 1=tzx-custom 2=trunc 3=headerless 4=data-after-hdr 5=lenmismatch 6=tail-hdr/np<2 7=first-not-basic 8=no-usr 9=not-code 10=range 0xT0=OK(np) */  /* fabric byte-inject: DEAD on B0049 (smart RTL absent - only bit 0x3E had it). JTAG-poke to revive after the RTL is ported back. */
+static volatile uint32_t g_tier0_diag __attribute__((used)) = 0;  /* reject point: 1=tzx-custom 2=trunc 3=headerless 4=data-after-hdr 5=lenmismatch 6=tail-hdr/np<2 7=first-not-basic 8=no-usr 9=not-code 10=range 18=BASIC продолжается после USR 0xT0=OK(np) */  /* fabric byte-inject: DEAD on B0049 (smart RTL absent - only bit 0x3E had it). JTAG-poke to revive after the RTL is ported back. */
 static int tier0_num_after(const uint8_t* b, uint32_t n, uint32_t i, uint32_t* out){
     /* Parse a BASIC number right after a token: ASCII digits first (authoritative in program text),
        else the 0x0E 5-byte binary form (small-int layout 0,0,lo,hi,0). Returns 1 + *out on success. */
@@ -2053,6 +4872,44 @@ static void tier0_scan_loader(const uint8_t* c, uint32_t n, t0scan* sc){
         sc->ok=0; return;                                  /* незнакомый опкод — честный отказ */
     }
 }
+/* v0.15.431: ПРОДОЛЖАЕТСЯ ЛИ BASIC ПОСЛЕ `RANDOMIZE USR`.
+   Зачем. tier0 стартует машину с PC = USR, SP = CLEAR+1 и шаблоном сисвар, а BASIC-программу в ОЗУ
+   НЕ кладёт. Игре это безразлично (её код никогда не возвращается), но любая программа, которая
+   возвращается в BASIC (`RET`) или читает его переменные, уходит по адресу 0x0000 со стека вычищенного
+   ОЗУ - на экране это выглядит как сброс машины. Так падали ВСЕ тесты Яна Бобровского
+   (`minfo`, `stime`, `btime`, `ulatest3`: у них строка вида
+   `10 RANDOMIZE USR 49152: PAUSE 1: PRINT AT 0,0;: GO TO 10`) и `z80full` RAXOFT.
+   Признак. Идём по программе СТРУКТУРНО (строка = номер[2] + длина[2] + тело, где тело кончается 0x0D),
+   внутри тела пропускаем пятибайтную форму числа после 0x0E (в ней может лежать любой байт, в том числе
+   0x0D и 0x3A - наивный посимвольный проход тут врёт). Если после последнего `USR` в ЕГО строке есть
+   что-то кроме пробелов и завершающего 0x0D, либо после этой строки есть ещё строки - BASIC
+   продолжается, и инжект применять нельзя.
+   Цена ошибки в обе стороны неравна: лишний отказ = обычная импульсная загрузка (медленнее, но верно),
+   пропущенный случай = «машина сбрасывается», то есть ложный отчёт о поломке железа. Поэтому правило
+   намеренно осторожное. */
+static int tier0_basic_continues(const uint8_t* b, uint32_t n){
+    uint32_t i = 0, usr_line_end = 0; int usr_seen = 0, tail_in_line = 0;
+    while(i + 4u <= n){
+        uint32_t ln = (uint32_t)b[i+2] | ((uint32_t)b[i+3] << 8);   /* длина тела, вместе с 0x0D */
+        uint32_t body = i + 4u, end = body + ln;
+        if(ln == 0u || end > n) break;                              /* битая структура - решает вызывающий */
+        uint32_t j = body;
+        int usr_here = 0; int tail_here = 0;
+        while(j < end){
+            uint8_t c = b[j];
+            if(c == 0x0Eu){ j += 6u; continue; }                    /* 0x0E + 5 байт числа */
+            if(c == 0x0Du) break;                                   /* конец строки */
+            if(c == 0xC0u){ usr_here = 1; tail_here = 0; j++; continue; }   /* токен USR */
+            if(usr_here && c != ' ') tail_here = 1;                  /* что-то ПОСЛЕ USR в этой же строке */
+            j++;
+        }
+        if(usr_here){ usr_seen = 1; tail_in_line = tail_here; usr_line_end = end; }
+        i = end;
+    }
+    if(!usr_seen) return 0;                                          /* USR не нашли - пусть решает основной разбор */
+    if(tail_in_line) return 1;                                       /* `USR n: ещё что-то` */
+    return (usr_line_end < n) ? 1 : 0;                               /* после строки с USR есть ещё строки */
+}
 static int tap_tier0_try(void){
     /* Collect [header,data] pairs from g_tapbuf (TAP or TZX-standard). */
     uint32_t bp = 0; int is_tzx = 0;
@@ -2099,6 +4956,9 @@ static int tap_tier0_try(void){
           if(b[i]==0xC0 && tier0_num_after(b,n,i+1u,&v)){ if(got_usr && v!=usr){ g_tier0_diag=11; return 0; } usr=v; got_usr=1; }  /* multi-USR loader (init chain, e.g. BigThings) - inject would skip the first USR's setup */
       } }
     if(!got_usr || usr<0x4000u || usr>0xFFFFu){ g_tier0_diag=8; return 0; }
+    /* v0.15.431: BASIC продолжается после USR -> инжект НЕЛЬЗЯ (см. tier0_basic_continues выше).
+       Отказ роняет нас в обычный импульсный путь: программа загрузится, только не мгновенно. */
+    if(tier0_basic_continues(g_tapbuf+dofs[0], dlen[0])){ g_tier0_diag=18; return 0; }
     if(nhl){
         /* ---- v135 stub-chain path: BASIC pokes a DATA m/c stub and USR's it; the stub (and the
            loaders it loads) place every headerless block via CALL 0x0556. Track the chain statically. */
@@ -2564,7 +5424,7 @@ pdsm_fallback_pulse:
    status row 22 - same row/columns/bar as dn_draw_tape_status, but YELLOW + an explicit caption so the
    user can tell the up-front PREPARATION apart from the green load that follows. pct = 0..100. */
 static void dn_draw_prep_status(unsigned pct){
-    if(!browser_on) return;                              /* only when the DN browser owns the screen */
+    if(!browser_on || g_modal_level > 0 || g_menu_open) return;                              /* only when the DN browser owns the screen */
     if(pct>100u) pct=100u;
     dn_fill(1,22,DN_COLS-2,1,DNK_PANEL_BG);              /* clear the row (same as the tape/music status) */
     dn_put_glyph(2,22, GLYPH_PLAY, DNK_HEADER, DNK_PANEL_BG);
@@ -2577,6 +5437,7 @@ static void dn_draw_prep_status(unsigned pct){
     dn_bar_pct(59,22,DNB_SCR-1-59,pct,DNK_HEADER,DNK_PANEL_BG);  /* exact same pct as the label */
 }
 static void dn_draw_tape_status(void){
+    if(g_modal_level > 0 || g_menu_open) return;
     uint64_t pt = tape_played_T();
     unsigned pct = (unsigned)((pt*100u)/g_tape_total_T); if(pct>100u) pct=100u;
     dn_fill(1,22,DN_COLS-2,1,DNK_PANEL_BG);
@@ -2821,6 +5682,11 @@ static void zx_tape_autostart(void){
     /* blind-retry ENTER: the single-shot ENTER sometimes misses (menu not ready / keypress dropped),
        so press it a few times with gaps. Extra ENTERs into an already-running loader are harmless. */
     for(int _e=0;_e<3;_e++){ zx_tap_key(0x5A); tape_wait_ms(450); }
+    /* v247: страховочные отпускания. Слепой повтор ENTER при потерянном отпускании оставляет
+       клавишу зажатой, и меню выбирает пункт снова и снова сразу после BREAK - на встроенном ПЗУ
+       это выглядит как заклинивание в ленточном загрузчике. */
+    zx_key(0x5A, 1); tape_wait_ms(40);
+    zx_key(0x29, 1); tape_wait_ms(40);
 }
 static void tape_start(void){
     ensure_spectrum_core();
@@ -3905,6 +6771,2295 @@ static void tape_pump(void){
 
 /* JTAG self-test auto-loader: fake a browser selection of <dir>/<name> and run the REAL load path
    (so it exercises the exact production code). Triggered by poking g_autotrig via xsdb - no keypress. */
+/* ---- General Sound: обслуживание из главного цикла ----
+   Прогон рубим на куски по миллиону тактов и между ними кормим deadman: одна виртуальная секунда
+   GS - это заметное время, и молчащий сторожевой таймер выглядел бы как зависшая прошивка. */
+extern void     gs_reset(void);
+extern uint32_t gs_run(uint32_t cycles);
+extern int      gs_dbg_load_rom(const void* p, unsigned n);
+extern void     gs_zx_write_cmd(uint8_t v);
+extern void     gs_zx_write_data(uint8_t v);
+extern uint8_t  gs_zx_read_data(void);   /* машина забрала байт: у эмулятора снять флаг данных */
+extern uint8_t  gs_zx_read_stat(void);   /* слово состояния ЭМУЛЯТОРА - его и зеркалит фабрика */
+extern uint8_t  gs_dout_get(void);
+extern unsigned gs_pc_get(void);
+extern unsigned gs_cmdrd_get(void);
+extern unsigned gs_int_get(void);
+extern unsigned gs_page_get(void);
+extern void     gs_render(int16_t* l, int16_t* r);   /* v265: один сэмпл ЦАП = прогон карты на его период */
+extern unsigned gs_inq_used(void);                   /* B0108: занятость очереди данных на стороне ARM */
+extern void     gs_outq_set_depth(unsigned d);       /* v339: очередь ОТВЕТОВ карты; 0 = прежнее поведение */
+extern unsigned gs_outq_get_depth(void);
+extern unsigned gs_outq_get_used(void);
+extern unsigned gs_outq_get_peak(void);
+extern unsigned gs_inq_room(void);
+extern unsigned gs_indrop_get(void);
+extern unsigned gs_pgsel_get(void);
+extern unsigned gs_regs_bcde(void);
+extern unsigned gs_regs_ahl(void);
+extern unsigned gs_ram4(unsigned addr);
+extern unsigned gs_latch_get(void);
+extern unsigned gs_vols_get(void);
+extern unsigned gs_chans_get(void);
+extern void     gs_set_ram_kb(unsigned kb);
+extern unsigned gs_get_ram_kb(void);
+extern unsigned gs_rambase_get(void);
+extern unsigned gs_cyc_get(void);
+extern unsigned gs_pages_get(void);       /* v298: страниц по 32 КБ в текущем объёме карты */
+extern unsigned gs_poll_get(void);        /* v298: чтений порта флагов - признак «карта в холостом цикле» */
+extern void     gs_debt_slots(unsigned slots);  /* v298: слоты ЦАП, прошедшие мимо карты - её долг времени */
+extern unsigned gs_debt_get(void);
+extern unsigned gs_hits_get(unsigned i);   /* v0.15.332: 0 HSEND, 1 HGET, 2 HTAIL2, 3 QTFAULT, 4 QTPLAY */
+extern unsigned gs_holes_get(void);
+extern unsigned gs_holemax_get(void);
+extern unsigned gs_holesum_get(void);
+extern unsigned gs_smpout_get(void);
+extern void     gs_diag2_reset(void);
+extern unsigned player_gs_done(void);     /* v298: сэмплов карты реально отдано в звук (часы прибора) */
+extern unsigned player_gs_slots(void);    /* v298: слотов ЦАП всего, включая закрытые тишиной */
+extern unsigned player_gs_used(void);     /* v299: сколько сэмплов лежит в очереди ЦАП прямо сейчас */
+extern unsigned gs_query_get(void);       /* v299: запросов состояния, пропущенных мимо очереди данных */
+extern unsigned gs_intheld_get(void);     /* v299: сколько раз прерывание карты пришлось ДЕРЖАТЬ (она в DI) */
+extern void     gs_latch_diag_take(uint32_t out[5]); /* v317: снять и очистить максимум окна */
+extern unsigned gs_int_per_get(void);     /* v336: тактов на прерывание при текущей частоте карты */
+/* v0.15.336: НОМИНАЛ ПРИБОРА ТЕМПА БЕРЁТСЯ У КАРТЫ, А НЕ ИЗ КОНСТАНТЫ 12 МГц. Прибор считает долю
+   отданных сэмплов от слотов ЦАП и умножает её на номинал; оставить 120 (12.0 МГц) означало бы,
+   что разогнанная карта, идущая ровно, показывает «12.0 МГц» и выглядит отставшей на треть. */
+static unsigned gs_nom10(void){ return gs_get_clock_hz() / 100000u; }   /* номинал, 0.1 МГц */
+/* v258: ОБСЛУЖИВАНИЕ General Sound. Читаем состояние ловушки, передаём эмулятору то, что
+   записала машина, снимаем флаги и держим ответный байт. Прогон считаем ПО ВРЕМЕНИ: GS обязан
+   идти в реальном темпе 12 МГц, иначе музыка поедет по скорости, а не просто станет тише.
+   Запас есть - на плате замерено 52 млн тактов/с. */
+static int      g_gs_live = 0;      /* ПЗУ загружено и прогон разрешён */
+/* ================= v0.15.265 НАСОС GENERAL SOUND =================
+   Два разных дела - две функции:
+     gs_flags_pump() - ДЁШЕВЫЙ обмен с ловушкой: забрать байты машины, отдать состояние. Без
+                       прогона процессора, поэтому его можно звать часто.
+     gs_pump()       - производство звука, которое ЗАОДНО двигает виртуальное время карты.
+
+   🥇 ФЛАГ ОДИН, И ЕГО ХОЗЯИН - КАРТА. По руководству GS бит0 регистра #BB имеет право сбросить
+   ТОЛЬКО сама карта своим внутренним портом #05 (CLRCBIT), и весь GS-софт первым делом крутит
+       WC: IN A,(#BB) : RRCA : JR C,WC   ; ждём, пока GS снимет флаг команд
+   В B0106 оболочка снимала ФАБРИЧНЫЙ флаг сразу, как передала команду эмулятору, то есть отвечала
+   машине «принято» ЗА карту: копии расходились, и плеер вис ровно там, где ждал подтверждения.
+   Теперь фабрика ЗЕРКАЛИТ состояние эмулятора: на каждом проходе мы отдаём ей ровно те биты,
+   которые сейчас у карты. События машины (запись #BB, запись #B3, чтение #B3) читаем по ТОГГЛ-битам
+   и возвращаем их эхом - фабрика применит зеркало только если с момента снимка события не было,
+   иначе устаревшее слово затёрло бы свежий флаг (см. B0107 в atlas_core/main.v).
+
+   🥇 ТЕМП ЗАДАЁТ ЦАП, А НЕ ЧАСЫ ARM. Сэмплы уходят в тот же FIFO, который фабрика вычерпывает на
+   47996 Гц, поэтому пока мы отдаём по сэмплу на его период, карта идёт ровно 12 МГц. Привязка к
+   XTime (v258..v264) этого не давала: любой промах счёта уводил музыку по ТЕМПУ, а не по громкости. */
+static uint8_t  g_gs_e0 = 0, g_gs_r7 = 0;   /* последние увиденные тоггл-биты событий машины */
+/* v276 ТРАССА ПРОТОКОЛА. Плеер делает десятки шагов, и гадать, какой из них лишний, дорого: одна
+   проверка на плате стоит пять минут. Записав ПОСЛЕДОВАТЕЛЬНОСТЬ, её можно повторить на хостовом
+   стенде за секунды. Кольцо: старое затирается, поэтому важна последняя тысяча событий, а не первая.
+   Данные пишем не все - поток модуля это десятки тысяч байт; первые 64 байта каждого потока
+   говорят о заголовке всё, а дальше считаем. */
+static uint32_t g_gs_trc_w, g_gs_trc_run;
+static uint32_t g_gs_cap_n;            /* v0.15.393: сколько байт снято в FS_BUF */
+static uint32_t g_gs_str_n, g_gs_str_s;
+static int      g_gs_str_open;
+static int      g_gs_trc_poll;           /* последняя команда была ОПРОСОМ - её ответы не пишем */
+static void gs_trc(uint32_t type, uint8_t v){
+    /* v0.15.392: выключено - выходим ДО любой записи в мейлбокс (см. gs_trc_en выше). */
+    uint32_t trc_en = gs_trc_en;
+    if(!trc_en) return;
+    /* v0.15.393 бит1: снимок ВСЕХ байтов данных подряд - для побайтной сверки с файлом модуля.
+       Работает независимо от #D1/#D2: этот плеер поток не открывает, а льёт байты пачками команд. */
+    if((trc_en & 2u) && type == 2u){
+        uint32_t i = g_gs_cap_n;
+        if(i < 262144u) ((volatile uint8_t*)FS_BUF_ADDR)[i] = v;
+        g_gs_cap_n = i + 1u;
+        gs_d_capn = g_gs_cap_n;
+    }
+    if(!(trc_en & 1u)) return;
+    /* 🥇 Фильтр опроса. Плеер непрерывно шлёт #60..#64 (позиция, ноты, громкости для своих
+       индикаторов) и вычитывает ответы - за секунды это тысячи событий, и кольцо затирает ровно то,
+       ради чего заводилось: загрузку модуля. Опрос и его ответы в трассу не пишем. */
+    if(type == 1u){
+        /* v311: см. gs_d_ngs - опознавательная пара загрузчика NeoGS, считаем её отдельно от
+           трассы, потому что кольцо трассы затирается, а ответ на вопрос нужен за весь сеанс. */
+        if(v == 0x55u) gs_d_ngs = (gs_d_ngs & 0xFFFF0000u) | ((gs_d_ngs + 1u) & 0xFFFFu);
+        if(v == 0xAAu) gs_d_ngs = (gs_d_ngs & 0x0000FFFFu) | (((gs_d_ngs >> 16) + 1u) << 16);
+        /* v0.15.391: блок опроса индикаторов - весь #60..#6F, а не только #60..#64. Плеер зовёт
+           и #67..#69 (у них же разрешён обгон очереди ниже), их ответы забивали кольцо, и момент
+           загрузки трека в трассе не сохранялся. */
+        g_gs_trc_poll = (v >= 0x60u && v <= 0x6Fu);
+        GS_CMDCNT[v]++;                                      /* счётчик по коду - потоком не смывается */
+        if(v == 0xD1u){ g_gs_str_n = 0; g_gs_str_s = 0; g_gs_str_open = 1; }
+        if(v == 0xD2u) g_gs_str_open = 0;                    /* закрытие: результат больше не портим */
+        gs_d_stream_n = g_gs_str_n; gs_d_stream_s = g_gs_str_s;
+    }
+    if(type == 2u && g_gs_str_open){
+        /* v279: КЛАДЁМ ВЕСЬ ПОТОК В ПАМЯТЬ и сверяем с файлом побайтно. Контрольная сумма сказала
+           только «не совпало», а нужно знать ГДЕ и КАК: потеря, дубль или сдвиг - это три разных
+           дефекта. Буфер FS_BUF свободен, пока не идут файловые операции. */
+        if(g_gs_str_n < 262144u) ((volatile uint8_t*)FS_BUF_ADDR)[g_gs_str_n] = v;
+        g_gs_str_n++;
+        g_gs_str_s = (g_gs_str_s * 31u) + v;                /* сумма с весом: ловит и порядок байт */
+        gs_d_stream_n = g_gs_str_n; gs_d_stream_s = g_gs_str_s;
+    }
+    if(g_gs_trc_poll && type != 2u) return;
+    if(type == 2u) gs_d_datn++;          /* v0.15.391 общие счётчики - вне кольца */
+    if(type == 3u) gs_d_rspn++;
+    if(type == 2u){                      /* данные: пишем только начало каждого потока */
+        if(g_gs_trc_run++ >= 64u) return;
+    } else {
+        g_gs_trc_run = 0;                /* команда/чтение - поток кончился, считаем заново */
+    }
+    GS_TRC[g_gs_trc_w % GS_TRC_N] = (type << 24) | (uint32_t)v;
+    g_gs_trc_w++;
+    gs_d_trc_n = g_gs_trc_w;
+}
+static unsigned g_gs_rqcnt = 0;             /* занятость очереди в ПЛИС, снятая попутно с байтом */
+/* 🥇 v0.15.310: ТЕПЕРЬ ЭТО НЕ «ЭПИЗОД», А ШТУКИ. Ядро B0119 считает потерянные БАЙТЫ (0x194) и
+   цену удержаний шины (0x198), поэтому липкий признак ниже остался только «случилось / не
+   случилось», а размер ущерба берётся из счётчика. С тактами ожидания на порте данных потеря
+   возможна ровно в одном случае - сработал сторож, то есть оболочка не вынула из очереди ни байта
+   за 148 мс. Поэтому сообщение владельцу говорит и то, и другое: сколько байт и был ли сторож.
+   🥇 v0.15.308 ПЕРЕПОЛНЕНИЕ БОЛЬШЕ НЕ МОЛЧИТ. Липкий признак в фабрике был и раньше,
+   но читал его только JTAG - и потерянный байт драйвера Z-Player искали сутки. С обратным
+   давлением (ядро B0118) признак обязан стоять в нуле ВСЕГДА: если он встал, значит гость
+   записал без опроса флага больше байт, чем зарезервировано в очереди (32) - это новый
+   случай, его надо чинить, а не искать заново. Признак СНИМАЕМ зеркалом (бит25): липкий
+   бит, который никто не гасит, показывает только «когда-то было» и не даёт отличить старый
+   эпизод от нового. Говорим В ИНТЕРФЕЙСЕ, а не только в мейлбокс. */
+/* 🥇 v0.15.310 СЧЁТЧИКИ ИЗ ДОМЕНА МАШИНЫ ЧИТАЕМ ДВАЖДЫ. Слова 0x194/0x198 собираются на 56.7 МГц,
+   а AXI отдаёт их в домен 100 МГц БЕЗ синхронизатора (axi_ctl.v: ). Одиночное
+   чтение может попасть ровно на перенос в счётчике и вернуть разряды от двух разных значений - а
+   мы по этому числу собираемся ставить диагноз «потеряно N байт». Совпали два подряд - значение
+   живое; не совпали - берём прошлое: счётчики меняются редко, и пропустить одно обновление дешевле,
+   чем один раз соврать (на ложных числах мы в этом проекте уже теряли по полдня). */
+static uint32_t gs_rd2(volatile uint32_t* r, uint32_t prev){
+    uint32_t a = *r, b = *r;
+    return (a == b) ? a : prev;
+}
+static uint32_t g_gs_bp2 = 0, g_gs_bp3 = 0;  /* B0119: прибор обратного давления, последнее живое чтение */
+static uint32_t g_gs_lost_say = 0;           /* о скольких потерянных байтах уже сказали */
+static uint32_t g_gs_wd_say   = 0;           /* и о скольких срабатываниях сторожа */
+static int      g_gs_ovr_seen = 0;          /* эпизод уже посчитан */
+static uint32_t g_gs_ovr_clr  = 0;          /* просим фабрику снять липкий признак (зеркало, бит25) */
+static uint32_t g_gs_ovr_n    = 0;          /* эпизодов за сеанс - и в мейлбокс, и в строку состояния */
+static int      g_gs_ovr_say  = 0;          /* сказать владельцу (из главного цикла, не из насоса) */
+static XTime    g_gs_ovr_t    = 0;          /* когда говорили в прошлый раз */
+static uint32_t g_gs_ovr_n7   = 0;          /* v309: эпизодов потери ДАННЫХ (#B3, очередь была полна) */
+static uint32_t g_gs_ovr_n0   = 0;          /* v309: эпизодов потери КОМАНДЫ (#BB, флаг ещё стоял) */
+static uint32_t g_gs_ovr_q    = 0;          /* v309: наибольшая занятость очереди ПЛИС у отказа */
+static uint32_t g_gs_ctl_lv = 0xFFFFFFFFu;  /* v299: последнее ОТПРАВЛЕННОЕ зеркало (0xFFFFFFFF = неизвестно) */
+static int      g_gs_en_last = 1;      /* 1 = в фабрике включён гейт GS; при выключении снять ОДИН раз */
+static int      g_gs_boot_try = 0;     /* ленивый старт по опции из ini - ровно одна попытка */
+static void gs_flags_pump(void){
+    uint32_t st = GS_STAT;
+    uint8_t  e0 = (uint8_t)((st >> 26) & 1u);
+    uint8_t  r7 = (uint8_t)((st >> 28) & 1u);
+    uint8_t  cmd_pending = (uint8_t)(e0 != g_gs_e0);
+    uint8_t  cmd = (uint8_t)((st >> 8) & 0xFFu);
+    int      wq_empty = 0;
+    if(r7 != g_gs_r7){ g_gs_r7 = r7; (void)gs_zx_read_data();                        gs_d_rd++;
+                       gs_trc(3u, gs_dout_get()); }
+    {   uint32_t ov = (st >> 30) & 3u; /* липкие: байт машины потерян (очередь была полна) */
+        /* v0.15.309 ДИАГНОСТИКА: ovr7 и ovr0 - РАЗНЫЕ отказы, складывать их в один счётчик нельзя.
+           ovr7 (бит31) = байт ДАННЫХ записан в #B3 при полной очереди - потерян байт потока.
+           ovr0 (бит30) = КОМАНДА записана в #BB, пока прошлая не забрана - потеряна команда.
+           Пока они считались вместе, по числу эпизодов нельзя было понять, куда чинить. */
+        if(ov && !g_gs_ovr_seen){ g_gs_ovr_seen = 1; g_gs_ovr_n++; g_gs_ovr_say = 1;
+                                  if(ov & 2u) g_gs_ovr_n7++;      /* данные */
+                                  if(ov & 1u) g_gs_ovr_n0++;      /* команда */
+                                  if(g_gs_rqcnt > g_gs_ovr_q) g_gs_ovr_q = g_gs_rqcnt; }
+        else if(!ov)            { g_gs_ovr_seen = 0; }
+        g_gs_ovr_clr = ov ? 1u : 0u;   /* снять липкий признак, чтобы следующий эпизод был виден */
+        gs_d_ovr = ov | ((g_gs_ovr_n0 & 0xFFu) << 8) | ((g_gs_ovr_n7 & 0xFFu) << 16)
+                      | ((g_gs_ovr_q  & 0xFFu) << 24);
+    }
+    /* B0108: ДАННЫЕ идут не по флагу, а очередью. Вычерпываем её, пока у карты есть куда принять:
+       остановились - фабричная очередь наполнится, флаг данных для машины встанет сам, и машина
+       законно подождёт. Предел на проход есть только чтобы не зависнуть в цикле навсегда. */
+    {   unsigned n = 0;
+        /* Команда и FIFO данных приходят из FPGA разными каналами, но на шине команда записана
+           ПОСЛЕ уже лежащих в FIFO байтов. Поэтому при новом e0 сперва обязаны увидеть FIFO пустым
+           и лишь затем ставить команду в общую очередь ARM. Прежний порядок давал
+           `... data, D2, tail data`: ROM закрывал поток до его хвоста. 257-я итерация нужна только
+           для чтения признака empty после теоретически полного FIFO на 256 байтов. Пока Command bit
+           поднят, корректный GS-софт ждёт WC и новых данных после команды добавить не может. */
+        while(n <= 256u && gs_inq_room() > 64u){
+            uint32_t q = GS_RQ;                 /* чтение ИЗВЛЕКАЕТ байт из очереди фабрики */
+            g_gs_rqcnt = (unsigned)((q >> 16) & 0x1FFu);   /* занятость приходит тем же словом:
+                                     отдельно её не прочитать - любое чтение 0x180 извлекает байт */
+            if(q & 0x100u){ wq_empty = 1; break; }          /* пусто */
+            gs_zx_write_data((uint8_t)(q & 0xFFu));
+            gs_trc(2u, (uint8_t)(q & 0xFFu));
+            n++;
+        }
+        if(n){ gs_d_dat += n; }
+    }
+    /* Если места во внутренней очереди временно не хватило, e0 не подтверждаем: на следующем
+       проходе продолжим выгребать FIFO, а машина всё это время законно ждёт WC. */
+    if(cmd_pending && wq_empty){
+        g_gs_e0 = e0;
+        gs_zx_write_cmd(cmd);
+        gs_d_acc++;
+        gs_trc(1u, cmd);
+    }
+    /* 🥇 v0.15.321 ЗЕРКАЛО ФЛАГОВ — ДО ИДЕАЛА ПРОТОКОЛА OUTRG/HSEND/WN/GD.
+       1) Свежий снимок фабрики: st с начала насоса мог устареть, пока мы вычерпывали FIFO.
+       2) Сверка want (эмулятор) vs fab (то, что ZX видит на #BB bit7/bit0).
+       3) Повтор записи при расхождении — иначе отклонённое по echo слово залипает в g_gs_ctl_lv
+          и we-тоггл больше не идёт (дедлок COM20/21: GS в HSEND, ZX в WN, fabric outp=0).
+       4) Второй проход в том же вызове: если после записи фабрика всё ещё не совпала — обновить
+          эхо тогглов (могли пропустить #B3/#BB) и стукнуть ещё раз. На multi-byte ответе это
+          снимает окно гонки без ожидания следующего главного цикла. */
+    {   uint32_t stf = GS_STAT;
+        uint8_t  r7f = (uint8_t)((stf >> 28) & 1u);
+        if(r7f != g_gs_r7){ g_gs_r7 = r7f; (void)gs_zx_read_data(); gs_d_rd++;
+                            gs_trc(3u, gs_dout_get()); }
+        uint8_t sw = gs_zx_read_stat();
+        uint8_t want_b7 = (uint8_t)((sw & 0x80u) ? 1u : 0u);
+        uint8_t want_b0 = (uint8_t)((sw & 0x01u) ? 1u : 0u);
+        uint8_t fab_b7  = (uint8_t)((stf >> 22) & 1u);
+        uint8_t fab_b0  = (uint8_t)((stf >> 21) & 1u);
+        uint32_t w = 0x80000000u
+               | (want_b7 ? (1u << 30) : 0u)
+               | (want_b0 ? (1u << 29) : 0u)
+               | ((uint32_t)g_gs_r7 << 28) | ((uint32_t)g_gs_e0 << 26)
+               | (g_gs_ovr_clr << 25)
+               | (uint32_t)gs_dout_get();
+        if(w != g_gs_ctl_lv || fab_b7 != want_b7 || fab_b0 != want_b0){
+            GS_CTL = w; g_gs_ctl_lv = w;
+            /* подтверждение в том же проходе (CDC echo: 2 такта машины + AXI) */
+            stf = GS_STAT;
+            r7f = (uint8_t)((stf >> 28) & 1u);
+            if(r7f != g_gs_r7){ g_gs_r7 = r7f; (void)gs_zx_read_data(); gs_d_rd++;
+                                gs_trc(3u, gs_dout_get()); }
+            sw = gs_zx_read_stat();
+            want_b7 = (uint8_t)((sw & 0x80u) ? 1u : 0u);
+            want_b0 = (uint8_t)((sw & 0x01u) ? 1u : 0u);
+            fab_b7  = (uint8_t)((stf >> 22) & 1u);
+            fab_b0  = (uint8_t)((stf >> 21) & 1u);
+            w = 0x80000000u
+               | (want_b7 ? (1u << 30) : 0u)
+               | (want_b0 ? (1u << 29) : 0u)
+               | ((uint32_t)g_gs_r7 << 28) | ((uint32_t)g_gs_e0 << 26)
+               | (g_gs_ovr_clr << 25)
+               | (uint32_t)gs_dout_get();
+            if(w != g_gs_ctl_lv || fab_b7 != want_b7 || fab_b0 != want_b0){
+                GS_CTL = w; g_gs_ctl_lv = w;
+            }
+        } }
+    g_gs_en_last = 1;
+}
+/* 🥇 v0.15.308 ПРИЁМ БАЙТОВ НЕ ОТПУСКАЕТСЯ НА ДОЛГИХ ФАЗАХ. Звук у нас уже реальное
+   время (ради этого есть bg_pump), а вот встречный поток из машины ждал конца фазы. Здесь
+   НЕЛЬЗЯ звать gs_pump: он считает сэмплы и сам стоит десятки миллисекунд - получилась бы
+   та же болезнь на этаж выше. Насос ФЛАГОВ дешёв (пара обращений к регистрам) и СОХРАНЯЕТ
+   ПОРЯДОК команд и данных - выборка только данных переставила бы их местами. */
+static void gs_wq_kick(void){
+    if(!g_gs_live) return;
+    if(opt_defmachine > 2) return;          /* ловушка портов живёт только в ядре Atlas */
+    gs_flags_pump();
+}
+/* ================= v0.15.298 ПРИБОР ТЕМПА КАРТЫ (окно 1 с, восемь долей по 1/8 с) =================
+   Что меряем: сэмплы, которые карта РЕАЛЬНО отдала в звук. Это конечный результат её работы, и
+   подделать его нечем - в отличие от «мгновенной скорости», которую владелец видел то 6, то 13 МГц
+   на одной и той же настройке. Часы берём у ЦАП (player_gs_slots): он вычерпывает очередь ровно
+   47996 раз в секунду из прерывания, поэтому его счёт не зависит ни от длины прохода главного
+   цикла, ни от открытого диалога. Доля отданных сэмплов от слотов и есть доля от 12 МГц.
+   Окно режем на восемь долей, чтобы показывать не только среднее, но и ХУДШУЮ долю: провал в
+   200 мс раз в четыре секунды в среднем за секунду почти не виден, а на слух - именно он. */
+#define GSM_SL_N    8u                       /* долей в окне */
+#define GSM_SL_SLOT (47996u / GSM_SL_N)      /* 5999 слотов ЦАП = 1/8 секунды */
+static uint32_t g_gsm_sl_done[GSM_SL_N], g_gsm_sl_slot[GSM_SL_N], g_gsm_sl_poll[GSM_SL_N];
+static unsigned g_gsm_i;                     /* какую долю заполняем */
+static uint32_t g_gsm_seen_slots, g_gsm_seen_done, g_gsm_seen_gaps, g_gsm_seen_under, g_gsm_seen_q;
+static uint32_t g_gsm_worst;                 /* v299: худшая доля ЗА ВСЁ ВРЕМЯ, а не только за окно */
+static uint32_t g_gsm_smp_acc, g_gsm_pass_acc;   /* кэшируемые накопители: в мейлбокс - раз в долю */
+static void gs_meter_reset(void){
+    for(unsigned i = 0; i < GSM_SL_N; i++){ g_gsm_sl_done[i] = 0; g_gsm_sl_slot[i] = 0; g_gsm_sl_poll[i] = 0; }
+    g_gsm_i = 0;
+    g_gsm_seen_slots = player_gs_slots();
+    g_gsm_seen_done  = player_gs_done();
+    g_gsm_seen_gaps  = g_gs_ungap;
+    g_gsm_seen_under = g_gs_under;
+    g_gsm_seen_q     = gs_query_get();
+    g_gsm_worst      = 0;
+    g_gsm_smp_acc = 0; g_gsm_pass_acc = 0;
+    gs_m_avg10 = 0; gs_m_min10 = 0; gs_m_smp = 0; gs_m_slots = 0; gs_m_gaps = 0; gs_m_debt = 0;
+    gs_m_poll = 0; gs_m_min10w = 0;
+    gs_d_lgap = gs_d_lgpc = gs_d_lgpos0 = gs_d_lgpos1 = gs_d_lgirq = 0;
+    gs_d_modpos = gs_d_lgseq = 0;
+    gs_s_lgap = gs_s_lgpc = gs_s_lgpos0 = gs_s_lgpos1 = gs_s_lgirq = gs_s_lgseq = 0;
+}
+/* 🥇 v0.15.299 СТРАХОВОЧНЫЙ ЗАПАС ЗВУКА. Ниже него оболочка не занимается ничем, кроме сэмплов:
+   протокол GS ждать умеет (тайм-аутов у GS-софта нет вовсе - проверено по коду X-Player, Mod Player
+   и драйвера производителя), а ЦАП не умеет - он отдаёт тишину, и это слышно. 1024 сэмпла = 21 мс. */
+#define GS_SAFE_SMP 1024u
+/* v0.15.320: потолок сэмплов за один проход главного цикла. Раньше при пустом кольце
+   gs_service досчитывал до 4096 сэмплов (~85 мс) одним куском (замер PH_M до 134 мс).
+   512 сэмплов ≈ 10.7 мс: запас 1024 набирается за 2 прохода, фазы чередуются. */
+#define GS_PUMP_MAX 512u
+/* В установившемся режиме кольцо полное: доливаем чуть-чуть. */
+#define GS_TARGET_SMP 2048u
+static void gs_pump(void){
+    if(!g_gs_live){
+        if(g_gs_en_last){ GS_CTL = 0; g_gs_ctl_lv = 0xFFFFFFFFu; g_gs_en_last = 0; }  /* карта выключена -
+                                                              порты #BB/#B3 отдать машине */
+        return;
+    }
+    if(opt_defmachine > 2){ return; }   /* ловушка живёт в ядре Atlas: на MiSTer48 и NES её нет */
+    /* 🥇 v0.15.330 СЭМПЛЫ РАНЬШЕ ФЛАГОВ (A/B ZYNAP vs Z-Player).
+       Владелец: тот же модуль в GS без стыков в игре/TR-DOS; стыки — только с Z-Player
+       (окно трекера #60..#64 — gs_cmd_is_query; комментарий v299 уже предупреждал).
+       Раньше при used>=SAFE сначала gs_flags_pump (дорогие AXI), лавина опросов съедала
+       проход до gs_render → wall-hold = «стык». Теперь: порция сэмплов → флаги → долив. */
+    {
+        unsigned used0 = player_gs_used();
+        unsigned room0 = player_gs_room();
+        unsigned pre = (used0 < GS_SAFE_SMP) ? 128u : 64u;
+        if(pre > room0) pre = room0;
+        if(pre > GS_PUMP_MAX) pre = GS_PUMP_MAX;
+        while(pre--){
+            int16_t l, r;
+            gs_render(&l, &r);
+            player_gs_push(l, r);
+            dmmc_poke();                    /* v426: карта - на каждом сэмпле, и в этом цикле тоже */
+        }
+    }
+    gs_flags_pump();
+    /* 🥇 ВРЕМЯ, ПРОШЕДШЕЕ МИМО КАРТЫ, СТАНОВИТСЯ ЕЁ ДОЛГОМ. Пока очередь пуста, ЦАП получает тишину,
+       а виртуальное время карты не идёт - и раньше оно не возвращалось НИКОГДА: карта отставала
+       навсегда, а GS-софт машины показывал это как «9 МГц вместо 12». Считаем пропущенные слоты и
+       отдаём их эмулятору долгом; он отрабатывает его не быстрее +25 % к темпу и не больше четверти
+       секунды всего (см. gs_render), поэтому после долгой паузы рывка не будет. */
+    {   uint32_t un = g_gs_under, d = un - g_gsm_seen_under;
+        if(d){ g_gsm_seen_under = un; gs_debt_slots(d); }
+    }
+    /* Звук: доливаем очередь до конца. Флаги прокачиваем каждые 16 сэмплов - на побайтовой передаче
+       данных это и есть скорость обмена с машиной, поэтому реже нельзя.
+       v0.15.299: пока запас ниже страховочного, тот же насос идёт ВЧЕТВЕРО РЕЖЕ. Совсем его
+       останавливать нельзя (машина ждёт вечно, и со стороны это выглядит зависанием карты), но и
+       опережать звук ему незачем: каждый вызов - это чтение и запись НЕкэшируемых регистров ПЛИС,
+       то есть время, отнятое у сэмплов. Как только запас набран, темп обмена возвращается прежним. */
+    {   unsigned room = player_gs_room(), k = 0, n = 0;
+        unsigned used = player_gs_used();
+        /* v320: не монополизировать CPU на полное кольцо. */
+        if(used >= GS_TARGET_SMP){
+            if(room > 64u) room = 64u;
+        } else if(room > GS_PUMP_MAX){
+            room = GS_PUMP_MAX;
+        }
+        while(room--){
+            int16_t l, r;
+            gs_render(&l, &r);
+            player_gs_push(l, r);
+            n++;
+            /* 🥇 v0.15.308 САМАЯ ДОЛГАЯ ПАУЗА ЖИВЁТ ИМЕННО ЗДЕСЬ. Пофазный секундомер
+               показал у фазы gs_service до 134 мс - столько стоит досчитать пустое кольцо в 4096
+               сэмплов (85 мс звука) на нашей скорости эмуляции. При шаге в 16 сэмплов пауза между
+               вычерпываниями выходила ~0.5 мс, а поток Z-Player даёт байт каждые 4.7 мкс: то есть
+               байты драйвера терялись ВНУТРИ расчёта звука, а не где-то в файловых операциях.
+               Шаг 2 сэмпла = пауза ~65 мкс при любом размере очереди. Цена: 2048 вызовов дешёвого
+               насоса на полное наполнение - около 2 % фазы. Ниже страховочного запаса звука
+               шаг остаётся реже (16): там каждое обращение к регистрам - это время, отнятое у ЦАП,
+               а машина теперь подождёт на флаге без потерь (ядро B0118). */
+            dmmc_poke();                    /* v426: на КАЖДОМ сэмпле (v424 - через 2, ловил 22 из 310) */
+            if((++k & 1u) == 0u){
+                if(player_gs_used() >= GS_SAFE_SMP) gs_flags_pump();
+                else if((k & 15u) == 0u)            gs_flags_pump();
+            }
+        }
+        g_gsm_smp_acc += n;
+    }
+    g_gsm_pass_acc++;
+    /* 🥇 ЗЕРКАЛО ДИАГНОСТИКИ - НЕ ЧАЩЕ ВОСЬМИ РАЗ В СЕКУНДУ. Пятнадцать записей в НЕкэшируемый
+       мейлбокс плюс три чтения ОЗУ карты стояли на КАЖДОМ проходе главного цикла (около 200 тысяч
+       в секунду) - это была самая дорогая постоянная работа насоса, и платила за неё именно карта.
+       Диагностике хватает доли секунды, а темпу эмуляции эти проценты нужны. */
+    {   uint32_t slots = player_gs_slots();
+        uint32_t dslot = slots - g_gsm_seen_slots;
+        if(dslot >= GSM_SL_SLOT){                       /* доля окна закрылась */
+            uint32_t lg[5];
+            uint32_t done = player_gs_done();
+            uint32_t gaps = g_gs_ungap;
+            uint32_t sd = 0, ss = 0, sq = 0, worst = 0xFFFFFFFFu;
+            uint32_t q = gs_query_get();
+            uint32_t nom10 = gs_nom10();                /* v336: номинал текущей частоты, 0.1 МГц */
+            unsigned j = g_gsm_i;                       /* доля, которую закрываем прямо сейчас */
+            g_gsm_sl_slot[g_gsm_i] = dslot;
+            g_gsm_sl_done[g_gsm_i] = done - g_gsm_seen_done;
+            g_gsm_sl_poll[g_gsm_i] = q - g_gsm_seen_q;  /* v299: запросов состояния в этой доле */
+            g_gsm_seen_slots = slots; g_gsm_seen_done = done; g_gsm_seen_q = q;
+            g_gsm_i = (g_gsm_i + 1u) % GSM_SL_N;
+            for(unsigned i = 0; i < GSM_SL_N; i++){
+                if(!g_gsm_sl_slot[i]) continue;         /* доля ещё не заполнялась - в счёт не идёт */
+                sd += g_gsm_sl_done[i]; ss += g_gsm_sl_slot[i]; sq += g_gsm_sl_poll[i];
+                {   uint32_t m = (nom10 * g_gsm_sl_done[i]) / g_gsm_sl_slot[i];   /* 0.1 МГц */
+                    if(m < worst) worst = m; }
+            }
+            gs_m_avg10 = ss ? ((nom10 * sd) / ss) : 0u;
+            gs_m_min10 = (worst == 0xFFFFFFFFu) ? 0u : worst;
+            /* v299: ХУДШЕЕ ЗА ВСЁ ВРЕМЯ - по ТОЛЬКО ЧТО закрытой доле. Брать для этого минимум окна
+               нельзя: одна и та же доля живёт в окне восемь тактов прибора, и «худшее» просто
+               повторялось бы. Провал раз в полминуты иначе не увидеть - окно в секунду его теряет. */
+            {   uint32_t m = g_gsm_sl_slot[j] ? ((nom10 * g_gsm_sl_done[j]) / g_gsm_sl_slot[j]) : 0u;
+                if(g_gsm_sl_slot[j] && (!g_gsm_worst || m < g_gsm_worst)){ g_gsm_worst = m; gs_m_min10w = m; } }
+            gs_m_poll  = sq;
+            gs_m_smp   = sd;
+            gs_m_slots = ss;
+            gs_m_gaps  = ((gaps - g_gsm_seen_gaps) << 16) | (gaps & 0xFFFFu);
+            g_gsm_seen_gaps = gaps;
+            gs_m_debt  = gs_debt_get();
+            gs_d_smp  += g_gsm_smp_acc;  g_gsm_smp_acc  = 0;
+            gs_d_pass += g_gsm_pass_acc; g_gsm_pass_acc = 0;
+            gs_d_pc    = gs_pc_get();
+            gs_d_cmdrd = gs_cmdrd_get();
+            gs_d_int   = gs_int_get();
+            gs_d_intheld = gs_intheld_get();
+            /* v0.15.332: прибор «где карта теряет звук». Обнуление - записью 1 в gs_d2_ctl из JTAG,
+               чтобы снять A/B «игра против плеера» без перезагрузки. */
+            if(gs_d2_ctl){ gs_diag2_reset(); gs_d2_ctl = 0; }
+            gs_d2_hsend   = gs_hits_get(0);
+            gs_d2_hget    = gs_hits_get(1);
+            gs_d2_htail   = gs_hits_get(2);
+            gs_d2_qtf     = gs_hits_get(3);
+            gs_d2_qtp     = gs_hits_get(4);
+            gs_d2_holes   = gs_holes_get();
+            gs_d2_holemax = gs_holemax_get();
+            gs_d2_holesum = gs_holesum_get();
+            gs_d2_smpout  = gs_smpout_get();
+            gs_latch_diag_take(lg);
+            gs_d_lgap = lg[0]; gs_d_lgpc = lg[1];
+            gs_d_lgpos0 = lg[2]; gs_d_lgpos1 = lg[3]; gs_d_lgirq = lg[4];
+            gs_d_modpos = gs_ram4(0x415Au);
+            gs_d_lgseq++;
+            /* v320: sticky только для живых разрывов (< 1 с = 12e6 тактов), иначе
+               навсегда остаётся gap от холодного старта до первой защёлки. */
+            if(lg[0] > gs_s_lgap && lg[0] < 12000000u){
+                gs_s_lgap = lg[0]; gs_s_lgpc = lg[1];
+                gs_s_lgpos0 = lg[2]; gs_s_lgpos1 = lg[3]; gs_s_lgirq = lg[4];
+                gs_s_lgseq = gs_d_lgseq;
+            }
+            gs_d_pk    = AUD_PK;
+            gs_d_inq   = ((uint32_t)gs_inq_used() << 16) | ((uint32_t)g_gs_rqcnt & 0xFFFFu);
+            gs_d_drop  = gs_indrop_get();
+            gs_d_pgsel = gs_pgsel_get();
+            gs_d_cyc   = gs_cyc_get();
+            gs_d_bcde  = gs_regs_bcde();
+            gs_d_ahl   = gs_regs_ahl();
+            gs_d_ram19B = gs_ram4(0x419Bu);
+            gs_d_numpg  = gs_ram4(0x4080u);
+            gs_d_latch  = gs_latch_get();
+            gs_d_vols   = gs_vols_get();
+            gs_d_chans  = gs_chans_get();
+        }
+    }
+    /* Мультиплексор звука: GS звучит ВМЕСТЕ с машиной (бит1 = сумма, а не кроссфейд). Ногу у нас
+       могут законно забрать файловый плеер и лента - их значение не перебиваем. */
+    if(!player_active() && !g_tape_on) AUDIO_CTRL = 3u;
+}
+/* Включение карты: ПЗУ с карты, сброс и ПРОГОН ИНИЦИАЛИЗАЦИИ. На настоящем железе GS загружен
+   задолго до старта софта; у нас он поднимается вместе с машиной, и быстрый загрузчик обгоняет его -
+   команда попадает в ещё не готовую карту. Прошивка gs105b на старте несколько ВИРТУАЛЬНЫХ секунд
+   обходит и чистит память (измерено на хостовом стенде), поэтому крутим 20 виртуальных секунд
+   кусками, с кормлением сторожевого таймера. ~5 с реального времени, один раз при включении. */
+static int gs_boot(void){
+    FIL f; UINT br = 0; FRESULT rr;
+    gs_set_ram_kb(GSRAM_KB[(opt_gsram >= 0 && opt_gsram <= 3) ? opt_gsram : 1]);   /* v281: объём ДО сброса */
+    gs_set_clock_hz(GSCLK_HZ[(opt_gsclk >= 0 && opt_gsclk <= 3) ? opt_gsclk : GSCLK_DEF]);  /* v336:
+        частота тоже ДО сброса - прогон инициализации (он же меряет память) пойдёт уже в её темпе */
+    gs_res_flg = 0;
+    /* v259: докладываем ПРИЧИНУ. res_cyc = код FatFs открытия, res_us = прочитано байт.
+       Молчаливый отказ стоил лишнего круга: было видно только «не загрузилось». */
+    gs_res_cyc = 0xFFFFFFFFu; gs_res_us = 0;
+    /* v301: прошивка КАРТЫ живёт в своей папке 0:/GS/, а не среди ПЗУ Спектрума. Владелец
+       пробовал загрузить её в машину как набор ПЗУ - она честно не запустилась: это код для
+       процессора самой карты, у него своя карта памяти и свои порты. Пока лежала в 0:/ROMS/, она
+       попадала в список выбора набора и путала. Старый путь оставлен запасным, чтобы карта с
+       прежней раскладкой не осталась без звука. */
+    rr = f_open(&f, "0:/GS/GS105B.ROM", FA_READ);
+    if(rr != FR_OK) rr = f_open(&f, "0:/ROMS/GS105B.ROM", FA_READ);
+    gs_res_cyc = (uint32_t)rr;
+    if(rr == FR_OK){
+        rr = f_read(&f, (void*)FS_BUF_ADDR, 65536u, &br);
+        gs_res_cyc = 0x100u | (uint32_t)rr;      /* 0x1xx = дошли до чтения */
+        gs_res_us  = (uint32_t)br;
+        if(rr == FR_OK && br >= 32768u)
+            gs_res_flg = gs_dbg_load_rom((const void*)FS_BUF_ADDR, br) ? 1u : 0u;
+        f_close(&f);
+    }
+    gs_reset();
+    if(gs_res_flg & 1u){
+        /* 🥇 v0.15.298 ПРОГОН ИНИЦИАЛИЗАЦИИ ПРЕКРАЩАЕМ ПО ДЕЛУ, А НЕ ПО ЧАСАМ. Прошивка карты при
+           старте МЕРИТ и ЧИСТИТ всю свою память, и это единственная работа, которая честно растёт с
+           объёмом: на хостовом стенде 0.6 / 2.5 / 6.0 / 11.0 с виртуального времени для 128 КБ /
+           512 КБ / 1 МБ / 4 МБ. Фиксированные 20 виртуальных секунд поэтому были одновременно и
+           расточительством (128 КБ ждали впустую больше четырёх секунд реального времени с
+           замороженной оболочкой), и опасной тесноватостью на 4 МБ.
+           Признак «карта закончила»: она пошла в свой холостой цикл и начала непрерывно читать порт
+           флагов. Пока идёт чистка памяти, этих чтений нет вовсе, поэтому счётчик gs_poll_get -
+           надёжный и машино-независимый детектор. Потолок остаётся, и он тоже по делу: растёт с
+           числом страниц, чтобы 4 МБ хватило времени домериться. */
+        unsigned cap  = 16u + gs_pages_get() * 4u;   /* кусков по 1 млн тактов: 4 МБ -> 528 = 44 с */
+        unsigned prev = gs_poll_get(), busy = 0;
+        for(unsigned _s = 0; _s < cap; _s++){
+            gs_run(1000000u);
+            KBD_HB = 1;                        /* прогон заметно долгий - deadman не должен сработать */
+            {   unsigned now = gs_poll_get(), d = now - prev;
+                prev = now;
+                if(d > 200u){ if(++busy >= 2u) break; }   /* два куска подряд в холостом цикле = готова */
+                else busy = 0;
+            }
+        }
+    }
+    g_gs_live = (gs_res_flg & 1u) ? 1 : 0;
+    {   uint32_t st = GS_STAT;                 /* синхронизируем кэш тогглов: старых событий не переигрываем */
+        g_gs_e0 = (uint8_t)((st >> 26) & 1u);
+        g_gs_r7 = (uint8_t)((st >> 28) & 1u); }
+    /* счётчики начинаются с мусора в НЕкэшируемой DDR (тёплая перезагрузка её не чистит) - обнуляем,
+       иначе дельты приходится считать глазами, а «ноль потерь» вообще не прочитать */
+    gs_d_acc = 0; gs_d_dat = 0; gs_d_rd = 0; gs_d_ovr = 0; gs_d_smp = 0; gs_d_pass = 0;
+    gs_d_inq = 0; gs_d_drop = 0; gs_d_cyc = 0; gs_d_pgsel = 0;
+    g_gs_trc_w = 0; g_gs_trc_run = 0; gs_d_trc_n = 0;
+    gs_d_rambase = gs_rambase_get();
+    player_gs_enable(g_gs_live);
+    gs_meter_reset();                     /* v298: прибор темпа считает с чистого листа вместе с картой */
+    g_gs_ctl_lv = 0xFFFFFFFFu;            /* v299: кэш зеркала недействителен - пишем следующим проходом */
+    if(g_gs_live) GS_CTL = 0x80000000u | (uint32_t)gs_dout_get()
+                         | ((uint32_t)g_gs_r7 << 28) | ((uint32_t)g_gs_e0 << 26);
+    g_gs_boot_try = 1;
+    return g_gs_live;
+}
+/* v282: снять кольцо BDI. Селектор кладём в младшие биты FDC_CTL поверх СОХРАНЁННОГО слова, иначе
+   собьём готовность привода и геометрию образа. Бит10 выбирает второе слово (там команда). */
+static void disk_ring_snap(void){
+    for(int i = 0; i < 12; i++){
+        FDC_CTL = (g_fdc_lv & ~0x7FFu) | (uint32_t)(4 + i);
+        for(volatile int d = 0; d < 200; d++) ;          /* дать пройти двум синхронизаторам */
+        disk_ring0[i] = FDC_STAT2;
+        FDC_CTL = (g_fdc_lv & ~0x7FFu) | (uint32_t)(4 + i) | (1u << 10);
+        for(volatile int d = 0; d < 200; d++) ;
+        disk_ring1[i] = FDC_STAT2;
+    }
+    FDC_CTL = g_fdc_lv;                                   /* вернуть как было */
+}
+/* ============================ NEMO-IDE: сторона ARM (v0.15.283) ============================
+   Регистры живут в фабрике, «диск» - здесь. Образ HDF: подпись `RS-IDE`, версия по смещению 7,
+   флаги по 8 (бит0 = 8-битный образ, сектор в файле 256 байт), СМЕЩЕНИЕ ДАННЫХ ПО 0x09 (не по
+   0x0A - проверено на настоящем образе, там 0x0216 у версии 1.1), готовый ответ IDENTIFY DEVICE
+   по 0x16. Его и отдаём как есть: строки внутри побайтно перевёрнуты, это ATA, а не наша ошибка. */
+static FIL      g_ide_f;
+static int      g_ide_open = 0;
+static uint32_t g_ide_data0 = 0;      /* смещение данных в файле */
+static int      g_ide_8bit  = 0;      /* сектор в файле 256 байт */
+static uint8_t  g_ide_ident[512];
+static uint8_t  g_ide_sec[512];
+static int      g_ide_stb_last = -1;
+static uint32_t g_ide_secs  = 0;      /* v292: размер образа В СЕКТОРАХ (им оперируют IDENTIFY и драйвер) */
+static char     g_ide_name[64] = "";  /* v292: имя вставленного файла - для окна информации и статуса */
+#define IDE_DEF_PATH "0:/HDD.HDF"     /* v292: дефолт, если в профиле машины путь пуст */
+static uint8_t  g_ide_spt   = 63;     /* v291: геометрию хост задаёт командой 0x91 INIT PARAMS, а до неё */
+static uint8_t  g_ide_heads = 16;     /* она берётся из заголовка образа либо из нашего дефолта (см. О-3) */
+static uint32_t g_ide_cyl   = 0;      /* v311 (О-3): цилиндров - тем же путём, что головки и секторы */
+static uint8_t  g_ide_ver   = 0;      /* v311 (О-13): версия заголовка RS-IDE в BCD: 0x10 = 1.0, 0x11 = 1.1 */
+/* v311 (О-7/О-2): состояние ПОСЛЕДНЕЙ команды передачи - из него собирается файл регистров ATA,
+   когда передача кончилась. Держим ЛИНЕЙНЫЙ номер: и CHS-адрес, и LBA-адрес сводятся к нему при
+   разборе команды, поэтому продвижение считается в одном месте и одинаково для обоих режимов. */
+static int      g_ide_lbamode = 1;    /* режим адресации последней команды: 1 = LBA, 0 = CHS */
+/* 🥇 Продвигать регистры имеет право ТОЛЬКО передача, у которой есть адрес. IDENTIFY (0xEC) едет
+   тем же механизмом блоков, но никакого сектора не читает, и опубликовать его адрес значило бы
+   соврать драйверу там, где по ATA содержимое регистров вообще не определено. С v0.15.312 признак
+   не нужен как переменная: публикация переехала в разбор команды чтения и физически недостижима
+   для остальных команд. */
+static uint8_t  g_ide_cur_head = 0xE0u; /* байт регистра #D0, каким его прислал хост (DEV и бит LBA) */
+static uint8_t  g_ide_raw[256];       /* v311 (О-1): сырой сектор восьмибитного образа */
+#define ide_cmds       (*(volatile uint32_t*)(KMB+0xF8u))   /* команд обслужено */
+#define ide_lastcmd    (*(volatile uint32_t*)(KMB+0xFCu))   /* последняя команда и её LBA */
+#define ide_geom       (*(volatile uint32_t*)(KMB+0x30F8u)) /* секторов в образе (для сверки прибором) */
+#define ide_parm       (*(volatile uint32_t*)(KMB+0x30FCu)) /* v291: геометрия от 0x91 {спт[15:8], головок[7:0]} */
+#define ide_hgeom      (*(volatile uint32_t*)(KMB+0x30F0u)) /* v311: геометрия, ПРИНЯТАЯ образом: {цил[31:16], головок[15:8], спт[7:0]} */
+#define ide_regs       (*(volatile uint32_t*)(KMB+0x30F4u)) /* v311: что мы положили в файл регистров после передачи:
+                                                               {счётчик[31:24], LBA2[23:16], LBA1[15:8], LBA0[7:0]} */
+/* ---- v0.15.294 ТРАССА ОБРАЩЕНИЙ К ДИСКУ (образец - кольцо трассы GS на 0x2800) ----
+   Одного слова «последняя команда» мало: Proteus печатает «Error 00» при входе в диск и НОВЫХ
+   обращений при этом не делает, то есть решение он принимает по УЖЕ полученным ответам. Значит
+   нужна вся последовательность целиком, а не её хвост. Кольцо на 256 событий по 8 слов:
+     [0] порядковый номер, 1-based и МОНОТОННЫЙ (по нему видно оборот кольца и пропуски)
+     [1] {команда[31:24], счётчик секторов #50[23:16], регистр head #D0[15:8], флаги[7:0]},
+         флаги: б0 обращение к slave, б1 образ 8-битный (сектор в файле 256 Б),
+                б2 ядро умеет запись регистров ATA (LOADCAP_IDEREG), б3 образ открыт,
+                б4 (v300) чтение многосекторное - хост запросил регистром #50 больше одного блока
+     [2] полный LBA (28 бит), собранный так же, как его собирает служба
+     [3] НАШ ОТВЕТ: {статус[31:24], регистр ошибки[23:16], отдано байт[15:0]}
+     [4] метка времени в мс от старта - по ней видно паузы и то, что обращений больше нет
+     [5] rptr фабрики на момент строба: сколько байт машина успела вычерпать из буфера
+         ПРЕДЫДУЩЕЙ команды (недобор = софт бросил чтение на середине сектора)
+     [6]/[7] сырые nemo_stat / nemo_stat2 - страховка от МОЕЙ ЖЕ ошибки в разборе полей */
+#define IDE_TRC        ((volatile uint32_t*)(KMB+0x3200u))
+#define IDE_TRC_N      256u                                 /* событий в кольце */
+#define IDE_TRC_W      8u                                   /* слов на событие */
+#define ide_trc_n      (*(volatile uint32_t*)(KMB+0x74u))    /* событий записано ВСЕГО (не по модулю) */
+#define ide_trc_fmt    (*(volatile uint32_t*)(KMB+0x78u))    /* {IDE_TRC_N[31:16], IDE_TRC_W[15:0]} */
+/* v0.15.312 ПРИБОР: кольцо ЗАПИСЕЙ В ФАЙЛ РЕГИСТРОВ ATA. Слова-итога (ide_regs) для разбора спора
+   не хватает: оно хранит только последнюю публикацию, а вопрос стоял ровно обратный - чья запись
+   легла последней, наша или машины. Одно слово на вызов nemo_reg_write:
+   {регистр[31:28], попыток[27:24], что писали[23:16], что прочли обратно[15:8], вышло[7:0]}. */
+#define IDE_RW         ((volatile uint32_t*)(KMB+0x3180u))  /* 32 слова: 0x3180..0x31FF свободны */
+#define IDE_RW_N       32u
+#define ide_rw_n       (*(volatile uint32_t*)(KMB+0x7Cu))   /* записей всего (не по модулю) */
+
+static uint8_t g_nemo_err = 0;      /* v290: регистр ошибки ATA (в слово состояния идут 4 бита) */
+/* v294: последний ответ, отданный машине, - {статус[31:24], err[23:16], байт[15:0]}. Трасса
+   пишется ОДНИМ событием на команду и уже после разбора, а к тому моменту ответ известен только
+   внутри nemo_push - оттуда его и забираем, чтобы не дублировать логику ответа в трассе. */
+static uint32_t g_nemo_rsp = 0;
+static uint32_t g_ide_trc_w = 0;    /* сколько событий записано (он же порядковый номер) */
+/* 🥇 v0.15.295 СТАТУС ОДИН, А УСТРОЙСТВ ДВА - И ЭТО ЛОМАЛО ЧУЖОЙ СОФТ.
+   Регистр состояния живёт в фабрике ОДИН на весь интерфейс (nemo_ide.v: q = {bsy, ide_status[6:0]}
+   без оглядки на выбранное устройство), а прошивка отвечает на probe slave нулём («устройства
+   нет»). После такого probe ноль остаётся в регистре НАВСЕГДА - следующее чтение статуса УЖЕ ДЛЯ
+   MASTER отдаёт 0x00, то есть DRDY снят. Измерено на Proteus File Manager: он читает MBR, строит
+   строку «E:hd2,0 (0:FAT32)», затем щупает slave, а при входе в диск печатает «Error 00» и НОВЫХ
+   обращений к диску не делает вовсе (трасса v294: 8 событий, последнее - EXEC-DIAGNOSTIC к slave).
+   Восстановление статуса master прямо по JTAG (NEMO_CTL = 0x1410) немедленно дало каталог диска.
+   Лечим здесь, а не в ядре: прошивка ВИДИТ выбранное устройство (бит4 регистра #D0 в старшем байте
+   NEMO_STAT2) и обязана держать в регистре статус ИМЕННО ЕГО. */
+static uint8_t  g_ide_mstat = 0x50u;    /* последний статус, отданный master */
+/* ОПЫТ (не для релиза): подменять тип раздела 0x04/0x06 (FAT16 CHS) на 0x0E (FAT16 LBA) в MBR,
+   который мы отдаём машине. Нужен, чтобы отличить «Proteus не умеет FAT16» от «Proteus не берёт
+   разделы без признака LBA»: чужой образ Олега (0:/HDD16.HDF) размечен типом 0x06, и Proteus его
+   не показывает вовсе, тогда как FATALL тот же образ читает. Включается gs_ctl = 8. */
+static int      g_ide_pthack = 0;
+static int      g_ide_sel_sl = -1;      /* какое устройство выбрано машиной сейчас (-1 = не знаем) */
+static XTime    g_ide_retry_t = 0;      /* v300: когда последний раз пробовали открыть образ (см. nemo_service) */
+/*==================================================================================================
+  🥇 v0.15.300 МНОГОСЕКТОРНОЕ ЧТЕНИЕ (жалоба владельца: «Z-Player не может проиграть ничего с образа
+  HDD», хотя навигаторы каталог листают).
+
+  ПРИЧИНА, найденная в коде: на 0x20/0x21 мы отдавали РОВНО ОДИН сектор и ИГНОРИРОВАЛИ регистр #50
+  (счётчик секторов). Навигатор читает каталог по одному сектору за команду - ему всё равно; плеер
+  грузит модуль пачками, и всё, что шло после первого сектора, машина вычерпывала ИЗ ТОГО ЖЕ буфера
+  по кругу: указатель чтения в фабрике 9-битный, за 512 байт он приходит обратно в ноль. То есть
+  вместо второго сектора софт получал копию первого - мусор, на котором плеер и ломался.
+
+  ЛЕЧИМ КАК НАСТОЯЩИЙ ДИСК: буфер по-прежнему ОДИН, но он ПЕРЕЗАРЯЖАЕТСЯ. Машина вычерпала 512 байт -
+  подкладываем следующий сектор и снова поднимаем DRQ, и так столько раз, сколько запросил хост
+  (счётчик 0 = 256 секторов, это ATA). После ПОСЛЕДНЕГО блока DRQ снимаем: раньше он висел до
+  следующей команды, а по ATA его наличие означает «в буфере лежат данные, забирай», и драйвер вправе
+  прочитать этот несуществующий блок.
+
+  «МАШИНА ВЫЧЕРПАЛА» БЕРЁМ ИЗ УКАЗАТЕЛЯ, А НЕ ИЗ ТАЙМЕРА: фабрика отдаёт rptr в nemo_stat[29:21]
+  (atlas_core/main.v: {stb, slave, rptr[8:0], 5'd0, cmd, lba0}). Таймер здесь был бы гаданием, а
+  указатель - фактом.
+
+  ⚠ ДЕФЕКТ ПРИБОРА, из-за которого «rptr == 0» сам по себе не значит НИЧЕГО: запись команды в #F0
+  ОБНУЛЯЕТ указатель (nemo_ide.v, ветка default дешифратора), то есть сразу после команды он равен
+  нулю ровно так же, как после полностью вычерпанного блока. Поэтому ноль засчитываем ТОЛЬКО после
+  того, как своими глазами видели указатель ненулевым (g_ide_rd_seen), а признаком оборота считаем
+  любое УМЕНЬШЕНИЕ относительно достигнутого максимума - с подтверждающим перечитыванием, чтобы
+  рваное чтение из чужого домена (у nemo_stat нет синхронизаторов) не сняло блок раньше времени.
+
+  ⚠ И ВТОРОЕ: пропустить окно «указатель шевелится» нельзя - не увидев его ненулевым, служба ждала бы
+  оборота вечно. Сектор Z80 вычерпывает примерно за 3.5 мс, а проход главного цикла в плохую минуту
+  бывает и длиннее. Поэтому сразу после подачи блока служба крутится здесь же, опрашивая указатель,
+  и выходит, КАК ТОЛЬКО машина за блок взялась (доли миллисекунды) - дальше её честно ждёт главный
+  цикл, потому что признак уже защёлкнут в статике. Пока крутимся - качаем звук теми же насосами,
+  что и главный цикл: карте General Sound всё равно, кто её двигает, а тишина слышна.
+==================================================================================================*/
+/*==================================================================================================
+  🥇 v0.15.307 (ядро B0117) КОНЕЦ БЛОКА ТЕПЕРЬ ДОКЛАДЫВАЕТ ФАБРИКА, а не выводится из указателя.
+
+  ИЗМЕРЕННЫЙ ДЕФЕКТ, из-за которого это переделано: DRQ снимали МЫ, словом состояния, а узнавали об
+  окончании блока лишь на следующем обходе службы. Машина за это время видела DRQ поднятым при пустом
+  буфере и успевала прочитать НАЧАЛО СТАРОГО блока (указатель 9-битный, за 512 байт он приходит в
+  ноль). Два прогона своим кодом на Z80: 105 битых байт (сектора 1, 17, 22, 36) и 87 байт
+  (сектор 23) - позиции плавают, то есть гонка. Лечение - в фабрике (nemo_ide.v, B0117): DRQ
+  снимается в тот же такт, когда указатель дошёл до конца буфера, а на промежуточных блоках машина
+  видит BSY, пока мы не подложим следующий. Здесь остаётся ДВЕ обязанности:
+    1) сказать фабрике, какой блок ПОСЛЕДНИЙ (метка в бите 1 слова состояния - только мы знаем,
+       сколько блоков осталось; фабрике взять это неоткуда, у IDENTIFY счётчик #50 не при делах);
+    2) вовремя подложить следующий блок, увидев, что фабрика сняла DRQ.
+  Признак «блок вычерпан» берём из слова состояния (бит20 DRQ, бит19 «жду блок»), а не из указателя:
+  ноль указателя означает и «вычерпано», и «только что записана команда», и вся возня с максимумом и
+  признаком «указатель уже шевелился» была попыткой отличить одно от другого по истории наблюдений.
+  На ядре без бита LOADCAP_IDEDRQ остаётся прежний путь по указателю - он рабочий, просто гадающий.
+==================================================================================================*/
+#define IDE_ST_DRQ  (1u << 20)        /* nemo_stat: в буфере лежит блок, машина его забирает */
+#define IDE_ST_GAP  (1u << 19)        /* nemo_stat: блок вычерпан, фабрика держит BSY и ждёт нас */
+static uint32_t g_ide_rd_rem   = 0;   /* блоков ещё не отдано машине, ВКЛЮЧАЯ тот, что лежит в буфере */
+static uint32_t g_ide_rd_lba   = 0;   /* LBA блока, который подложим СЛЕДУЮЩИМ */
+static unsigned g_ide_rd_max   = 0;   /* максимум rptr, увиденный на текущем блоке */
+static int      g_ide_rd_seen  = 0;   /* указатель уже был ненулевым - значит его падение = оборот */
+static int      g_ide_rd_armed = 0;   /* v307: фабрика ПОДТВЕРДИЛА DRQ на текущем блоке. Без этого
+                                         признака «DRQ снят» нельзя толковать вовсе: сразу после
+                                         нашей записи он ещё не поднят (слово идёт в домен машины
+                                         через тоггл и три триггера), и мы приняли бы собственную
+                                         задержку за вычерпанный блок - то есть отдали бы всю пачку
+                                         секторов в пустоту за один проход. */
+static uint32_t g_ide_rd_tlast = 0;   /* CCNT последнего ДВИЖЕНИЯ указателя (для простоя и сторожа) */
+#define IDE_SPIN_IDLE_US  1000u   /* столько ждём БЕЗ движения, прежде чем вернуть время оболочке */
+#define IDE_RD_WD_MS      2000u   /* столько молчания - и считаем передачу брошенной (снимаем DRQ) */
+#define IDE_RETRY_S       3u      /* как редко пробуем открыть отсутствующий образ */
+static void nemo_push(uint32_t status, int owns, const uint8_t* buf, unsigned n){
+    unsigned i;
+    uint32_t base = (uint32_t)(opt_ide ? 0x10u : 0u) | ((status & 0xFFu) << 6) | (owns ? 0x20u : 0u)
+                  | (uint32_t)(g_nemo_err & 0x0Fu);
+    /* 🥇🥇 v0.15.313 БЛОК ЗАЛИВАЕМ ПОД ПОДНЯТЫМ BSY. Это и есть причина, по которой ни один плеер
+       не доходил до загрузочного сектора раздела.
+       ИЗМЕРЕНО (свой код на Z80, три чтения LBA 0 одной программой): если ждать DRQ, статус на
+       выходе 0x58 и сектор идеален - 512/512, подпись 55 AA на месте. Если ждать ТОЛЬКО снятия BSY
+       (а именно так делает Wild Player: 9AF3 = OUT (#F0),#20 + JP 9C09 «ждать снятия BSY», и сразу
+       INI-цикл), статус на выходе 0x50 - BSY уже снят, а DRQ ЕЩЁ НЕ ПОДНЯТ. Гость качает данные в
+       пустоту: указатель фабрики стоит (он двигается только при DRQ), в буфер гостя ложится
+       sbuf[0] вперемешку с застрявшей защёлкой старшего байта - в дампе это 00 AA 00 AA ...,
+       где AA - последний байт ПРОШЛОГО сектора. Когда заливка кончается и DRQ встаёт, указатель
+       идёт с нуля, и сектор приезжает сдвинутым на 8 слов: 496 из 496 байт совпадают со сдвигом
+       +16, а последние 16 байт не приезжают вовсе - ПОДПИСЬ 55 AA ТЕРЯЕТСЯ. Отсюда и «плеер берёт
+       поле размера вместо поля начала»: разбор у него верный, это наш сдвиг, увиденный его кодом.
+       Число потерянных слов ПЛАВАЛО (+12 и +16 в разных прогонах) - оно равно длине окна заливки,
+       делённой на темп INI-цикла, то есть это гонка, а не смещение адреса.
+       ПОЧЕМУ ОКНО ВООБЩЕ БЫЛО: заглушка перед чтением файла (nemo_push(0x80, 1, ...)) держит
+       занятость через buf_arm_owns, но ПЕРВОЕ ЖЕ слово заливки сбрасывает owns в 0 и несёт
+       статус 0x58, у которого бита BSY нет. Настоящий диск снимает BSY и поднимает DRQ ОДНИМ
+       движением, когда данные уже в буфере, - именно это мы теперь и делаем: слова заливки несут
+       статус с BSY, и только завершающее «чистое» слово отдаёт настоящий 0x58.
+       Лечить это в прошивке, а не в фабрике, правильно: фабрика и так гасит DRQ при BSY
+       (st_mach), знание «блок ещё неполон» есть только у нас, и цена вопроса - один OR. */
+    uint32_t fill = base | (0x80u << 6);                 /* BSY на всё время наполнения буфера */
+    if(buf) for(i = 0; i < n; i++){
+        NEMO_CTL = fill | 0x4000u | ((uint32_t)i << 15) | ((uint32_t)buf[i] << 24);
+        (void)NEMO_STAT;   /* v288: РАЗНЕСТИ ЗАПИСИ ВО ВРЕМЕНИ. Слово ctl_nemo и его тоггл меняются
+                              одним фронтом, поэтому при плотных записях защёлка в домене машины
+                              ловит СМЕСЬ БИТОВ двух соседних слов: данные от одной записи, адрес от
+                              другой. Измерено своим кодом на Z80: подпись 55 AA приехала как
+                              55 .. .. AA - байт лёг на два адреса раньше. Чтение того же слейва
+                              завершает запись и даёт домену машины защёлкнуть слово целиком.
+                              Настоящее лечение - упругая очередь в ПЛИС, как у GS. */
+    }
+    NEMO_CTL = base;                                     /* снять строб, оставить статус */
+    /* Последний push команды и есть её финальный ответ: перед ним стоит только заглушка с BSY,
+       её значение затирается законно. Регистр ошибки берём ЗДЕСЬ и целиком: в фабрику уходит
+       только младший полубайт, а в трассе нужен весь байт (вызывающий обнуляет g_nemo_err сразу
+       после push, и позже настоящее значение уже не прочитать). */
+    g_nemo_rsp = ((status & 0xFFu) << 24) | ((uint32_t)g_nemo_err << 16)
+               | (uint32_t)((buf ? n : 0u) & 0xFFFFu);
+}
+/* v294: записать событие трассы. Зовётся на КАЖДУЮ команду машины и ничего не фильтрует -
+   «неинтересные» команды (0xE7 FLUSH, 0xEF SET FEATURES, обращения к slave) и есть главные
+   подозреваемые, когда софт отказывает БЕЗ новых обращений к диску. */
+static void ide_trc(uint8_t cmd, uint32_t lba, uint8_t cnt, uint8_t head,
+                    uint32_t flags, uint32_t raw1, uint32_t raw2){
+    volatile uint32_t* e = IDE_TRC + (g_ide_trc_w % IDE_TRC_N) * IDE_TRC_W;
+    XTime t = 0;
+    XTime_GetTime(&t);
+    e[0] = g_ide_trc_w + 1u;                     /* 1-based: ноль в кольце = «здесь не писали» */
+    e[1] = ((uint32_t)cmd << 24) | ((uint32_t)cnt << 16) | ((uint32_t)head << 8) | (flags & 0xFFu);
+    e[2] = lba;
+    e[3] = g_nemo_rsp;
+    e[4] = (uint32_t)(((uint64_t)t * 1000ull) / COUNTS_PER_SECOND);
+    e[5] = (raw1 >> 21) & 0x1FFu;                /* rptr фабрики - см. main.v:785 */
+    e[6] = raw1;
+    e[7] = raw2;
+    g_ide_trc_w++;
+    ide_trc_n   = g_ide_trc_w;                   /* счётчик ПОСЛЕ данных: хост читает столько, */
+    ide_trc_fmt = (IDE_TRC_N << 16) | IDE_TRC_W; /* сколько записано целиком */
+}
+/* Обнулить трассу. Кольцо чистим целиком: некэшируемая DDR тёплую перезагрузку переживает, и
+   события прошлого сеанса читались бы как свои. */
+static void ide_trc_reset(void){
+    unsigned i;
+    for(i = 0; i < IDE_TRC_N * IDE_TRC_W; i++) IDE_TRC[i] = 0;
+    g_ide_trc_w = 0;
+    ide_trc_n   = 0;
+    ide_trc_fmt = (IDE_TRC_N << 16) | IDE_TRC_W;
+}
+/* v291: УСТОЙЧИВОЕ ЧТЕНИЕ СЛОВА СОСТОЯНИЯ. nemo_stat/nemo_stat2 идут из домена машины БЕЗ
+   синхронизаторов (axi_ctl.v заводит их прямо в s_rdata), поэтому многобитное слово может
+   «порваться»: часть полей от одного такта, часть от следующего. Берём до двух одинаковых подряд;
+   при поднятом BSY регистры статичны и это сходится с первого раза. */
+static uint32_t nemo_rd_stable(uint32_t addr){
+    volatile uint32_t* p = (volatile uint32_t*)addr;
+    uint32_t a = *p, b; int i;
+    for(i = 0; i < 8; i++){ b = *p; if(b == a) return a; a = b; }
+    return a;
+}
+/* Обратное чтение регистра ATA - тем же номером, каким его пишет nemo_reg_write. */
+static uint8_t nemo_reg_read(unsigned idx){
+    uint32_t a2;
+    if(idx == 3) return (uint8_t)(nemo_rd_stable(GP0+0x188) & 0xFFu);   /* LBA0 - в первом слове */
+    a2 = nemo_rd_stable(GP0+0x18C);                                     /* {head, LBA2, LBA1, cnt} */
+    switch(idx){
+        case 2:  return (uint8_t)( a2        & 0xFFu);
+        case 4:  return (uint8_t)((a2 >>  8) & 0xFFu);
+        case 5:  return (uint8_t)((a2 >> 16) & 0xFFu);
+        default: return (uint8_t)((a2 >> 24) & 0xFFu);
+    }
+}
+/* v291: ЗАПИСАТЬ РЕГИСТР ATA. Драйверы NEMO после 0x90 EXECUTE DEVICE DIAGNOSTIC читают СИГНАТУРУ
+   (#50 = 01, #70 = 01, #90 = 00, #B0 = 00) и без неё считают, что диска нет: до ядра B0115 эти
+   регистры вела ТОЛЬКО машина. idx - номер регистра в дешифраторе машины: 2 cnt, 3 lba0, 4 lba1,
+   5 lba2, 6 head. Возвращает 1, только если запись ПОДТВЕРЖДЕНА обратным чтением: канал
+   односторонний и квитанции у него нет, а наврать драйверу сигнатурой хуже, чем честно ответить
+   ошибкой. Звать ТОЛЬКО с owns = 1: ядро принимает такую запись лишь при поднятом бите владения
+   (это и второй ключ маркера, и гарантия того, что машина видит BSY и в файл регистров не лезет),
+   а при owns = 0 слово просто уйдёт в никуда и обратное чтение его не подтвердит. */
+static uint32_t g_ide_rw_w = 0;
+static int nemo_reg_write(uint32_t status, int owns, unsigned idx, uint8_t val){
+    uint32_t base = (uint32_t)(opt_ide ? 0x10u : 0u) | ((status & 0xFFu) << 6) | (owns ? 0x20u : 0u)
+                  | (uint32_t)(g_nemo_err & 0x0Fu);
+    int t; uint8_t back = 0; int ok = 0;
+    if(!(LOAD_CAPS_R & LOADCAP_IDEREG)) return 0;        /* ядро до B0115: писать некуда */
+    for(t = 0; t < 3; t++){
+        NEMO_CTL = base | 0x00A80000u | ((uint32_t)(idx & 7u) << 15) | ((uint32_t)val << 24);
+        (void)NEMO_STAT;   /* та же мера, что в nemo_push: чтение того же слейва завершает запись,
+                              иначе домен машины защёлкивает СМЕСЬ БИТОВ двух соседних слов */
+        NEMO_CTL = base;   /* вернуть слово в «просто состояние»: маркер - разовое событие */
+        for(volatile int d = 0; d < 200; d++) ;          /* дать пройти тогглу и трём триггерам */
+        back = nemo_reg_read(idx);
+        if(back == val){ ok = 1; break; }
+    }
+    IDE_RW[g_ide_rw_w % IDE_RW_N] = ((uint32_t)(idx & 0xFu) << 28) | ((uint32_t)(t & 0xFu) << 24)
+                                  | ((uint32_t)val << 16) | ((uint32_t)back << 8) | (uint32_t)ok;
+    g_ide_rw_w++; ide_rw_n = g_ide_rw_w;
+    return ok;
+}
+/* v292: ПУТЬ К ОБРАЗУ - ОПЦИЯ МАШИНЫ. Пустая строка в профиле означает наш исторический дефолт
+   (и его запасной вариант в 0:/IDE/), чтобы старая карта без нового ключа завелась как раньше. */
+static const char* ide_img_path(void){
+    int m = (opt_defmachine>=0 && opt_defmachine<N_MACHINES) ? opt_defmachine : 0;
+    return g_mp[m].idefile[0] ? g_mp[m].idefile : IDE_DEF_PATH;
+}
+/* v292: есть ли ВТОРОЙ образ (slave). Пока прошивка обслуживает только master - на slave фабрика
+   отвечает «устройства нет», и это единственная правда, которую мы имеем право показывать. От этой
+   функции зависят и пункт меню, и запись в ini, и окно информации: появится второй образ - правда
+   поменяется в ОДНОМ месте, а не в четырёх. */
+static int ide_slave_present(void){ return 0; }
+static int ide_open(void){
+    FRESULT rr; UINT br = 0; uint8_t hdr[40];
+    const char* path = ide_img_path();
+    if(g_ide_open) return 1;
+    rr = f_open(&g_ide_f, path, FA_READ);
+    /* запасной путь пробуем ТОЛЬКО для дефолта: если владелец выбрал файл сам, молчаливая подмена
+       чужим образом - это ровно тот отказ, который потом ищут в железе. */
+    if(rr != FR_OK && !cicmp(path, IDE_DEF_PATH)) rr = f_open(&g_ide_f, "0:/IDE/HDD.HDF", FA_READ);
+    if(rr != FR_OK) return 0;
+    if(f_read(&g_ide_f, hdr, sizeof hdr, &br) != FR_OK || br < sizeof hdr) { f_close(&g_ide_f); return 0; }
+    /* 🥇 v0.15.311 (О-13): ПОДПИСЬ ПРОВЕРЯЕМ ЦЕЛИКОМ. Эталон (LSIDE ide.c:224) сверяет шесть букв
+       `RS-IDE` И байт-ограничитель 0x1A; мы сверяли четыре буквы `RS-I`, то есть под нас подходил
+       любой файл с таким началом. Дальше мы взяли бы из него смещение данных и стали бы отдавать
+       машине мусор как содержимое диска - причём молча, потому что отказать было уже негде. */
+    if(!(hdr[0]=='R' && hdr[1]=='S' && hdr[2]=='-' && hdr[3]=='I' &&
+         hdr[4]=='D' && hdr[5]=='E' && hdr[6]==0x1Au)){ f_close(&g_ide_f); return 0; }
+    g_ide_ver   = hdr[7];                                        /* BCD: 0x10 = 1.0, 0x11 = 1.1 */
+    g_ide_data0 = (uint32_t)hdr[9] | ((uint32_t)hdr[10] << 8);   /* 🥇 по 0x09, а НЕ по 0x0A */
+    g_ide_8bit  = hdr[8] & 1u;
+    /* Смещение данных обязано указывать ЗА заголовок и внутрь файла: иначе первый же сектор
+       читался бы из самого заголовка (или из-за конца файла) и выглядел бы как испорченный MBR. */
+    if(g_ide_data0 < 0x16u || (uint32_t)f_size(&g_ide_f) <= g_ide_data0){ f_close(&g_ide_f); return 0; }
+    /* 🥇 IDENTIFY СИНТЕЗИРУЕМ, А НЕ БЕРЁМ ИЗ ОБРАЗА. В заголовке HDF по 0x16 действительно лежит
+       место под ответ IDENTIFY, но у настоящих образов оно почти всё НУЛЕВОЕ (измерено на
+       divide.hdf), а драйвер по нему решает, есть ли диск: слово 0 (тип), слова 27..46 (модель),
+       слово 49 бит9 (LBA) и слова 60/61 (число секторов LBA). С нулями диск будет отброшен.
+       Строки в ATA лежат ПОБАЙТНО ПЕРЕВЁРНУТЫМИ внутри 16-битных слов - так и пишем. */
+    {   uint32_t secs = (uint32_t)((f_size(&g_ide_f) - g_ide_data0) / (g_ide_8bit ? 256u : 512u));
+        unsigned i;
+        for(i = 0; i < 512; i++) g_ide_ident[i] = 0;
+        #define IDW(w,v) do { g_ide_ident[(w)*2] = (uint8_t)((v) & 0xFF); \
+                              g_ide_ident[(w)*2+1] = (uint8_t)(((v) >> 8) & 0xFF); } while(0)
+        /* 🥇 v0.15.311 (О-3): ГЕОМЕТРИЮ БЕРЁМ ИЗ ЗАГОЛОВКА, ЕСЛИ ОНА ТАМ ЕСТЬ. В блоке IDENTIFY
+           заголовка HDF (со смещения 0x16) лежат слова 1 (цилиндры), 3 (головки) и 6 (секторов на
+           дорожку) - эталон (LSIDE ide.c:241-247) берёт CHS-трансляцию именно оттуда. Мы её просто
+           выбрасывали и всегда объявляли 16x63; для образа с заполненным блоком это значит, что
+           хост, пришедший в CHS-режиме, пересчитает адрес по НАШЕЙ геометрии, а данные лежат по
+           ЕГО. Условие доверия строгое: числа ненулевые, головок не больше 16 и секторов не больше
+           255 (пределы ATA), и произведение не выходит за размер образа - иначе за геометрию
+           можно принять нули или мусор и адресовать диск мимо файла. Не сошлось - наш прежний
+           дефолт 16x63, на котором всё уже работает. */
+        {   uint32_t hc = (uint32_t)hdr[0x18] | ((uint32_t)hdr[0x19] << 8);   /* слово 1 */
+            uint32_t hh = (uint32_t)hdr[0x1C] | ((uint32_t)hdr[0x1D] << 8);   /* слово 3 */
+            uint32_t hs = (uint32_t)hdr[0x22] | ((uint32_t)hdr[0x23] << 8);   /* слово 6 */
+            if((g_ide_ver == 0x10u || g_ide_ver == 0x11u) && hc && hh && hs &&
+               hh <= 16u && hs <= 255u && hc <= 65535u && hc * hh * hs <= secs){
+                g_ide_cyl = hc; g_ide_heads = (uint8_t)hh; g_ide_spt = (uint8_t)hs;
+            } else {
+                g_ide_cyl   = (secs / (16u*63u)) > 16383u ? 16383u : (secs / (16u*63u));
+                g_ide_heads = 16u; g_ide_spt = 63u;
+            }
+            ide_hgeom = (g_ide_cyl << 16) | ((uint32_t)g_ide_heads << 8) | (uint32_t)g_ide_spt;
+        }
+        IDW(0, 0x0040u);                       /* фиксированный диск, не съёмный */
+        IDW(1, g_ide_cyl);                     /* цилиндры */
+        IDW(3, g_ide_heads); IDW(6, g_ide_spt);/* головки и секторы на дорожку */
+        /* 🥇 Строки в ATA УЖЕ хранятся побайтно перевёрнутыми внутри слов, поэтому переворачивать
+           их ещё раз НЕЛЬЗЯ: zxfdisk честно напечатал «BBLLUTARDI EDI AMEG» вместо
+           «BULBULATOR IDE IMAGE» - и тем самым доказал, что наш блок доходит байт в байт. */
+        /* v289: строки ATA лежат ПОБАЙТНО ПЕРЕВЁРНУТЫМИ внутри слов (первый символ - в старшем
+           байте). До B0114 наш тракт чтения терял выравнивание, и перевёрнутая строка выглядела
+           правильной - я убрал переворот, компенсируя дефект железа. Теперь тракт байт-в-байт
+           (512 из 512 проверено своим кодом на Z80), и переворот вернулся на место. */
+        {   static const char* mdl = "BULBULATOR IDE IMAGE                    ";
+            for(i = 0; i < 40; i += 2){ g_ide_ident[27*2 + i] = (uint8_t)mdl[i+1];
+                                        g_ide_ident[27*2 + i + 1] = (uint8_t)mdl[i]; } }
+        {   static const char* ser = "BULB0001            ";
+            for(i = 0; i < 20; i += 2){ g_ide_ident[10*2 + i] = (uint8_t)ser[i+1];
+                                        g_ide_ident[10*2 + i + 1] = (uint8_t)ser[i]; } }
+        IDW(47, 0x8010u);                      /* максимум секторов в multiple */
+        IDW(49, 0x0200u);                      /* бит9 = LBA поддерживается - это проверяют все */
+        IDW(53, 0x0001u);
+        IDW(54, g_ide_cyl); IDW(55, g_ide_heads); IDW(56, g_ide_spt);
+        /* Слова 57/58 - ТЕКУЩАЯ ёмкость по CHS, то есть ровно произведение геометрии (LSIDE
+           ide.c:733). Раньше сюда шло полное число секторов образа, и при геометрии из заголовка
+           это были бы два разных числа в одном ответе. Ёмкость по LBA живёт отдельно, в 60/61. */
+        {   uint32_t chscap = g_ide_cyl * (uint32_t)g_ide_heads * (uint32_t)g_ide_spt;
+            IDW(57, (uint16_t)(chscap & 0xFFFFu)); IDW(58, (uint16_t)(chscap >> 16)); }
+        IDW(60, (uint16_t)(secs & 0xFFFFu)); IDW(61, (uint16_t)(secs >> 16));   /* число секторов LBA */
+        #undef IDW
+        ide_geom = secs;
+        g_ide_secs = secs;                            /* v292: то же число, но для интерфейса */
+    }
+    {   const char* b = path;                         /* v292: в статусе и в окне показываем ИМЯ файла */
+        for(const char* q = path; *q; q++) if(*q == '/') b = q + 1;
+        int i = 0;
+        for(; b[i] && i < (int)sizeof(g_ide_name)-1; i++) g_ide_name[i] = b[i];
+        g_ide_name[i] = 0; }
+    g_ide_open = 1;
+    return 1;
+}
+/* v292: снять образ. Строб последней команды тоже забываем: после новой вставки служба обязана
+   заново отдать машине DRDY тем же путём, что при холодном старте, иначе первая команда нового
+   диска уедет под строб старого и будет обслужена не тем опкодом. */
+static void ide_close(void){
+    if(g_ide_open){ f_close(&g_ide_f); g_ide_open = 0; }
+    g_ide_stb_last = -1;
+    g_ide_secs = 0; g_ide_name[0] = 0;
+    /* v0.15.293: счётчики живут в НЕкэшируемой DDR и после выключения диска остаются от прошлой
+       вставки - окно информации показывало бы чужие числа как свои. Обнуляем здесь, а не только при
+       первом стробе: снятый образ обслужил ровно ноль команд, и это правда. */
+    ide_cmds = 0; ide_lastcmd = 0;
+    ide_trc_reset();          /* v294: снятый образ обслужил ноль команд - и трасса тоже пустая */
+    /* v300: незаконченная отдача блоков принадлежала СНЯТОМУ образу - её счётчик и признаки обязаны
+       уйти вместе с ним, иначе первая же команда нового диска доложила бы ему чужие сектора. */
+    g_ide_rd_rem = 0; g_ide_rd_max = 0; g_ide_rd_seen = 0;
+    g_ide_retry_t = 0;        /* v300: владелец что-то поменял - следующую попытку открыть НЕ откладываем */
+    NEMO_CTL = 0;
+}
+/* v292: ВСТАВИТЬ ОБРАЗ ИЗ НАВИГАТОРА - тот же порядок, что у дискеты в disk_mount_drv. Файл
+   проверяем ДО того, как записать путь в профиль машины: иначе опция запомнила бы то, что мы не
+   умеем читать, и после сохранения ini владелец получал бы «IDE включён, а диска нет». */
+/* v0.15.293: НОВЫЙ ОБРАЗ ПРОВЕРЯЕМ, ПОКА СТАРЫЙ ЕЩЁ РАБОТАЕТ. Отдельный дескриптор нужен именно
+   ради этого: ide_open() пишет в g_ide_f, то есть «примерить» файл на месте нельзя, не сняв
+   работающий диск. Проверяем ровно то же, что и открытие, - подпись RS-IDE в заголовке. */
+static int ide_probe(const char* path){
+    FIL f; UINT br = 0; uint8_t hdr[8]; int ok;
+    if(f_open(&f, path, FA_READ) != FR_OK) return 0;
+    /* v311 (О-13): проверка ОБЯЗАНА совпадать с той, что делает ide_open. Разойдясь, они дают
+       худший вид отказа: навигатор образ принял, а служба его потом не открыла - и владелец видит
+       «IDE включён, диска нет» без единого объяснения. */
+    ok = (f_read(&f, hdr, sizeof hdr, &br) == FR_OK && br >= 8 &&
+          hdr[0]=='R' && hdr[1]=='S' && hdr[2]=='-' && hdr[3]=='I' &&
+          hdr[4]=='D' && hdr[5]=='E' && hdr[6]==0x1Au);
+    f_close(&f);
+    return ok;
+}
+static uint8_t ide_mount(const char* path){
+    int m = (opt_defmachine>=0 && opt_defmachine<N_MACHINES) ? opt_defmachine : 0;
+    char prev[sizeof(g_mp[0].idefile)]; int i;
+    if(!path || !path[0]) return 0xE1;
+    if(slen(path) >= (int)sizeof(g_mp[m].idefile)) return 0xE2;   /* честный отказ вместо тихой обрезки */
+    /* v0.15.293: сначала убеждаемся, что новый файл годится, и только потом снимаем работающий.
+       Прежний порядок (снять - записать путь - попробовать открыть) ронял ИСПРАВНЫЙ диск из-за
+       чужой ошибки: промахнулся курсором в навигаторе - и машина осталась вообще без винчестера,
+       хотя ничего не менялось. Тот же порядок, что у дискет: неудачная вставка не трогает вставленное. */
+    if(!ide_probe(path)) return 0xE3;                             /* не RS-IDE или файл не открылся */
+    for(i = 0; i < (int)sizeof(prev); i++) prev[i] = g_mp[m].idefile[i];
+    ide_close();
+    for(i = 0; path[i] && i < (int)sizeof(g_mp[m].idefile)-1; i++) g_mp[m].idefile[i] = path[i];
+    g_mp[m].idefile[i] = 0;
+    if(!ide_open()){                    /* файл прошёл проверку, но исчез между нею и вставкой */
+        for(i = 0; i < (int)sizeof(prev); i++) g_mp[m].idefile[i] = prev[i];
+        ide_open();                     /* вернуть прежний образ, раз новый не состоялся */
+        return 0xE3;
+    }
+    opt_ide = 1; g_mp[m].ide = 1;                                 /* вставили образ - интерфейс включаем */
+    return 0;
+}
+/* v300: указатель чтения буфера в фабрике - nemo_stat[29:21] (atlas_core/main.v:785). */
+static unsigned ide_rptr(void){ return (unsigned)((nemo_rd_stable(GP0+0x188) >> 21) & 0x1FFu); }
+/* v307: статус «данные готовы» с меткой последнего блока. 0x58 = DRDY|DSC|DRQ, бит1 - служебный
+   канал к фабрике (см. LOADCAP_IDEDRQ): по нему она решает, вешать ли BSY после вычерпывания. На
+   ядре без этой возможности бит НЕ ставим - там он ушёл бы прямо в регистр состояния машины, а
+   бит1 (IDX) хоть и объявлен устаревшим, врать драйверу без нужды незачем. */
+static uint32_t ide_drq_st(int last){
+    return (last && (LOAD_CAPS_R & LOADCAP_IDEDRQ)) ? 0x5Au : 0x58u;
+}
+/* v300: подложить в буфер сектор `lba` и поднять DRQ. 0 = сектор не прочитался.
+   BSY поднимаем ПЕРЕД наполнением по требованию ATA: пока буфер неполон, машине там делать нечего.
+   v307: `last` - последний ли это блок передачи. Соврать здесь дорого в обе стороны: сказать
+   «последний» раньше времени = машина уйдёт из чтения, не дождавшись остатка пачки; не сказать
+   вовсе = после настоящего последнего блока фабрика повесит BSY и будет ждать блок, которого мы
+   уже не подложим (снимет её сторож через 148 мс, но эта пауза видна софту). */
+static int ide_push_sector(uint32_t lba, int last){
+    UINT br = 0; unsigned i;
+    uint32_t off = g_ide_data0 + lba * (g_ide_8bit ? 256u : 512u);
+    nemo_push(0x80u, 1, 0, 0);
+    if(g_ide_8bit){
+        /* 🥇 v0.15.311 (О-1): ВОСЬМИБИТНЫЙ ОБРАЗ - ЭТО РАСКЛАДКА, А НЕ ПРОСТО ДРУГОЙ ШАГ.
+           В файле такого образа сектор занимает 256 байт: там лежат только МЛАДШИЕ байты слов,
+           старшие не хранятся вовсе (флаг «halved sector data», бит0 по 0x08 заголовка). Эталон
+           (LSIDE ide.c:446-457) читает 256 байт и разворачивает их в логический сектор: чётные
+           байты - из файла, нечётные - 0xFF. Смещение мы считали верно, а читали 512 байт подряд,
+           то есть отдавали машине ДВА соседних сектора образа, слепленных в один, и ни одного
+           старшего байта. Ни одна файловая система такое пережить не может. */
+        if(f_lseek(&g_ide_f, off) != FR_OK ||
+           f_read(&g_ide_f, g_ide_raw, 256, &br) != FR_OK) return 0;
+        for(i = 0; i < br; i++){ g_ide_sec[i*2] = g_ide_raw[i]; g_ide_sec[i*2+1] = 0xFFu; }
+        /* хвост за концом образа - честные нули в младшем байте и та же 0xFF в старшем */
+        for(i = br; i < 256u; i++){ g_ide_sec[i*2] = 0; g_ide_sec[i*2+1] = 0xFFu; }
+        br = 512u;
+    } else {
+        if(f_lseek(&g_ide_f, off) != FR_OK || f_read(&g_ide_f, g_ide_sec, 512, &br) != FR_OK) return 0;
+    }
+    /* Хвост за концом образа обнуляем. Отдать «сколько прочиталось» и оставить в буфере остатки
+       ПРЕДЫДУЩЕГО сектора - это ровно та мина, которая была у буфера дисковода: чужие байты уезжают
+       машине как свои. Пусть лучше будут честные нули. */
+    for(i = br; i < 512u; i++) g_ide_sec[i] = 0;
+    if(g_ide_pthack && lba == 0u){
+        unsigned q;
+        for(q = 0; q < 4; q++){
+            uint8_t* t = &g_ide_sec[446 + q*16 + 4];
+            if(*t == 0x04u || *t == 0x06u) *t = 0x0Eu;
+        }
+    }
+    nemo_push(ide_drq_st(last), 0, g_ide_sec, 512);   /* DRDY|DSC|DRQ + данные (+ метка последнего) */
+    g_ide_rd_max = 0; g_ide_rd_seen = 0; g_ide_rd_armed = 0; g_ide_rd_tlast = ph_ccnt();
+    return 1;
+}
+/* 🥇🥇 v0.15.312 ЗАЛИПАНИЕ ТРАКТА: ЭТА ПУБЛИКАЦИЯ ШЛА В ЧУЖОЕ ОКНО И ЗАТИРАЛА АДРЕС ХОЗЯИНА.
+   Измерено своим кодом на Z80 (12 одиночных чтений подряд, обратное чтение файла регистров самой
+   машиной ДО каждой команды): первое чтение проходит, а начиная со второго машина, записав
+   #70/#90/#B0/#D0, читает оттуда ЧУЖОЙ адрес - и дальше он держится намертво, потому что мы
+   публикуем обратно его же. Адрес оказывался за концом образа, f_read отдавал ноль байт, хвост
+   обнулялся - машина получала НУЛИ на законные адреса до перемонтирования образа. Контрольные
+   опыты развели виновных: ARM в одиночку (машина после чтения только опрашивает регистры, 1024
+   пробы) файл регистров не портит, машина в одиночку (первое чтение) тоже; портится только их
+   НАЛОЖЕНИЕ.
+   ПРИЧИНА НАЛОЖЕНИЯ - НЕ СКОРОСТЬ, А ОКНО. Конец передачи мы узнаём на СЛЕДУЮЩЕМ обходе главного
+   цикла (служба выходит, как только машина взялась за буфер), а фабрика к этому времени уже сняла
+   и DRQ, и BSY - то есть хозяин по ATA имеет полное право программировать следующую команду, и
+   именно это он и делает. Пять наших записей с обратным чтением занимают десятки микросекунд и
+   ложатся ровно поверх его пяти OUT-ов.
+   ЛЕЧИМ ОКНОМ, А НЕ ГОНКОЙ: публикуем ОДИН РАЗ, сразу после разбора команды, пока занятость держит
+   сама фабрика (B0115 поднимает её в том же такте, в котором хост записал #F0). В это окно хозяин
+   по ATA в файл регистров не лезет и лезть не может. Значение известно заранее: адрес последнего
+   сектора пачки и нулевой остаток - мы обязуемся отдать ровно столько блоков, сколько он запросил.
+   Что мы за это отдали: если чтение сорвётся на середине пачки, в регистрах останется обещанный
+   конец, а не место обрыва. Это честнее прежнего: там был не «конец», а НАЧАЛО прошлой команды,
+   и оплачено оно было залипанием всего тракта. Место обрыва по-прежнему видно в трассе.
+
+   v0.15.311 (О-7) - прежнее обоснование, оно остаётся верным по сути:
+   ПОСЛЕ ПЕРЕДАЧИ ФАЙЛ РЕГИСТРОВ ОБЯЗАН ОПИСЫВАТЬ ПОСЛЕДНИЙ СЕКТОР.
+   По ATA устройство ведёт адрес и уменьшает счётчик секторов по мере передачи (эталон - LSIDE
+   ide.c:686-723). У нас #50 писал ТОЛЬКО хост, а остаток блоков жил в переменной прошивки, поэтому
+   после многосекторного чтения в регистрах оставались ИСХОДНЫЕ адрес и счётчик. Драйвер, который
+   продолжает работу «от того места, где диск остановился», получал от нас начало прошлой команды
+   вместо её конца - ровно тот класс отказа, на который жалуется Wild Player.
+
+   ПИШЕМ ОДИН РАЗ, КОГДА ПЕРЕДАЧА КОНЧИЛАСЬ, а не после каждого блока. Причина: канал записи
+   регистров односторонний, каждая запись подтверждается ОБРАТНЫМ ЧТЕНИЕМ и требует поднятого BSY
+   (см. nemo_reg_write). Делать это между блоками значит вклиниваться в живую отдачу DRQ, ради
+   состояния, которое хост по ATA всё равно вправе читать только при снятых BSY и DRQ.
+
+   Счётчик и адрес считаем из ЛИНЕЙНОГО номера: разбор команды сводит к нему оба режима, поэтому
+   формула продвижения тут одна, а расходится только обратный перевод - в CHS сектор считается
+   С ЕДИНИЦЫ, головка и цилиндр получаются делением с остатком. */
+static void ide_regs_publish(uint32_t last_lba, uint32_t left){
+    uint8_t sc, r0, r1, r2, hd;
+    if(!(LOAD_CAPS_R & LOADCAP_IDEREG)) return;   /* ядро до B0115: писать регистры некуда */
+    if(g_ide_lbamode){
+        r0 = (uint8_t)( last_lba        & 0xFFu);
+        r1 = (uint8_t)((last_lba >>  8) & 0xFFu);
+        r2 = (uint8_t)((last_lba >> 16) & 0xFFu);
+        /* старший полубайт #D0 - хозяйский: там бит режима LBA и номер устройства. Затерев его,
+           мы бы сами перевыбрали устройство и сняли признак LBA у ещё живого драйвера. */
+        hd = (uint8_t)((g_ide_cur_head & 0xF0u) | ((last_lba >> 24) & 0x0Fu));
+    } else {
+        uint32_t spt = g_ide_spt   ? (uint32_t)g_ide_spt   : 63u;
+        uint32_t hds = g_ide_heads ? (uint32_t)g_ide_heads : 16u;
+        uint32_t t   = last_lba / spt;
+        uint32_t cyl = t / hds;
+        r0 = (uint8_t)((last_lba % spt) + 1u);          /* сектор CHS считается С ЕДИНИЦЫ */
+        r1 = (uint8_t)( cyl        & 0xFFu);
+        r2 = (uint8_t)((cyl >>  8) & 0xFFu);
+        hd = (uint8_t)((g_ide_cur_head & 0xF0u) | (uint8_t)(t % hds));
+    }
+    sc = (uint8_t)(left & 0xFFu);                       /* 0 = передано всё, что просили */
+    (void)nemo_reg_write(0x80u, 1, 2, sc);
+    (void)nemo_reg_write(0x80u, 1, 3, r0);
+    (void)nemo_reg_write(0x80u, 1, 4, r1);
+    (void)nemo_reg_write(0x80u, 1, 5, r2);
+    (void)nemo_reg_write(0x80u, 1, 6, hd);
+    ide_regs = ((uint32_t)sc << 24) | ((uint32_t)r2 << 16) | ((uint32_t)r1 << 8) | (uint32_t)r0;
+}
+/* v300: закончить отдачу блоков заданным статусом (в том числе снять DRQ). */
+static void ide_rd_stop(uint32_t status, uint8_t err){
+    g_ide_rd_rem = 0; g_ide_rd_max = 0; g_ide_rd_seen = 0; g_ide_rd_armed = 0;
+    g_nemo_err = err; nemo_push(status, 0, 0, 0); g_nemo_err = 0;
+    g_ide_mstat = (uint8_t)status;
+}
+/* v300: довести начатую передачу до конца. Зовётся с КАЖДОГО прохода службы, пока есть что отдавать
+   (обоснование всей механики - у объявления g_ide_rd_rem). */
+static void ide_rd_service(void){
+    const uint32_t idle_lim = g_ph_cpum * IDE_SPIN_IDLE_US;
+    const uint32_t wd_lim   = g_ph_cpum * (IDE_RD_WD_MS * 1000u);
+    /* 🥇 ЖЁСТКИЙ ПОТОЛОК ОБОРОТОВ - страховка от НЕИСПРАВНЫХ ЧАСОВ, а не от машины. Всё, что выше,
+       меряет время счётчиком тактов процессора (CCNT), а он начинает считать только после ph_init().
+       Пока он стоит, обе разности времени равны нулю, ни один выход по простою не сработает - и
+       безобидное ожидание превратилось бы в вечный цикл, который не спасти уже ничем. Нормальный
+       выход происходит за единицы оборотов (машина берётся за буфер почти сразу), самый длинный
+       законный - около тысячи, так что двадцать тысяч не мешают ничему живому. */
+    const int hw = (LOAD_CAPS_R & LOADCAP_IDEDRQ) ? 1 : 0;   /* v307: фабрика ведёт DRQ сама */
+    unsigned guard = 0;
+    for(;;){
+        int done = 0;
+        unsigned r;
+        if(++guard > 20000u) return;
+        if(hw){
+            /* ЯДРО B0117: спрашиваем ФАКТ. Указатель здесь нужен только для отсчёта простоя -
+               по нему видно, что машина шевелится, а решение о конце блока принимает фабрика. */
+            uint32_t sw = nemo_rd_stable(GP0+0x188);
+            r = (unsigned)((sw >> 21) & 0x1FFu);
+            if(sw & IDE_ST_DRQ) g_ide_rd_armed = 1;    /* наш блок доехал и лежит в буфере */
+            if(r > g_ide_rd_max){ g_ide_rd_max = r; g_ide_rd_seen = 1; g_ide_rd_tlast = ph_ccnt(); }
+            /* ДВА признака, и оба нужны. «Жду блок» поднимается ТОЛЬКО вычерпыванием и гаснет от
+               любого нашего слова состояния (в том числе от того, которым мы этот блок и подложили),
+               поэтому увидеть его = точно знать, что машина дочитала. Но на ПОСЛЕДНЕМ блоке его не
+               будет вовсе - там фабрика просто снимает DRQ и никого не ждёт; этот случай и ловит
+               второе условие. Снять DRQ в фабрике больше некому: новая команда рвёт передачу выше
+               по коду, а её сторож срабатывает только через 148 мс молчания. */
+            done = ((sw & IDE_ST_GAP) != 0u) || (g_ide_rd_armed && !(sw & IDE_ST_DRQ));
+        } else {
+            r = ide_rptr();
+            if(r > g_ide_rd_max){                      /* указатель пошёл вперёд - машина читает */
+                g_ide_rd_max = r; g_ide_rd_seen = 1; g_ide_rd_tlast = ph_ccnt();
+            } else if(g_ide_rd_seen && r < g_ide_rd_max && ide_rptr() < g_ide_rd_max){
+                /* Кольцо провернулось = блок вычерпан целиком. Перечитывание обязательно: nemo_stat
+                   приходит из домена машины без синхронизаторов, и одно рваное слово не имеет права
+                   снять блок, который машина ещё читает. */
+                done = 1;
+            }
+        }
+        if(done){
+            g_ide_rd_tlast = ph_ccnt();
+            if(--g_ide_rd_rem == 0u){
+                /* v312: файл регистров уже опубликован в окне занятости команды - здесь трогать его
+                   НЕЛЬЗЯ (см. разбор у ide_regs_publish): машина в этот момент вправе программировать
+                   следующую команду, и наша запись затирала её адрес. */
+                ide_rd_stop(0x50u, 0); return;                              /* DRQ - только до последнего блока */
+            }
+            /* Метка «последний» - на блок, после которого не останется ни одного: счётчик уже
+               уменьшен, значит подкладываемый блок последний ровно при остатке в единицу. */
+            if(!ide_push_sector(g_ide_rd_lba, g_ide_rd_rem == 1u)){
+                /* Сектор не прочитался. Адрес обрыва в файл регистров НЕ пишем - окно уже чужое
+                   (v312); он есть в трассе, а драйверу хватит ERR|ABRT, чтобы повторить команду. */
+                ide_rd_stop(0x51u, 0x04u); return;                          /* ABRT: носитель ни при чём */
+            }
+            g_ide_rd_lba++;
+            continue;                                  /* дождаться, что машина взялась и за этот блок */
+        }
+        {   uint32_t idle = (uint32_t)(ph_ccnt() - g_ide_rd_tlast);
+            /* Сторож проверяем ПЕРВЫМ и до выхода «машина читает»: софт вправе бросить чтение на
+               середине сектора, и тогда признак движения остался бы взведён навсегда, а служба
+               навсегда пропускала бы обслуживание выбора устройства. */
+            if(idle > wd_lim){
+                /* Софт бросил чтение на середине. Файл регистров не трогаем по той же причине
+                   (v312): за две секунды молчания хозяин точно занялся чем-то своим, и запись в
+                   его регистры была бы вмешательством в чужую команду. */
+                ide_rd_stop(0x50u, 0); return;
+            }
+            if(g_ide_rd_seen) return;                  /* взялась - дальше её ждёт главный цикл */
+            if(idle > idle_lim) return;                /* пауза - вернуть время оболочке, состояние в статике */
+        }
+        gs_pump(); player_pump();                      /* ждём машину, но звук ждать не умеет */
+    }
+}
+static void nemo_service_body(void);
+/* v300: служба теперь сама качает звук, пока ждёт машину, а звуковые насосы зовут из разных мест.
+   Прямой рекурсии сейчас нет, но одна строка страховки дешевле разбора «почему кончился стек». */
+static void nemo_service(void){
+    static int in = 0;
+    if(in) return;
+    in = 1; nemo_service_body(); in = 0;
+}
+static void nemo_service_body(void){
+    uint32_t st;
+    if(!opt_ide){ if(g_ide_open) ide_close(); NEMO_CTL = 0; return; }
+    if(!g_ide_open){
+        /* 🥇 v0.15.300 НЕТ ФАЙЛА - МОЛЧИМ, НО НАСТРОЙКУ НЕ ТЕРЯЕМ. Раньше первый же промах гасил
+           opt_ide И профиль машины, то есть отсутствие образа на карте НАВСЕГДА выключало интерфейс,
+           а «Save config» закреплял это в ini. С включённым по умолчанию винчестером так нельзя:
+           у всех, у кого на карте нет HDD.HDF, фича выключилась бы сама и молча. Машине честно
+           показываем «устройства нет» (NEMO_CTL = 0), настройку не трогаем, а попытку открыть
+           повторяем РЕДКО: f_open на каждом проходе главного цикла стоил бы дороже всей службы. */
+        XTime now; XTime_GetTime(&now);
+        if(g_ide_retry_t && (now - g_ide_retry_t) < (XTime)COUNTS_PER_SECOND * IDE_RETRY_S){
+            NEMO_CTL = 0; return; }
+        g_ide_retry_t = now;
+        if(!ide_open()){ NEMO_CTL = 0; return; }
+        g_ide_retry_t = 0;
+    }
+    if(g_ide_stb_last < 0){ ide_cmds = 0; ide_lastcmd = 0; ide_trc_reset(); }   /* счётчики в НЕкэшируемой DDR - мусор до обнуления */
+    /* v291: ОДНО устойчивое чтение на всё слово - и строб, и команда, и slave, и LBA0. Читать
+       строб отдельно от полей нельзя: между двумя чтениями хост успевает записать СЛЕДУЮЩУЮ
+       команду, и тогда под строб старой команды обслужится опкод новой (а вместе с ним и её
+       регистры). Слова состояния приходят из домена машины без синхронизаторов, поэтому чтение
+       ещё и повторяется до двух одинаковых подряд. */
+    st = nemo_rd_stable(GP0+0x188);
+    { int stb = (int)((st >> 31) & 1u);
+      if(g_ide_stb_last < 0){ g_ide_stb_last = stb; nemo_push(0x50u, 0, 0, 0); return; }
+      if(stb == g_ide_stb_last){
+          /* v300: идёт отдача блоков - её и продолжаем. Слово состояния в фабрике ОДНО, поэтому
+             трогать его здесь чем-то ещё (например статусом выбранного устройства) нельзя: это
+             сняло бы DRQ посреди сектора. Смены устройства посреди передачи не бывает. */
+          if(g_ide_rd_rem){ ide_rd_service(); return; }
+          /* v295: новой команды нет - но машина могла ПЕРЕВЫБРАТЬ устройство. Статус в фабрике
+             один, поэтому при каждой смене выбора кладём в него статус выбранного: у master -
+             последний настоящий, у slave - ноль («устройства нет»). Без этого ноль от probe slave
+             оставался в регистре, и master выглядел неготовым. */
+          int sl = ((nemo_rd_stable(GP0+0x18C) >> 24) & 0x10u) ? 1 : 0;
+          if(sl != g_ide_sel_sl){ g_ide_sel_sl = sl; nemo_push(sl ? 0x00u : g_ide_mstat, 0, 0, 0); }
+          return;
+      }
+      g_ide_stb_last = stb;
+      /* v300: новая команда отменяет незаконченную отдачу. Указатель фабрика уже обнулила записью
+         в #F0, и старый счётчик относился бы к ЧУЖОМУ запросу. */
+      g_ide_rd_rem = 0; g_ide_rd_max = 0; g_ide_rd_seen = 0; g_ide_rd_armed = 0; }
+    {   uint32_t a2  = nemo_rd_stable(GP0+0x18C);
+        uint8_t cmd = (uint8_t)((st >> 8) & 0xFFu);
+        /* v291: LBA0 теперь берём из ПЕРВОГО слова - младший байт NEMO_STAT2 занят счётчиком
+           секторов (#50), он нужен для 0x91 и для приёмки нашей же записи регистров.
+           v311 (О-2): собираем адрес НИЖЕ, когда станет известен режим - см. разбор регистра #D0. */
+        uint32_t lba = 0;
+        int addr_bad = 0;
+        /* 🥇 На SLAVE отвечаем «устройства нет». Мы отзывались на оба адреса, и zxfdisk честно
+           показывал второй диск-двойник; софт полез бы с ним работать. Признак - бит DEV
+           регистра #D0 (E0 = master, F0 = slave), фабрика отдаёт его битом 30. */
+        /* v294: полные регистры для трассы. Счётчик секторов - младший байт второго слова, head -
+           старший. В LBA от head идёт только младший полубайт, но в трассу нужен ВЕСЬ байт: в нём
+           бит LBA-режима и номер устройства, то есть то, чего софт от нас ждал. */
+        uint8_t cnt  = (uint8_t)(a2 & 0xFFu);
+        uint8_t head = (uint8_t)((a2 >> 24) & 0xFFu);
+        /* 🥇 v0.15.311 (О-2): РЕЖИМ АДРЕСАЦИИ ВЫБИРАЕТ БИТ 6 РЕГИСТРА #D0, И ЕГО НАДО ЧИТАТЬ.
+           Мы всегда собирали адрес как линейный, то есть одни и те же байты в #70/#90/#B0 толковали
+           одинаково в обоих режимах. Хост, пришедший в CHS (бит 6 снят), получал бы сектор совсем
+           из другого места образа - и МОЛЧА. Формула эталонная (LSIDE ide.c:645-726): цилиндр из
+           #90/#B0, головка - младший полубайт #D0, сектор из #70 И СЧИТАЕТСЯ С ЕДИНИЦЫ.
+           Геометрия здесь - та, которую мы объявили в IDENTIFY (из заголовка образа либо наш
+           дефолт), иначе хост считал бы адрес по одной раскладке, а мы по другой.
+           За границы геометрии CHS отвечаем ошибкой: сектор 0 или головка вне диапазона - это не
+           «край диска», а несогласованность с тем, что мы сами же объявили. Для LBA прежнее
+           поведение (за концом образа отдаём нули) НЕ трогаем: число блоков там задаёт хост, и
+           обрыв на середине пачки подвесил бы драйвер - см. обоснование у ide_push_sector. */
+        g_ide_cur_head = head;
+        g_ide_lbamode  = (head & 0x40u) ? 1 : 0;
+        if(g_ide_lbamode){
+            lba = (st & 0xFFu) | (a2 & 0x00FFFF00u) | (((a2 >> 24) & 0x0Fu) << 24);
+        } else {
+            uint32_t spt = g_ide_spt   ? (uint32_t)g_ide_spt   : 63u;
+            uint32_t hds = g_ide_heads ? (uint32_t)g_ide_heads : 16u;
+            uint32_t cyl = ((a2 >> 8) & 0xFFu) | (((a2 >> 16) & 0xFFu) << 8);
+            uint32_t hd  = (uint32_t)(head & 0x0Fu);
+            uint32_t sec = (st & 0xFFu);
+            if(sec == 0u || sec > spt || hd >= hds) addr_bad = 1;
+            else lba = ((cyl * hds) + hd) * spt + (sec - 1u);
+        }
+        uint32_t flg = ((st >> 30) & 1u)                              /* б0: обращение к slave */
+                     | (uint32_t)(g_ide_8bit ? 2u : 0u)               /* б1: сектор в файле 256 Б */
+                     | ((LOAD_CAPS_R & LOADCAP_IDEREG) ? 4u : 0u)     /* б2: ядро пишет регистры ATA */
+                     | (uint32_t)(g_ide_open ? 8u : 0u)               /* б3: образ открыт */
+                     | (uint32_t)(g_ide_lbamode ? 0u : 32u)           /* б5 (v311): хост пришёл в CHS */
+                     | (uint32_t)(addr_bad ? 64u : 0u);               /* б6 (v311): адрес вне геометрии */
+        if(st & (1u << 30)){ nemo_push(0x00u, 0, 0, 0); g_ide_sel_sl = 1;
+                             /* slave тоже в трассу: без него не отличить «софт нас не спрашивал»
+                                от «спрашивал не тот адрес» */
+                             ide_trc(cmd, lba, cnt, head, flg, st, a2); return; }
+        ide_cmds++; ide_lastcmd = ((uint32_t)cmd << 24) | lba;
+        nemo_push(0x80u, 1, 0, 0);                        /* BSY, пока наполняем буфер */
+        if(cmd == 0xECu){                                 /* IDENTIFY DEVICE */
+            /* v307: блок ЕДИНСТВЕННЫЙ, поэтому он же и последний - метку ставим сразу, иначе
+               фабрика после вычерпывания повесит BSY в ожидании продолжения, которого не будет.
+               Это же и ответ на вопрос «не сломается ли IDENTIFY»: он идёт тем же путём, что и
+               одиночное чтение, и от них обоих отличается только тем, что данные синтезированы,
+               а не прочитаны с карты. */
+            nemo_push(ide_drq_st(1), 0, g_ide_ident, 512);/* DRDY|DSC|DRQ + данные */
+            /* v300: блок один, но провожаем его тем же механизмом - чтобы DRQ снялся, когда машина
+               его вычерпает, а не висел до следующей команды. */
+            g_ide_rd_rem = 1; g_ide_rd_max = 0; g_ide_rd_seen = 0; g_ide_rd_armed = 0;
+            g_ide_rd_tlast = ph_ccnt();
+        } else if(cmd == 0x20u || cmd == 0x21u){          /* READ SECTOR(S) */
+            /* v300: сколько секторов просит хост - регистр #50 (счётчик), ноль по ATA = 256.
+               Гейт по возможностям ядра тот же, что у 0x90/0x91, и по той же причине: младший байт
+               NEMO_STAT2 стал счётчиком только в B0115, а до него там лежал ДУБЛЬ LBA0 - принять
+               его за счётчик значит отдать «LBA0» секторов вместо одного. За концом образа не
+               обрезаем: число блоков задаёт ХОСТ, и отдать их меньше значит подвесить драйвер;
+               недостающее уходит нулями (см. ide_push_sector). */
+            uint32_t nsec = 1u;
+            if(LOAD_CAPS_R & LOADCAP_IDEREG) nsec = cnt ? (uint32_t)cnt : 256u;
+            if(nsec > 1u) flg |= 16u;                     /* б4 трассы: передача многосекторная */
+            /* 🥇 v0.15.312 ЗА КОНЦОМ ОБРАЗА - ЧЕСТНАЯ ОШИБКА, А НЕ «512 НУЛЕЙ И УСПЕХ».
+               Так было устроено раньше: f_lseek за концом файла упирается в его размер, f_read
+               отдаёт ноль байт БЕЗ ошибки, хвост буфера мы обнуляем - и машина получает полный
+               сектор нулей со статусом «готово». Софт по такому ответу не может понять, что
+               спросил чушь: таблица разделов из нулей выглядит как «разделов нет», и разумный
+               навигатор уходит в петлю перечитывания. По ATA (эталон LSIDE ide.c:680) ответ на
+               адрес вне носителя - ERR с кодом IDNF «сектор не найден»; ABRT добавляем потому,
+               что команда действительно не выполнена. Прежнее опасение «оборвём пачку и подвесим
+               драйвер» здесь не работает: мы обрываем её ДО первого блока, то есть ровно так,
+               как обязан вести себя настоящий диск.
+               Проверяем ВСЮ пачку: диск, отдавший половину запрошенного, для драйвера так же
+               неотличим от исправного, как и нули. Счёт в 64 битах - иначе lba+nsec перельётся
+               ровно на тех адресах, ради которых проверка и заводится. */
+            if(!addr_bad && g_ide_secs &&
+               ((uint64_t)lba + (uint64_t)nsec > (uint64_t)g_ide_secs)){
+                addr_bad = 2; flg |= 64u;                 /* б6 трассы: адрес вне носителя */
+            }
+            if(addr_bad){
+                /* v311 (О-2): CHS-адрес не лёг в объявленную нами же геометрию. Эталон отвечает
+                   на это ABRT|IDNF (LSIDE ide.c:680) - «команда прервана, сектор не найден».
+                   В фабрику уходит только младший полубайт регистра ошибки (О-8), то есть машина
+                   увидит ABRT; IDNF пока живёт только в трассе, и это честнее молчания. */
+                g_ide_rd_rem = 0;
+                g_nemo_err = 0x14u; nemo_push(0x51u, 0, 0, 0); g_nemo_err = 0;
+            }
+            else {
+                /* v312: файл регистров описывает КОНЕЦ пачки и пишется ЗДЕСЬ, пока занятость держит
+                   фабрика (обоснование - у ide_regs_publish). ДО подачи блока, а не после: запись
+                   регистра идёт словом с владением буфером и BSY, и после ide_push_sector она сняла
+                   бы только что поднятый DRQ. Столько блоков, сколько запросил хост, мы отдадим -
+                   выход за носитель отсечён выше, - поэтому конец пачки известен заранее. */
+                ide_regs_publish(lba + nsec - 1u, 0u);
+                if(ide_push_sector(lba, nsec == 1u)){ g_ide_rd_rem = nsec; g_ide_rd_lba = lba + 1u; }
+                else { g_ide_rd_rem = 0;
+                       g_nemo_err = 0x04u; nemo_push(0x51u, 0, 0, 0); g_nemo_err = 0; }
+            }
+        } else if(cmd == 0x90u){
+            /* v290: EXECUTE DEVICE DIAGNOSTIC. Первое, что делает Proteus, и мы отвечали ошибкой -
+               для драйвера это «диска нет». Код 0x01 = устройство 0 исправно (ATA-спека).
+               v291: одного кода мало - драйвер читает ещё и СИГНАТУРУ в регистрах (#50 = 01,
+               #70 = 01, #90 = 00, #B0 = 00), а нулей ему хватает, чтобы решить то же самое. BSY
+               поднят выше по коду, значит машина по ATA в файл регистров сейчас не лезет. */
+            if(LOAD_CAPS_R & LOADCAP_IDEREG){
+                int ok = 1;
+                ok &= nemo_reg_write(0x80u, 1, 2, 0x01u);   /* #50 Sector Count */
+                ok &= nemo_reg_write(0x80u, 1, 3, 0x01u);   /* #70 LBA0 */
+                ok &= nemo_reg_write(0x80u, 1, 4, 0x00u);   /* #90 LBA1 */
+                ok &= nemo_reg_write(0x80u, 1, 5, 0x00u);   /* #B0 LBA2 */
+                /* Регистр #30 у этой команды читается ДВУМЯ разными способами, и путать их нельзя:
+                   при снятом ERR это КОД ДИАГНОСТИКИ (0x01 = устройство 0 исправно), при поднятом -
+                   обычный регистр ошибки, где 0x01 значит «сбойный блок носителя». Отвечая
+                   0x51 (ERR) с кодом 0x01, мы сообщали бы драйверу не «команда не вышла», а
+                   «диск сыпется», и тот честно списал бы носитель. Поэтому на отказ ставим
+                   ABRT (0x04) - команда прервана, носитель ни при чём.
+                   Отвечать ошибкой при несошедшемся обратном чтении обязательно: сигнатура из
+                   воображения означает, что драйвер поверит в исправное устройство и полезет
+                   читать сектора. */
+                g_nemo_err = ok ? 0x01u : 0x04u;
+                nemo_push(ok ? 0x50u : 0x51u, 0, 0, 0);
+                g_nemo_err = 0;
+            } else {
+                /* ядро до B0115: регистры ведёт только машина, выставить сигнатуру нечем -
+                   отвечаем как v290, чтобы не сломать то, что на нём уже работает */
+                g_nemo_err = 0x01u; nemo_push(0x50u, 0, 0, 0); g_nemo_err = 0;
+            }
+        } else if(cmd == 0x91u){
+            /* v291: INITIALIZE DEVICE PARAMETERS. Геометрию хост задаёт ПЕРЕД командой: в #50 -
+               секторов на дорожку, в младшем полубайте #D0 - число головок минус 1. Раньше этих
+               регистров не было видно вовсе, и команда просто квитировалась. Диск мы отдаём по
+               LBA, поэтому геометрию запоминаем и показываем прибору: по ней видно, с какой
+               трансляцией пришёл драйвер, если тот вдруг начнёт считать сектора по-своему.
+               Гейт по возможностям ядра - тот же, что у 0x90, и по той же причине: счётчик
+               секторов в младшем байте NEMO_STAT2 появился только в B0115, а до него там лежал
+               ДУБЛЬ LBA0. На старом ядре разбор новой раскладки записал бы в «секторов на дорожку»
+               младший байт адреса последней команды - мусор, выданный за настройку хоста. */
+            if(LOAD_CAPS_R & LOADCAP_IDEREG){
+                g_ide_spt   = (uint8_t)(a2 & 0xFFu);
+                g_ide_heads = (uint8_t)(((a2 >> 24) & 0x0Fu) + 1u);
+                ide_parm = ((uint32_t)g_ide_spt << 8) | (uint32_t)g_ide_heads;
+            }
+            nemo_push(0x50u, 0, 0, 0);
+        } else if(cmd == 0xE7u || cmd == 0x08u || cmd == 0xEFu ||
+                  cmd == 0xE0u || cmd == 0xE1u){
+            nemo_push(0x50u, 0, 0, 0);                    /* приняли и готовы, BSY не вешаем */
+        } else {
+            /* 🥇 v0.15.311 (О-9): НЕИЗВЕСТНАЯ КОМАНДА ОБЯЗАНА ДАТЬ И ERR, И ABRT.
+               Мы поднимали ERR, а регистр ошибки оставался нулевым (его обнуляет предыдущий ответ).
+               Для драйвера это «ошибка без причины»: одни на нулевой код ошибки решают, что диск
+               посыпался, другие - что команда всё-таки прошла. По ATA неподдержанный опкод = ABRT.
+               🥇 v0.15.311 (О-10): СЮДА ЖЕ ПЕРЕЕХАЛА 0xC6 SET MULTIPLE MODE. Мы отвечали на неё
+               успехом, ничего не реализовав, а драйвер, увидев успех, вправе выдать 0xC4 READ
+               MULTIPLE - и получить отказ уже посреди работы. Честный ABRT на 0xC6 отправляет его
+               на обычные 0x20/0x21, которые у нас работают. */
+            g_nemo_err = 0x04u; nemo_push(0x51u, 0, 0, 0); g_nemo_err = 0;
+        }
+        /* Событие пишем ПОСЛЕ ответа: в нём и запрос, и то, чем мы на него отозвались. Одно
+           событие на команду - иначе номера в трассе перестают отвечать на вопрос «какая по
+           счёту команда сломала софт». */
+        /* v295: запомнить, ЧТО именно master сейчас держит: этот же статус придётся вернуть в
+           регистр после того, как машина отщупает slave.
+           v307: DRQ и метку последнего блока из запомненного статуса ВЫРЕЗАЕМ. Они описывают не
+           устройство, а БУФЕР, и переиздать их потом значит сказать фабрике «данные снова готовы»
+           поверх содержимого, которое уже отдано, - то есть своими руками воспроизвести ту самую
+           отдачу старого блока, ради которой всё и переделано. Восстановление статуса master живёт
+           в ветке «передачи нет», так что снимать этим настоящий DRQ посреди пачки неоткуда. */
+        g_ide_mstat = (uint8_t)(((g_nemo_rsp >> 24) & 0xFFu) & ~0x0Au);
+        g_ide_sel_sl = 0;
+        ide_trc(cmd, lba, cnt, head, flg, st, a2);
+        /* v300: трасса записана (одно событие на команду - так и договаривались), и только теперь
+           провожаем блоки. Первый заход обязан быть ЗДЕСЬ, а не через проход главного цикла: он
+           ловит момент, когда машина взялась за буфер, и без него признак движения можно проспать. */
+        if(g_ide_rd_rem) ide_rd_service();
+    }
+}
+/* v0.15.304: применение опции мыши. Живое, как у NEMO-IDE и SAA1099: переключил - и машина видит
+   новое состояние немедленно, а не после перезагрузки. Отказ тоже виден сразу: ядро без портов
+   мыши честно говорит об этом строкой состояния, а не молча делает вид, что мышь работает. */
+static void apply_kmouse(void){
+    int m = (opt_defmachine>=0 && opt_defmachine<N_MACHINES) ? opt_defmachine : 0;
+    if(opt_kmouse < 0 || opt_kmouse > 2) opt_kmouse = 0;
+    if(g_km_cap < 0) g_km_cap = (LOAD_CAPS_R & LOADCAP_KMOUSE) ? 1 : 0;
+    if(opt_kmouse && !g_km_cap){ opt_kmouse = 0; dn_status_msg("NO KEMPSTON MOUSE IN THIS CORE"); }
+    g_mp[m].kmouse = opt_kmouse;
+    /* Кнопки и разгон обнуляем ПРИ ЛЮБОЙ смене режима: выключение мыши с зажатой кнопкой оставило
+       бы её нажатой в последнем отданном слове. */
+    g_km_btn = 0; g_km_hold_t = 0;
+    g_km_last = 0xFFFFFFFFu;      /* бит разрешения поменялся - слово обязано уехать заново */
+    kmouse_eval();
+    if(opt_kmouse == 2)      dn_status_msg("KEMPSTON MOUSE: KEYPAD 8246, 7913 DIAG, 0/5 LEFT, ENTER RIGHT");
+    else if(opt_kmouse == 1) dn_status_msg("KEMPSTON MOUSE: PORTS ON, NO POINTER");
+    else                     dn_status_msg("KEMPSTON MOUSE OFF");
+}
+/* v0.15.292 NEMO-IDE - ОБЫЧНАЯ МАШИННАЯ ОПЦИЯ. Применяется живьём, как SAA1099 или ROM SET:
+   выключили - файл закрыт и NEMO_CTL обнулён (машина видит «устройства нет»), включили - образ
+   открывается ПРЯМО СЕЙЧАС, а не при первой команде машины. Так отказ («нет файла», «не RS-IDE»)
+   виден в момент переключения, а не через полчаса, когда софт не найдёт диск. */
+static void apply_ide(void){
+    int m = (opt_defmachine>=0 && opt_defmachine<N_MACHINES) ? opt_defmachine : 0;
+    opt_ide = opt_ide ? 1 : 0;
+    g_mp[m].ide = opt_ide;
+    if(!opt_ide){ ide_close(); dn_status_msg("IDE OFF"); return; }
+    if(!ide_open()){
+        opt_ide = 0; g_mp[m].ide = 0;
+        { char s[80]; int k = 0;
+          for(const char* q = "NO IDE IMAGE: "; *q; q++) s[k++] = *q;
+          for(const char* q = ide_img_path(); *q && k < 78; q++) s[k++] = *q;
+          s[k] = 0; dn_status_msg(s); }
+        return;
+    }
+    { char s[64]; int k = 0;
+      for(const char* q = "IDE: "; *q; q++) s[k++] = *q;
+      for(const char* q = g_ide_name; *q && k < 40; q++) s[k++] = *q;
+      s[k++] = ' '; itoa_u(g_ide_secs, s + k); k = slen(s);
+      for(const char* q = " SEC"; *q; q++) s[k++] = *q;
+      s[k] = 0; dn_status_msg(s); }
+}
+/* v292: выбор устройств на шине. Пункт существует ради второго образа, но пока его нет, значение
+   может быть только MASTER - и строка говорит об этом вслух, а не показывает несбыточное. */
+static void apply_idedev(void){
+    int m = (opt_defmachine>=0 && opt_defmachine<N_MACHINES) ? opt_defmachine : 0;
+    if(!ide_slave_present()){
+        opt_idedev = 0;
+        dn_status_msg("IDE: MASTER ONLY - NO SECOND IMAGE");
+    }
+    g_mp[m].idedev = opt_idedev ? 1 : 0;
+}
+
+/* ============================ DIVMMC A+B (v0.15.327) ============================
+   Backend only until PL SPI/automap: FOLDER -> divmmc_fs synthetic FAT16, IMAGE -> raw
+   sectors from a file on the card. Same UX idea as NEMO-IDE (on/off, path, mount/eject). */
+#define DM_DEF_FOLDER "0:/DIVMMC"
+#define DM_DEF_IMAGE  "0:/DIVMMC.IMG"
+static FIL      g_dm_img;
+static int      g_dm_img_open = 0;
+static int      g_dm_img_rw = 0;        /* v0.15.397: образ открыт на запись */
+static uint32_t g_dm_c_wr = 0, g_dm_c_werr = 0;  /* v0.15.397: секторов записано / отказов */
+static uint32_t g_dm_c_ings;              /* v0.15.424: секторов обслужено ИЗНУТРИ расчёта звука */
+/* v0.15.425 ПРИБОРЫ ПУТИ ЗАПИСИ. Такты (ph_ccnt) между нашим ACK и СЛЕДУЮЩИМ запросом карты -
+   это время, которое esxDOS думает между секторами; без этого числа выбор linger - гадание. */
+static uint32_t g_dm_ack_t = 0;           /* такты последнего ACK (0 = не было) */
+static uint32_t g_dm_gap_max = 0, g_dm_gap_min = 0xFFFFFFFFu, g_dm_gap_sum = 0, g_dm_gap_n = 0;
+static uint32_t g_dm_drain_max = 0;       /* максимум секторов за один dmmc_drain */
+static uint32_t g_dm_where[4];            /* кто обслужил: 0 drain, 1 poke(звук), 2 bg_pump, 3 прочее */
+static int      g_dm_who = 3;
+static uint32_t g_dm_gap_h[10];           /* v426: гистограмма пауз, мс: <1,<2,<4,<8,<16,<32,<64,<128,<256,>= */
+static void dm_gap_note(void){            /* зовётся при взятии запроса */
+    if(g_dm_ack_t){
+        uint32_t d = (uint32_t)(ph_ccnt() - g_dm_ack_t);
+        uint32_t ms = d / (g_ph_1ms ? g_ph_1ms : 666000u);
+        int b = 0; while(b < 9 && ms >= (1u << b)) b++;
+        g_dm_gap_h[b]++;
+        if(d > g_dm_gap_max) g_dm_gap_max = d;
+        if(d < g_dm_gap_min) g_dm_gap_min = d;
+        g_dm_gap_sum += d >> 6; g_dm_gap_n++;
+    }
+    g_dm_where[g_dm_who & 3]++;
+}
+static int      g_dm_sync_due = 0;               /* v0.15.421: f_sync отложен, как у дискеты */
+/* v0.15.422: очередь записей. Фабрика ждёт WRACK в S_RXACK, и пока мы делали f_write
+   на каждый сектор, esxDOS `.mkdir` (кластер ~32 КБ = 64 сектора) стоял ~36 с.
+   Подтверждаем сразу, на карту сбрасываем в простое; чтение смотрит очередь. */
+#define DM_WQ_N 96
+static uint32_t dm_wq_lba[DM_WQ_N];
+static uint8_t  dm_wq_dat[DM_WQ_N][512] __attribute__((aligned(32)));
+static int      dm_wq_n  = 0;
+static int      dm_wq_hd = 0;
+static int      dm_wq_tl = 0;
+static uint32_t dm_wq_acc = 0;
+static uint32_t g_dm_img_secs = 0;
+static uint32_t g_dm_img_base = 0;
+static char     g_dm_name[64] = "";
+static int      g_dm_ready = 0;
+static int      g_dm_backend = 0;
+static XTime    g_dm_retry_t = 0;
+#define DM_RETRY_S  3u
+/* v360: «за этот сеанс машину ещё не перезапускали под готовую карту». См. шапку правки. */
+/* v363: «за этот сеанс машине ещё не отдавали чистый старт под готовую карту». Защёлка здесь, а
+   не в загрузке: там она взводилась до применения профиля машины и была ложной (найдено v362). */
+static int      g_dm_first_ready = 1;
+/* 🥇 v357 ОТМЕНЁННАЯ ПОПЫТКА, ЧТОБЫ НЕ ПОВТОРИЛИ. В v356 здесь стоял одноразовый признак: как
+   только том впервые поднимется, машина уходит в чистый старт уже с картой. На железе стало ХУЖЕ.
+   Замер (счётчики карты, опрос раз в 5 с после перезагрузки): на 5-й секунде карта УЖЕ живая -
+   51 команда, 40 чтений, то есть esxDOS в тот раз стартовал нормально; на 20-й мой сброс обнулил
+   счётчики, и дальше НОЛЬ команд за 40 секунд - машина после сброса не обратилась к карте вовсе.
+   Причина: перезапуск сам по себе НЕ воспроизводит включение питания - в ОЗУ DivMMC остаётся метка
+   esxDOS «я уже стартовал» ($2D42 = $AA), и он законно уходит мимо инициализации в 48 BASIC.
+   Приборно подтверждено, что память грязная: в окне 0x0FE00000 при живой плате 1099 ненулевых слов.
+   Правильный порядок - не «сбросить, когда будет готово», а «сделать готовым ДО первого запуска
+   машины»: поднять том синхронно на старте, стереть ОЗУ, запрограммировать карту, и только потом
+   отпускать машину. Это отдельная правка, и проверять её надо счётчиками, а не на глаз. */
+
+static const char* dm_path(void){
+    int m = (opt_defmachine>=0 && opt_defmachine<N_MACHINES) ? opt_defmachine : 0;
+    if(g_mp[m].dmfile[0]) return g_mp[m].dmfile;
+    return opt_dmmode ? DM_DEF_IMAGE : DM_DEF_FOLDER;
+}
+/* v366: путь лежит внутри смонтированной ПАПКИ DivMMC? Сравнение регистронезависимое - FatFs
+   регистр не различает, и `0:/divmmc/x` обязан считаться тем же, что `0:/DIVMMC/X`. Разделители
+   обоих видов, потому что пути к нам приходят и с хоста. */
+static int dm_path_inside(const char* p){
+    const char* r;
+    int i;
+    if(!p || !*p || opt_dmmode) return 0;          /* в режиме IMAGE папки нет */
+    r = dm_path();
+    if(!r || !*r) return 0;
+    for(i = 0; r[i]; i++){
+        char a = p[i], b = r[i];
+        if(a >= 'a' && a <= 'z') a = (char)(a - 32);
+        if(b >= 'a' && b <= 'z') b = (char)(b - 32);
+        if(a == '\\') a = '/';
+        if(b == '\\') b = '/';
+        if(a != b) return 0;
+    }
+    return (p[i] == 0 || p[i] == '/' || p[i] == '\\');   /* сама папка либо что-то внутри неё */
+}
+static void dm_set_name_from_path(const char* path){
+    const char* b = path; int i;
+    for(const char* q = path; *q; q++) if(*q=='/' || *q=='\\') b = q+1;
+    for(i=0; b[i] && i<(int)sizeof(g_dm_name)-1; i++) g_dm_name[i]=b[i];
+    g_dm_name[i]=0;
+    if(!g_dm_name[0]){ g_dm_name[0]='?'; g_dm_name[1]=0; }
+}
+static int  dm_wq_find(uint32_t lba);
+static void dm_wq_flush_one(void);
+static void dm_wq_flush_all(void);
+static int  dm_img_write_now(uint32_t lba, const uint8_t* buf);
+static void divmmc_close(void){
+    dm_wq_flush_all();
+    divmmc_fs_close();
+    if(g_dm_img_open){
+        if(g_dm_sync_due){ (void)f_sync(&g_dm_img); g_dm_sync_due = 0; }
+        f_close(&g_dm_img); g_dm_img_open = 0;
+    }
+    g_dm_img_secs = 0; g_dm_img_base = 0; g_dm_name[0] = 0;
+    g_dm_ready = 0; g_dm_backend = 0; g_dm_retry_t = 0;
+}
+static int divmmc_open_folder(const char* path){
+    int rc;
+    divmmc_close();
+    if(!path || !*path) path = DM_DEF_FOLDER;
+    divmmc_fs_set_format(opt_dmfat32 ? 1 : 0);                                 /* v359 */
+    divmmc_fs_set_rootent(opt_dmroot ? DMFS_ROOTENT_LFN : DMFS_ROOTENT_ESX);   /* v355 */
+    rc = divmmc_fs_build(path);
+    if(rc != DMFS_OK) return 0;
+    g_dm_backend = 0;
+    g_dm_ready = 1;
+    g_dm_img_secs = divmmc_fs_sectors();
+    dm_set_name_from_path(path);
+    return 1;
+}
+static int divmmc_open_image(const char* path){
+    FRESULT rr; UINT br; uint8_t hdr[16]; uint32_t sz;
+    divmmc_close();
+    if(!path || !*path) path = DM_DEF_IMAGE;
+    /* v0.15.397: сперва на ЧТЕНИЕ И ЗАПИСЬ, и только если не дали - на чтение. Иначе f_write вернул
+       бы FR_DENIED, и отказ записи объяснялся бы причиной, не имеющей отношения к делу. */
+    g_dm_img_rw = 0;
+    rr = f_open(&g_dm_img, path, FA_READ | FA_WRITE);
+    if(rr == FR_OK) g_dm_img_rw = 1;
+    else            rr = f_open(&g_dm_img, path, FA_READ);
+    if(rr != FR_OK) return 0;
+    sz = (uint32_t)f_size(&g_dm_img);
+    if(sz < 512u){ f_close(&g_dm_img); return 0; }
+    g_dm_img_base = 0;
+    if(f_read(&g_dm_img, hdr, 16, &br) == FR_OK && br == 16 &&
+       hdr[0]=='R' && hdr[1]=='S' && hdr[2]=='-' && hdr[3]=='I' &&
+       hdr[4]=='D' && hdr[5]=='E' && hdr[6]==0x1Au){
+        uint32_t d0 = (uint32_t)hdr[9] | ((uint32_t)hdr[10] << 8);   /* по 0x09, а не по 0x0A */
+        /* v365: 8-битный образ хранит сектор в 256 байтах (только младшие байты слов). Наш путь
+           делит размер на 512 всегда, поэтому такой файл читался бы со сдвигом - и МОЛЧА.
+           Отказываем вслух: лучше «не смонтировано», чем карта с мусором. */
+        if(hdr[8] & 1u){
+            f_close(&g_dm_img);
+            dn_status_msg("DIVMMC: 8-BIT HDF NOT SUPPORTED - CONVERT TO 16-BIT");
+            return 0;
+        }
+        if(d0 >= 0x16u && d0 < sz) g_dm_img_base = d0;
+    }
+    if(g_dm_img_base >= sz || ((sz - g_dm_img_base) < 512u)){
+        f_close(&g_dm_img); return 0;
+    }
+    g_dm_img_secs = (sz - g_dm_img_base) / 512u;
+    g_dm_img_open = 1;
+    g_dm_backend = 1;
+    g_dm_ready = 1;
+    dm_set_name_from_path(path);
+    return 1;
+}
+static int divmmc_open(void){
+    const char* p = dm_path();
+    return opt_dmmode ? divmmc_open_image(p) : divmmc_open_folder(p);
+}
+/* v0.15.397 ЗАПИСЬ В НОСИТЕЛЬ. Образ - прямо в файл по смещению, и сразу `f_sync`: питание могут
+   снять в любой момент, а FatFs держит каталог в памяти до закрытия файла. Папочный том - шаг 2:
+   `divmmc_fs_write` готов, но включать его надо после хостового стенда, поэтому честный отказ. */
+static int dm_wq_find(uint32_t lba){
+    int i;
+    for(i = dm_wq_n - 1; i >= 0; i--){
+        int idx = (dm_wq_hd + i) % DM_WQ_N;
+        if(dm_wq_lba[idx] == lba) return idx;
+    }
+    return -1;
+}
+static int dm_img_write_now(uint32_t lba, const uint8_t* buf){
+    UINT bw; FRESULT rr;
+    if(!g_dm_img_open || !g_dm_img_rw || !buf) return -1;
+    if(lba >= g_dm_img_secs) return -1;
+    rr = f_lseek(&g_dm_img, (FSIZE_t)g_dm_img_base + (FSIZE_t)lba * 512u);
+    if(rr != FR_OK) return -1;
+    rr = f_write(&g_dm_img, buf, 512u, &bw);
+    if(rr != FR_OK || bw != 512u) return -1;
+    g_dm_sync_due = 1;
+    return 0;
+}
+static void dm_wq_flush_one(void){
+    if(dm_wq_n <= 0) return;
+    if(dm_img_write_now(dm_wq_lba[dm_wq_hd], dm_wq_dat[dm_wq_hd]) != 0) g_dm_c_werr++;
+    dm_wq_hd = (dm_wq_hd + 1) % DM_WQ_N;
+    dm_wq_n--;
+}
+static void dm_wq_flush_all(void){
+    while(dm_wq_n > 0) dm_wq_flush_one();
+}
+static int dm_wq_push(uint32_t lba, const uint8_t* buf){
+    int i, ex;
+    if(!buf) return -1;
+    ex = dm_wq_find(lba);
+    if(ex >= 0){
+        for(i = 0; i < 512; i++) dm_wq_dat[ex][i] = buf[i];
+        dm_wq_acc = ph_ccnt();
+        return 0;
+    }
+    if(dm_wq_n >= DM_WQ_N) dm_wq_flush_one();
+    dm_wq_lba[dm_wq_tl] = lba;
+    for(i = 0; i < 512; i++) dm_wq_dat[dm_wq_tl][i] = buf[i];
+    dm_wq_tl = (dm_wq_tl + 1) % DM_WQ_N;
+    dm_wq_n++;
+    dm_wq_acc = ph_ccnt();
+    return 0;
+}
+static int divmmc_backend_write(uint32_t lba, const uint8_t* buf){
+    if(!g_dm_ready || !buf) return -1;
+    if(!card_write_ok()) return -1;
+    if(g_dm_backend == 0) return -1;
+    if(!g_dm_img_open || !g_dm_img_rw) return -1;
+    if(lba >= g_dm_img_secs) return -1;
+    if(dm_wq_push(lba, buf) != 0) return -1;
+    g_dm_c_wr++;
+    return 0;
+}
+static int divmmc_backend_read(uint32_t lba, uint8_t* buf){
+    UINT br;
+    int q, i;
+    if(!g_dm_ready || !buf) return -1;
+    if(g_dm_backend == 0) return divmmc_fs_read(lba, buf);
+    if(!g_dm_img_open || lba >= g_dm_img_secs) return -1;
+    q = dm_wq_find(lba);
+    if(q >= 0){
+        for(i = 0; i < 512; i++) buf[i] = dm_wq_dat[q][i];
+        return 0;
+    }
+    if(f_lseek(&g_dm_img, (FSIZE_t)g_dm_img_base + (FSIZE_t)lba * 512u) != FR_OK) return -1;
+    if(f_read(&g_dm_img, buf, 512, &br) != FR_OK || br != 512u) return -1;
+    return 0;
+}
+static uint8_t divmmc_mount(const char* path){
+    int m = (opt_defmachine>=0 && opt_defmachine<N_MACHINES) ? opt_defmachine : 0;
+    char prev[sizeof(g_mp[0].dmfile)]; int i; int is_dir = 0; int prev_mode; FILINFO fi;
+    if(!path || !*path) return 0xE1;
+    if(slen(path) >= (int)sizeof(g_mp[m].dmfile)) return 0xE2;
+    if(f_stat(path, &fi) != FR_OK) return 0xE3;
+    is_dir = (fi.fattrib & AM_DIR) ? 1 : 0;
+    for(i = 0; i < (int)sizeof(prev); i++) prev[i] = g_mp[m].dmfile[i];
+    prev_mode = g_mp[m].dmmode;
+    for(i = 0; path[i] && i < (int)sizeof(g_mp[m].dmfile)-1; i++) g_mp[m].dmfile[i] = path[i];
+    g_mp[m].dmfile[i] = 0;
+    opt_dmmode = is_dir ? 0 : 1;
+    g_mp[m].dmmode = opt_dmmode;
+    if(!(is_dir ? divmmc_open_folder(path) : divmmc_open_image(path))){
+        for(i = 0; i < (int)sizeof(prev); i++) g_mp[m].dmfile[i] = prev[i];
+        opt_dmmode = prev_mode ? 1 : 0;
+        g_mp[m].dmmode = opt_dmmode;
+        if(prev[0]){
+            if(prev_mode) divmmc_open_image(prev);
+            else          divmmc_open_folder(prev);
+        }
+        return 0xE4;
+    }
+    opt_divmmc = 1; g_mp[m].divmmc = 1;
+    return 0;
+}
+/* v355: смена числа записей корня = ПЕРЕСБОРКА тома. Делаем это тем же путём, что и смена
+   режима папка/образ: носитель закрывается и открывается заново, машина уходит в холодный старт. */
+/* v359: подсказки. Правило владельца - опция без объяснения, КОГДА её трогать, бесполезна. */
+static const char* note_dmfat(void){ return opt_dmfat32 ? " (root entries ignored)" : 0; }
+static const char* why_dmfat(void){
+    if(opt_dmfat32) return "FAT32: FOR PLAYERS WITH THEIR OWN DRIVER (WILD PLAYER, Z-PLAYER)";
+    return opt_dmroot ? "FAT16 + 512 ENTRIES: FOR THE LFN BROWSER"
+                      : "FAT16 + 2048 ENTRIES: FOR LOADING THROUGH esxDOS";
+}
+/* v0.15.405 Подсказка «сейчас этот переключатель не действует» - по образцу соседей. Запись
+   принимает ТОЛЬКО образ, открытый на чтение-запись: у папочного тома писать пока нечем, а образ
+   на карте может оказаться доступным только для чтения. */
+static int g_dm_prog;   /* fwd: объявлена ниже, а применению опции нужна здесь (см. apply_dmwrite) */
+/* v0.15.409 ЕДИНАЯ ТОЧКА РЕШЕНИЯ «примет ли карта запись». Одна карта на два транспорта, поэтому:
+   включён один - действует его выключатель; включены оба - более строгий; не включён никто - нет и
+   записи. Решение в ОДНОМ месте, чтобы показ в меню и поведение железа не могли разойтись. */
+static int card_write_ok(void){
+    int any = 0, allow = 1;
+    if(opt_divmmc){ any = 1; if(!opt_dmwr) allow = 0; }
+    if(opt_zc){     any = 1; if(!opt_zcwr) allow = 0; }
+    if(!any) return 0;
+    return allow && (g_dm_backend == 1) && g_dm_img_open && g_dm_img_rw;
+}
+static int card_both_on(void){ return (opt_divmmc && opt_zc) ? 1 : 0; }
+/* Честная пометка «сейчас этот переключатель не действует» - по образцу соседей. */
+static const char* note_wr_common(int mine){
+    if(!mine) return 0;
+    if(g_dm_backend != 1)              return " (folder volume: read only)";
+    if(g_dm_img_open && !g_dm_img_rw)  return " (image is read-only)";
+    if(card_both_on() && !card_write_ok()) return " (other transport keeps card read-only)";
+    return 0;
+}
+static const char* note_dmwr(void){ return note_wr_common(opt_dmwr); }
+static const char* note_zcwr(void){ return note_wr_common(opt_zcwr); }
+/* Правило владельца: опция без объяснения, КОГДА её трогать, бесполезна. */
+static const char* why_dmwr(void){
+    if(card_both_on()) return "ONE CARD FOR BOTH TRANSPORTS: WRITE NEEDS THIS AND THE Z-CONTROLLER SWITCH";
+    if(opt_dmwr)       return "ON: esxDOS AND SOFTWARE VIA #EB MAY WRITE TO THE MOUNTED IMAGE";
+    return "OFF = CARD READ ONLY FOR DIVMMC. SAFE DEFAULT";
+}
+static const char* why_zcwr(void){
+    if(card_both_on()) return "ONE CARD FOR BOTH TRANSPORTS: WRITE NEEDS THIS AND THE DIVMMC SWITCH";
+    if(opt_zcwr)       return "ON: KOE SOFTWARE VIA #77/#57 MAY WRITE TO THE MOUNTED IMAGE";
+    return "OFF = CARD READ ONLY FOR Z-CONTROLLER. SAFE DEFAULT";
+}
+static void apply_cardwr(void){
+    opt_dmwr = opt_dmwr ? 1 : 0; opt_zcwr = opt_zcwr ? 1 : 0;
+    g_dm_prog = 0;                     /* признак СОСТОЯНИЯ: обнулили - служба поднимет карту заново
+                                          (защита записи - свойство карты, значит и вставка заново) */
+    dn_status_msg(card_write_ok() ? "CARD WRITE ENABLED FOR THE MOUNTED IMAGE"
+                                  : "CARD IS READ ONLY");
+}
+static void apply_dmfat32(void){
+    opt_dmfat32 = opt_dmfat32 ? 1 : 0;
+    dn_status_msg(opt_dmfat32 ? "DIVMMC FOLDER: FAT32 - FOR PLAYERS"
+                              : "DIVMMC FOLDER: FAT16 - FOR esxDOS");
+    apply_dmmode();                      /* он и перемонтирует, и перезапустит машину */
+}
+static void apply_dmroot(void){
+    opt_dmroot = opt_dmroot ? 1 : 0;
+    dn_status_msg(opt_dmroot ? "DIVMMC ROOT: 512 - FOR THE LFN BROWSER"
+                             : "DIVMMC ROOT: 2048 - FOR esxDOS LOADING");
+    apply_dmmode();                      /* он и перемонтирует, и перезапустит машину */
+}
+static void apply_divmmc(void){
+    int m = (opt_defmachine>=0 && opt_defmachine<N_MACHINES) ? opt_defmachine : 0;
+    opt_divmmc = opt_divmmc ? 1 : 0;
+    g_mp[m].divmmc = opt_divmmc;
+    /* 🥇 v342 СМЕНА DivMMC = СМЕНА ПЗУ И СЛОВА МАШИНЫ, а не только монтирование папки.
+       Раньше этот обработчик открывал том и на этом заканчивался: слово MACHINE_CFG в фабрику никто
+       не проталкивал (бит17 ставится в machine_cfg_word, а зовут её только apply_machine и правки
+       ПЗУ), и страница ПЗУ 2 оставалась прежней. Приборно это выглядело как «опция включена, а
+       DivMMC не работает»: DMMC_STAT ноль, MACHINE_CFG без бита17, машина в 128-меню.
+       rom_reapply_and_reset делает ровно то, что нужно, и в правильном порядке: заливает страницы
+       (с нашим перекрытием ESXMMC.ROM), проталкивает слово, сбрасывает машину с уже готовым ПЗУ. */
+    if(!opt_divmmc){ divmmc_close(); rom_reapply_and_reset(); dn_status_msg("DIVMMC OFF"); return; }
+    if(!divmmc_open()){
+        opt_divmmc = 0; g_mp[m].divmmc = 0;
+        { char s[80]; int k=0;
+          for(const char* q="NO DIVMMC: "; *q; q++) s[k++]=*q;
+          for(const char* q=dm_path(); *q && k<78; q++) s[k++]=*q;
+          s[k]=0; dn_status_msg(s); }
+        return;
+    }
+    { char s[64]; int k=0;
+      for(const char* q = opt_dmmode ? "DIVMMC IMG: " : "DIVMMC FOLDER: "; *q; q++) s[k++]=*q;
+      for(const char* q=g_dm_name; *q && k<48; q++) s[k++]=*q;
+      s[k++]=' '; itoa_u(g_dm_img_secs, s+k); k=slen(s);
+      for(const char* q=" SEC"; *q; q++) s[k++]=*q;
+      s[k]=0; dn_status_msg(s); }
+    dmmc_program();                   /* карта обязана быть готова ДО того, как машина пойдёт с CMD0 */
+    rom_reapply_and_reset();          /* ПЗУ esxDOS в страницу 2 + слово в фабрику + сброс машины */
+}
+/* v379: независимое открытие носителя Z-Controller */
+static const char* zc_path(void){
+    int m = (opt_defmachine>=0 && opt_defmachine<N_MACHINES) ? opt_defmachine : 0;
+    if(g_mp[m].zcfile[0]) return g_mp[m].zcfile;
+    return opt_zcmode ? "0:/SDCARD.IMG" : "0:/DIVMMC/";
+}
+
+static int zc_open(void){
+    const char* p = zc_path();
+    if(opt_zcmode) return divmmc_open_image(p);
+    int rc;
+    divmmc_close();
+    if(!p || !*p) p = "0:/DIVMMC/";
+    divmmc_fs_set_format(opt_zcfat32 ? 1 : 0);
+    divmmc_fs_set_rootent(opt_zcroot ? DMFS_ROOTENT_LFN : DMFS_ROOTENT_ESX);
+    rc = divmmc_fs_build(p);
+    if(rc != DMFS_OK) return 0;
+    g_dm_backend = 0;
+    g_dm_ready = 1;
+    g_dm_img_secs = divmmc_fs_sectors();
+    dm_set_name_from_path(p);
+    return 1;
+}
+
+/* v350/v379: включение Z-Controller с независимым носителем и файловой системой */
+static void apply_zc(void){
+    int m = (opt_defmachine>=0 && opt_defmachine<N_MACHINES) ? opt_defmachine : 0;
+    opt_zc = opt_zc ? 1 : 0;
+    g_mp[m].zc = opt_zc;
+    if(opt_zc){
+        if(!zc_open()){
+            opt_zc = 0; g_mp[m].zc = 0;
+            dn_status_msg("Z-CONTROLLER: MOUNT FAILED");
+            return;
+        }
+    } else {
+        if(!opt_divmmc) divmmc_close();
+    }
+    dmmc_program();
+    MACHINE_CFG = machine_cfg_word();
+    dn_status_msg(opt_zc ? "Z-CONTROLLER: ON (#77/#57)" : "Z-CONTROLLER: OFF");
+}
+/* 🥇 v0.15.386 КТО ЗАТРЕБОВАЛ НОСИТЕЛЬ, ПО ТОГО НАСТРОЙКАМ ОН И МОНТИРУЕТСЯ.
+   Карта в фабрике ОДНА на оба транспорта, и служба ниже открывала том всегда путём DivMMC - то есть
+   его режимом (папка/образ), его файловой системой и его числом записей корня. Настройка
+   Z-Controller при этом жила ровно до первого вмешательства службы: ленивое монтирование при старте
+   платы или пересборка тома после правки папки возвращали FAT16 (умолчание DivMMC), хотя у ZC
+   умолчание FAT32. Снаружи это выглядело так: Proteus показывал FAT16 при выставленном FAT32, а
+   Wild Player (свой драйвер FAT32) карту не видел вовсе; помогало выключить и включить ZC.
+   Приоритет у DivMMC: esxDOS живёт в странице ПЗУ и стартует раньше, поэтому при включённых обоих
+   транспортах менять формат под ZC значило бы сломать работающий esxDOS. Это НЕ произвол оболочки, а
+   следствие одной карты на два транспорта - о чём и сказано в окне Z-диска. */
+static int dm_media_open(void){
+    if(opt_divmmc) return divmmc_open();   /* esxDOS главный потребитель: его режим и его ФС */
+    if(opt_zc)     return zc_open();       /* только Z-Controller: его носитель, режим и ФС */
+    return 0;
+}
+static void apply_dmmode(void){
+    int m = (opt_defmachine>=0 && opt_defmachine<N_MACHINES) ? opt_defmachine : 0;
+    opt_dmmode = opt_dmmode ? 1 : 0;
+    g_mp[m].dmmode = opt_dmmode;
+    if(!opt_divmmc){ dn_status_msg(opt_dmmode ? "DIVMMC MODE: IMAGE" : "DIVMMC MODE: FOLDER"); return; }
+    apply_divmmc();
+}
+/* ============================ МОСТ «ПРОШИВКА <-> КАРТА DivMMC» ============================
+   Полное обоснование - в шапке divmmc_card.v и в DIVMMC_PLAN.md. Здесь только то, что нужно
+   читающему код. Порядок монтирования ОБЯЗАТЕЛЕН: CAP, CSD, CID, потом CTL - у DMMC_CAP нет
+   своего строба, он защёлкивается тем же тогглом, что и DMMC_CTL. */
+static uint32_t g_dm_cap = 0;        /* ёмкость КАРТЫ в секторах, кратна 1024 (>= размера тома) */
+static uint32_t g_dm_ctl = 0;        /* базовое слово: EN|CCS|WP. FSM_RST здесь НИКОГДА не живёт */
+static int      g_dm_prog;            /* карта запрограммирована в ЭТОМ битстриме (0 при старте:
+                                         статические переменные обнуляются, объявление выше - fwd) */
+static int      g_dm_cap_ok = -1;    /* кэш «в ядре есть DivMMC»; сбрасывать при смене ядра */
+static uint8_t  g_dm_sec[512];       /* СТАТИК: насос зовут из bg_pump вглубь интерфейса */
+static uint32_t g_dm_c_rd, g_dm_c_zero, g_dm_c_err, g_dm_c_ptr, g_dm_c_lost, g_dm_c_hang;
+
+/* Пауза между стробами буфера. Движок карты принимает новый строб только когда доигралась
+   предыдущая пачка (5-6 тактов aclk = 50-60 нс), а автомат записи AXI короче. Настоящего темпа
+   записей с ARM никто не мерил, поэтому здесь И пауза, И сверка указателя: пауза делает потерю
+   маловероятной, сверка делает её ЗАМЕТНОЙ. */
+static inline void dm_gap(void){
+    uint32_t need = (g_ph_cpum ? g_ph_cpum : 666u) / 8u;   /* ~125 нс */
+    uint32_t t0 = ph_ccnt();
+    while((uint32_t)(ph_ccnt() - t0) < need){ }
+}
+static uint8_t dm_crc7(const uint8_t* p, int n){
+    uint8_t crc = 0; int k, i;
+    for(k = 0; k < n; k++){
+        uint8_t b = p[k];
+        for(i = 0; i < 8; i++){
+            uint8_t bit = (uint8_t)(((crc >> 6) ^ (b >> 7)) & 1u);
+            crc = (uint8_t)((crc << 1) & 0x7Fu);
+            if(bit) crc ^= 0x09u;
+            b = (uint8_t)(b << 1);
+        }
+    }
+    return crc;
+}
+/* CSD v2.0: esxDOS берёт объём ТОЛЬКО из C_SIZE и умножает на 1024 - отсюда и требование
+   кратности ёмкости, и обратная формула здесь. */
+static void dm_build_csd(uint8_t* c, uint32_t cap){
+    uint32_t csize = (cap / 1024u) - 1u; int i;
+    for(i = 0; i < 16; i++) c[i] = 0;
+    c[0]=0x40; c[1]=0x0E; c[2]=0x00; c[3]=0x32; c[4]=0x5B; c[5]=0x59; c[6]=0x00;
+    c[7]=(uint8_t)((csize>>16)&0x3Fu); c[8]=(uint8_t)((csize>>8)&0xFFu); c[9]=(uint8_t)(csize&0xFFu);
+    c[10]=0x7F; c[11]=0x80; c[12]=0x0A; c[13]=0x40; c[14]=0x40;
+    c[15]=(uint8_t)((dm_crc7(c,15)<<1)|1u);
+}
+static void dm_build_cid(uint8_t* c){
+    static const uint8_t t[15] = {0xBB,'B','L','B','U','L','B','U',0x15,0x42,0x55,0x4C,0x42,0x01,0xA8};
+    int i; for(i = 0; i < 15; i++) c[i] = t[i];
+    c[15]=(uint8_t)((dm_crc7(c,15)<<1)|1u);
+}
+/* 🥇 Указатель сверяем СРАЗУ, до первого слова. Потерянный строб DMMC_BUFA иначе отправил бы весь
+   блок в ЧУЖОЙ буфер, и заметить это было бы нечем: данные ушли бы правдоподобные, но не те.
+   Указатель переживает и FSM_RST, и сброс машины, поэтому на входе он всегда чужой. */
+static int dm_setptr(uint32_t base){
+    int t;
+    for(t = 0; t < 3; t++){
+        DMMC_BUFA = base; dm_gap();
+        if((DMMC_BUFA & 0x7FFu) == (base & 0x7FFu)) return 0;
+        g_dm_c_ptr++;
+    }
+    g_dm_c_lost++; return -1;
+}
+static int dm_wrbuf(uint32_t base, const uint8_t* p, uint32_t n){
+    uint32_t i;
+    if(dm_setptr(base) != 0) return -1;
+    for(i = 0; i < n; i += 4u){
+        DMMC_BUFW = (uint32_t)p[i] | ((uint32_t)p[i+1]<<8) |
+                    ((uint32_t)p[i+2]<<16) | ((uint32_t)p[i+3]<<24);
+        dm_gap();
+    }
+    if((DMMC_BUFA & 0x7FFu) != ((base + n) & 0x7FFu)){ g_dm_c_lost++; return -1; }
+    return 0;
+}
+/* 🥇 ОЗУ DivMMC - КАК ПРИ ВКЛЮЧЕНИИ ПИТАНИЯ. Полное обоснование - в шапке правки v345 и в
+   хэндовере: esxDOS держит в нём метку «я уже стартовал» ($2D42 = $AA), а у нас это окно DDR,
+   которое не обнуляет ничто. С меткой он уходит мимо инициализации карты в 48 BASIC, не послав
+   ни одной команды - и это ровно тот отказ, который мы ловили полночи.
+   ⚠ РОВНО 128 КБ от базы окна: сразу за ними в том же мегабайте лежат расширенные банки
+   Пентагона, и ошибка в границе сотрёт память машины. */
+#define DMMC_RAM_BASE 0x0FE00000u
+#define DMMC_RAM_SZ   0x00020000u        /* 16 страниц по 8 КБ = 128 КБ, весь адресуемый объём */
+static void dmmc_ram_wipe(void){
+    volatile uint32_t* p = (volatile uint32_t*)DMMC_RAM_BASE;
+    uint32_t i;
+    for(i = 0; i < DMMC_RAM_SZ / 4u; i++) p[i] = 0u;
+    Xil_DCacheFlushRange((INTPTR)DMMC_RAM_BASE, DMMC_RAM_SZ);   /* машина читает ЧЕРЕЗ DDR, не через кеш */
+}
+/* v350: носитель монтируем, если включён ХОТЬ ОДИН транспорт. Иначе Z-Controller получил бы
+   карту, которой нечего отдавать, - и это выглядело бы как «карта есть, файлов нет». */
+static int dm_media_needed(void){ return opt_divmmc || opt_zc; }
+static void dmmc_program(void){
+    uint8_t csd[16], cid[16];
+    g_dm_prog = 0;
+    if(g_dm_cap_ok < 0) g_dm_cap_ok = (LOAD_CAPS_R & LOADCAP_DIVMMC) ? 1 : 0;
+    if(!g_dm_cap_ok) return;                       /* ядро без карты - регистров не трогаем вовсе */
+    if(!dm_media_needed() || !g_dm_ready || g_dm_img_secs == 0u){
+        DMMC_CTL = DMC_FSMRST;                     /* EN сброшен: карта вынута, автомат в исходном */
+        return;
+    }
+    g_dm_cap = ((g_dm_img_secs + 1023u) / 1024u) * 1024u;   /* ВВЕРХ: вниз MBR торчал бы за конец */
+    /* v0.15.397: защиту записи снимаем ТОЛЬКО когда носитель её реально примет - образ, открытый
+       на запись, при разрешённой опции. Иначе оставляем WP: машина увидит честную «карту только на
+       чтение» вместо записи, которая никуда не легла. */
+    {   int wr_ok = card_write_ok();          /* v0.15.409: одна точка решения на оба транспорта */
+        g_dm_ctl = DMC_EN | DMC_CCS | (wr_ok ? 0u : DMC_WP) | (opt_dmfast ? DMC_FAST : 0u);   /* v427 */
+    }
+    DMMC_CTL = DMC_FSMRST;
+    dm_build_csd(csd, g_dm_cap);
+    dm_build_cid(cid);
+    DMMC_CAP = g_dm_cap;
+    if(dm_wrbuf(DMB_CSD, csd, 16u) != 0) return;   /* мусор вместо CSD = неверный объём у esxDOS */
+    if(dm_wrbuf(DMB_CID, cid, 16u) != 0) return;
+    dmmc_ram_wipe();                               /* карта поднимается заново - значит и ОЗУ как при включении */
+    DMMC_CTL = g_dm_ctl;                           /* вставили карту И защёлкнули ёмкость одним стробом */
+    g_dm_prog = 1;
+}
+/* Устойчивое чтение ПОЛЕЙ ЗАПРОСА. Стабилизировать слово целиком нельзя - состояние и счётчики в
+   нём меняются каждый такт, цикл не сошёлся бы никогда. Сверяем ровно младшие пять бит. */
+static uint32_t dm_stat_rq(void){
+    uint32_t a = DMMC_STAT, b = a; int i;
+    for(i = 0; i < 8; i++){ b = DMMC_STAT; if(((a ^ b) & 0x1Fu) == 0u) return b; a = b; }
+    return b;
+}
+/* v0.15.397 ОБСЛУЖИВАНИЕ ЗАПИСИ - зеркало dm_serve_read. Сектор, записанный машиной, фабрика
+   сложила в свой буфер по базе DMB_WRA; читаем его словами (чтение DMMC_BUFR само двигает
+   указатель и отдаёт четыре байта). Подтверждение обязано вернуть ТОТ ЖЕ номер запроса - иначе
+   фабрика будет ждать вечно, а машина стоять в S_RXWAIT; при отказе поднимаем DMC_WRERR, чтобы
+   софт получил честную ошибку записи вместо тишины. */
+static void dm_serve_write(uint32_t st){
+    uint32_t seq = DMS_SEQ(st);
+    uint32_t lba = DMMC_LBA;                 /* достоверен только пока запрос поднят */
+    uint32_t err = 0, i, t0, lim, w;
+    dm_gap_note();                           /* v425: прибор - сколько молчал esxDOS */
+    if(dm_setptr(DMB_WRA) != 0) err = DMC_WRERR;
+    else {
+        for(i = 0; i < 512u; i += 4u){
+            w = DMMC_BUFR; dm_gap();
+            g_dm_sec[i]   = (uint8_t)(w & 0xFFu);
+            g_dm_sec[i+1] = (uint8_t)((w >> 8) & 0xFFu);
+            g_dm_sec[i+2] = (uint8_t)((w >> 16) & 0xFFu);
+            g_dm_sec[i+3] = (uint8_t)((w >> 24) & 0xFFu);
+        }
+        if(divmmc_backend_write(lba, g_dm_sec) != 0) err = DMC_WRERR;
+    }
+    if(err) g_dm_c_werr++;
+    DMMC_CTL = g_dm_ctl | DMC_WSEQ(seq) | DMC_WRACK | err;
+    g_dm_ack_t = ph_ccnt();                  /* v425: точка отсчёта паузы esxDOS */
+    lim = (g_ph_cpum ? g_ph_cpum : 666u) * 2000u; t0 = ph_ccnt();
+    while(DMMC_STAT & DMS_RQ_WR){
+        if((uint32_t)(ph_ccnt() - t0) > lim){ g_dm_c_hang++; break; }
+    }
+}
+static void dm_serve_read(uint32_t st){
+    uint32_t seq = DMS_SEQ(st);
+    uint32_t buf = DMS_RBUF(st) ^ 1u;      /* наполняем НЕ тот, из которого карта отдаёт сейчас */
+    uint32_t lba = DMMC_LBA;               /* достоверен только пока запрос поднят */
+    uint32_t err = 0, i, t0, lim;
+    int rc;
+    dm_gap_note();                           /* v425 */
+    if(lba < g_dm_img_secs)   rc = divmmc_backend_read(lba, g_dm_sec);
+    else if(lba < g_dm_cap) { for(i=0;i<512u;i++) g_dm_sec[i]=0; rc = 0; g_dm_c_zero++; }
+    else                      rc = -1;     /* за концом карты - честный отказ */
+    if(rc != 0){ for(i=0;i<512u;i++) g_dm_sec[i]=0; err = DMC_RDERR; g_dm_c_err++; }
+    if(dm_wrbuf(buf ? DMB_RDB : DMB_RDA, g_dm_sec, 512u) != 0) err = DMC_RDERR;
+    DMMC_CTL = g_dm_ctl | DMC_RSEQ(seq) | DMC_RDACK | err | (buf ? DMC_RBUF : 0u);
+    g_dm_ack_t = ph_ccnt();                  /* v425 */
+    g_dm_c_rd++;
+    /* Дождаться снятия запроса, но с потолком: главный цикл не имеет права встать на регистре. */
+    lim = (g_ph_cpum ? g_ph_cpum : 666u) * 2000u; t0 = ph_ccnt();
+    while(DMMC_STAT & DMS_RQ_RD){
+        if((uint32_t)(ph_ccnt() - t0) > lim){ g_dm_c_hang++; break; }
+    }
+}
+/* Насос. Дешёвый: регистры плюс один сектор из тома. Тяжёлое (открытие тома) живёт в
+   divmmc_service. Защита от рекурсии обязательна - насос зовут из мест, куда он возвращается. */
+static void dmmc_pump(void){
+    static int in = 0;
+    int n;
+    if(in || !g_dm_prog) return;
+    in = 1;
+    for(n = 0; n < 16; n++){         /* ACK дешёвый; 4 мало, когда mkdir шлёт кластер подряд */
+        uint32_t st = dm_stat_rq();
+        if(st & DMS_RQ_RD)      dm_serve_read(st);
+        else if(st & DMS_RQ_WR) dm_serve_write(st);
+        else break;
+    }
+    in = 0;
+}
+/* 🥇 v0.15.423: очередь 422 подтверждает сразу, но насос звался РАЗ за проход, ПОСЛЕ
+   gs_service (до 134 мс звука). esxDOS пишет сектор, ждёт ACK, пишет следующий — в FPGA
+   пачка не копится, и `.mkdir` (кластер ~64 сектора) снова стоял ~36 с. Правило одно:
+   держать насос, пока карта просит, и ещё ~20 мс после последнего запроса — следующий
+   CMD24 успевает родиться. Если запросов нет — выходим сразу, звук GS не трогаем.
+   Потолок 250 мс: длинная запись не душит карту GS (сторож шины ~148 мс). */
+/* v0.15.424 Один запрос карты - и назад к звуку. Никакого linger: следующий сэмпл через ~65 мкс
+   всё равно снова заглянет сюда. Только чтение регистра, если запроса нет. */
+static void dmmc_poke(void){
+    uint32_t st;
+    if(!g_dm_prog) return;
+    st = DMMC_STAT;                          /* дешёвое одиночное чтение; стабилизация - в насосе */
+    if(!(st & (DMS_RQ_RD | DMS_RQ_WR))) return;
+    st = dm_stat_rq();
+    g_dm_who = 1;
+    if(st & DMS_RQ_RD)      { dm_serve_read(st);  g_dm_c_ings++; }
+    else if(st & DMS_RQ_WR) { dm_serve_write(st); g_dm_c_ings++; }
+    g_dm_who = 3;
+}
+static void dmmc_drain(void){
+    uint32_t t0, lim, n = 0;
+    if(!g_dm_prog) return;
+    if(!(dm_stat_rq() & (DMS_RQ_RD | DMS_RQ_WR))) return;
+    t0 = ph_ccnt();
+    lim = (g_ph_1ms ? g_ph_1ms : 666000u) * 250u;
+    /* 🥇 v0.15.425 LINGER УБРАН. Прибор показал: 20 мс ожидания ни разу не поймали следующий сектор
+       (esxDOS думает дольше), зато 264 × 20 мс = 5 с чистого простоя за mkdir, во время которого
+       стоят и звук, и главный цикл, и poke. Обслуживаем всё, что есть СЕЙЧАС, и выходим; момент
+       готовности esxDOS ловит poke внутри звука (каждые ~65 мкс). */
+    for(;;){
+        uint32_t st = dm_stat_rq();
+        if(!(st & (DMS_RQ_RD | DMS_RQ_WR))) break;
+        g_dm_who = 0;
+        dmmc_pump();
+        g_dm_who = 3;
+        n++;
+        KBD_HB = 1;
+        if((uint32_t)(ph_ccnt() - t0) > lim) break;
+    }
+    if(n > g_dm_drain_max) g_dm_drain_max = n;
+}
+/* v0.15.394: пометку ставит kbd_note (она видит КАЖДОЕ нажатие), работу делает служба ниже. */
+static int g_hard_rst_req = 0;
+/* 🥇 v0.15.394 ДВЕ КЛАВИШИ СБРОСА, И РАЗНИЦА МЕЖДУ НИМИ ТЕПЕРЬ ЧЕСТНАЯ (просьба владельца 20.08).
+   F11 - «железная кнопка»: фабрика сбрасывает машину с очисткой ОЗУ (`hard_combo = f11_h`), а
+   прошивка добивает то, до чего фабрика не достаёт - ВИРТУАЛЬНЫЕ приборы. Первым делом карта
+   General Sound: она живёт эмуляцией на ARM, F11 её не касался вовсе, и после сброса машины её
+   драйвер начинал с нуля, а карта помнила прежнее состояние - расхождение, которое выглядит как
+   «GS не найден» или как молчащая музыка.
+   Ctrl+Alt+Del - «мягкая»: фабрика даёт короткий сброс с СОХРАНЕНИЕМ ОЗУ (`soft_combo`), и
+   виртуальные приборы прошивка НЕ трогает намеренно - смысл этого аккорда именно в том, чтобы
+   перезапустить один Спектрум.
+   Почему служба, а не обработчик клавиши: `gs_boot()` читает ПЗУ карты с SD, а `kbd_note` зовут из
+   любого контекста, включая ожидание клавиши внутри модального окна. */
+static void hard_reset_service(void){
+    if(!g_hard_rst_req) return;
+    g_hard_rst_req = 0;
+    if(!g_gs_live) return;                       /* карта выключена в опциях - перезапускать нечего */
+    if(gs_boot()){ gs_meter_reset(); dn_status_msg("F11: GENERAL SOUND RESTARTED WITH THE MACHINE"); }
+    else                             dn_status_msg("F11: GS RESTART FAILED - CHECK 0:/GS/GS105B.ROM");
+}
+static void divmmc_service(void){
+    if(!dm_media_needed()){
+        if(g_dm_ready) divmmc_close();
+        if(g_dm_prog){ DMMC_CTL = DMC_FSMRST; g_dm_prog = 0; }
+        return;
+    }
+    /* v343: было «пробное чтение нулевого сектора». Его выкинули по двум причинам: карту оно не
+       программировало вовсе, а `divmmc_fs_read` попутно исполняет отложенные удаления - то есть
+       «проверка живости» могла удалять файлы. */
+    /* v366: папку правили - пересобираем том и отдаём машине чистый старт. Физический аналог:
+       вынули карту, положили файл, вставили обратно. */
+    if(g_dm_dirty && g_dm_ready){
+        g_dm_dirty = 0;
+        if(dm_media_open()){
+            dmmc_program();
+            dmmc_ram_wipe();
+            machine_cold_restart();
+            dn_status_msg(opt_divmmc ? "DIVMMC FOLDER CHANGED - VOLUME REBUILT, MACHINE RESTARTED" : "Z-CONTROLLER FOLDER CHANGED - VOLUME REBUILT, MACHINE RESTARTED");
+        } else {
+            dn_status_msg(opt_divmmc ? "DIVMMC: REBUILD FAILED - CHECK THE FOLDER" : "Z-CONTROLLER: REBUILD FAILED - CHECK THE FOLDER");
+        }
+        return;
+    }
+    if(g_dm_ready){
+        if(!g_dm_prog) dmmc_program();
+        /* Карта готова и запрограммирована - отдаём машине чистый старт уже С НЕЙ. Ровно один раз
+           за сеанс, и БЕЗ повторного программирования карты (см. шапку: именно оно ломало v356). */
+        if(g_dm_first_ready && g_dm_prog){
+            /* 🥇 v361 СТИРАНИЕ ОБЯЗАТЕЛЬНО, И ЭТО ПРОВЕРЕНО ДОРОГО. esxDOS, не найдя карту при
+               первом старте, всё равно оставляет в СВОЁМ ОЗУ метку «я уже стартовал» ($2D42),
+               и следующий сброс он проходит МИМО инициализации - ноль команд к карте.
+               В опыте по JTAG я стирал все 128 КБ, а на нули проверял только первые 8 - метка
+               при вставленной странице 3 лежит по смещению 0x6D42 и в осмотр не попала, отчего
+               я решил, будто хватает одного сброса. Не хватает: нужны ОБА действия. */
+            g_dm_first_ready = 0;
+            dmmc_ram_wipe();              /* ОЗУ DivMMC - как при включении питания */
+            machine_cold_restart();       /* и только теперь чистый старт машины */
+            dn_status_msg(opt_divmmc ? "DIVMMC READY - MACHINE RESTARTED" : "Z-CONTROLLER READY - MACHINE RESTARTED");
+        }
+        return;
+    }
+    { XTime now; XTime_GetTime(&now);
+      if(g_dm_retry_t && (now - g_dm_retry_t) < (XTime)COUNTS_PER_SECOND * DM_RETRY_S) return;
+      g_dm_retry_t = now; }
+    if(dm_media_open()) g_dm_retry_t = 0;
+}
+static void gs_service(void){
+    /* v0.15.308: о потерянном байте говорим ЗДЕСЬ, а не в насосе флагов: там мы внутри
+       расчёта звука, и отрисовка строки состояния стоила бы сэмплов. Удержание (а не мигающее
+       сообщение) нужно потому, что отказ случается посреди загрузки, когда строка активно
+       перерисовывается, и обычное сообщение смыло бы тем же тиком музыки. */
+    /* B0119 ПРИБОР ОБРАТНОГО ДАВЛЕНИЯ. Читаем РЕДКО: каждое обращение к некэшируемому регистру
+       ПЛИС стоит сотни наносекунд, а служба крутится сотни тысяч раз в секунду - в насос флагов
+       (он идёт на каждом проходе) это класть нельзя, там за лишние чтения платит звук. Раз в 512
+       проходов службы диагностике хватает с запасом. */
+    {   static unsigned tick = 0;
+        if((++tick & 511u) == 0u){
+            g_gs_bp2 = gs_rd2(GS_ST2_P, g_gs_bp2);
+            g_gs_bp3 = gs_rd2(GS_ST3_P, g_gs_bp3);
+            gs_d_bp2 = g_gs_bp2; gs_d_bp3 = g_gs_bp3;
+            {   uint32_t lb = (g_gs_bp2 >> 16) & 0xFFFu, wd = g_gs_bp3 >> 30;
+                if(lb != g_gs_lost_say || wd != g_gs_wd_say){
+                    g_gs_lost_say = lb; g_gs_wd_say = wd; g_gs_ovr_say = 1;
+                }
+            }
+        }
+    }
+    if(g_gs_ovr_say){
+        XTime now; XTime_GetTime(&now);
+        if(!g_gs_ovr_t || (now - g_gs_ovr_t) > (XTime)(COUNTS_PER_SECOND * 3u)){
+            /* Говорим ШТУКАМИ и называем причину: с тактами ожидания байт может пропасть только
+               если сторож отпустил шину, то есть оболочка молчала дольше 148 мс. Без этого числа
+               владелец видел «7 эпизодов» и не мог узнать, семь это байт или семьсот. */
+            char m[64]; int k = 0;
+            uint32_t lb = (g_gs_bp2 >> 16) & 0xFFFu, wd = g_gs_bp3 >> 30;
+            for(const char* q = "GS: BYTES LOST x"; *q; q++) m[k++] = *q;
+            {   char d[12]; int j = 0; uint32_t n = lb;
+                if(!n) d[j++] = '0';
+                while(n){ d[j++] = (char)('0' + (n % 10u)); n /= 10u; }
+                while(j) m[k++] = d[--j]; }
+            if(wd){
+                for(const char* q = "  SHELL STALLED x"; *q; q++) m[k++] = *q;
+                {   char d[4]; int j = 0; uint32_t n = wd;
+                    if(!n) d[j++] = '0';
+                    while(n){ d[j++] = (char)('0' + (n % 10u)); n /= 10u; }
+                    while(j) m[k++] = d[--j]; }
+            }
+            m[k] = 0;
+            dn_status_hold(m);
+            g_gs_ovr_t = now; g_gs_ovr_say = 0;
+        }
+    }
+    uint32_t c = gs_ctl;
+    if(!c){
+        /* ленивый старт: опция включена в ini, но карта ещё не поднята. Делаем это ПОСЛЕ старта
+           оболочки, а не в загрузке - прогон инициализации занимает секунды. */
+        if(opt_gs && !g_gs_live && !g_gs_boot_try && sd_mounted) gs_boot();
+        gs_pump();
+        return;
+    }
+    if(c == 1){ gs_boot(); }
+    else if(c == 4){ disk_ring_snap(); }                  /* v282: прибор по дисководу */
+    else if(c == 5){ opt_ide = 1; apply_ide(); }           /* v285 отладочный путь; v292 - через штатное
+                                                              применение, иначе Save config записал бы
+                                                              в профиль старое значение опции */
+    else if(c == 6){ opt_ide = 0; apply_ide(); }
+    else if(c == 20){ ph_reset(); }            /* v297: начать пофазный замер с чистого листа */
+    else if(c == 7){ ide_trc_reset(); }                    /* v294: начать трассу IDE с чистого листа */
+    else if(c == 8){ g_ide_pthack = !g_ide_pthack; }       /* опыт: тип раздела FAT16 -> LBA-вариант */
+    else if(c == 2){
+        XTime a, b; uint32_t done = 0;
+        XTime_GetTime(&a);
+        for(int k = 0; k < 12; k++){ done += gs_run(1000000u); KBD_HB = 1; }
+        XTime_GetTime(&b);
+        gs_res_cyc = done;
+        gs_res_us  = (uint32_t)(((uint64_t)(b - a) * 1000000ull) / COUNTS_PER_SECOND);
+    }
+    gs_ctl = 0;    /* v265: команду снимаем ПОСЛЕДНЕЙ - иначе читающий видит результат ПРЕДЫДУЩЕГО
+                      прогона (замечание из раздела 15 хэндовера) */
+}
+
 static void autoload_tape(const char* dir, const char* name){
     int i=0; for(; dir[i] && i<79; i++) curpath[i]=dir[i]; curpath[i]=0;
     int j=0; for(; name[j] && j<NAMELEN; j++) flist[0][j]=name[j]; flist[0][j]=0;
@@ -3920,6 +9075,31 @@ static void autoload_tape(const char* dir, const char* name){
     else if(cicmp(e,"mp3")==0){ int sv=opt_mp3tape; opt_mp3tape=1; mp3_start(); opt_mp3tape=sv; }   /* force tape (known cassette) */
     else if(cicmp(e,"wav")==0) wav_start();
     else if(cicmp(e,"tap")==0||cicmp(e,"tzx")==0) tape_start();
+    else if(cicmp(e,"trd")==0||cicmp(e,"scl")==0){              /* v208 дискета, v218 + SCL (и путь JTAG-самотеста) */
+        char pp[192]; int n=0;
+        for(const char* q=dir; *q && n<180; q++) pp[n++]=*q;
+        if(n && pp[n-1] != '/') pp[n++]='/';
+        for(const char* q=name; *q && n<191; q++) pp[n++]=*q;
+        pp[n]=0;
+        g_fs_err = disk_mount(pp);
+    }
+    else if(cicmp(e,"hdf")==0){                                 /* v292: винчестер - тем же путём, что дискета */
+        char pp[192]; int n=0;
+        for(const char* q=dir; *q && n<180; q++) pp[n++]=*q;
+        if(n && pp[n-1] != '/') pp[n++]='/';
+        for(const char* q=name; *q && n<191; q++) pp[n++]=*q;
+        pp[n]=0;
+        g_fs_err = ide_mount(pp);
+    }
+    else if(cicmp(e,"img")==0 || cicmp(e,"vhd")==0 || cicmp(e,"mmc")==0){ /* v327 web */
+        char pp[192]; int n=0;
+        for(const char* q=dir; *q && n<180; q++) pp[n++]=*q;
+        if(n && pp[n-1] != '/') pp[n++]='/';
+        for(const char* q=name; *q && n<191; q++) pp[n++]=*q;
+        pp[n]=0;
+        g_fs_err = divmmc_mount(pp);
+    }
+    else if(cicmp(e,"nes")==0) nes_launch();                    /* v0.15.152: NES cart (web panel too) */
 }
 static void browser_enter(void){
     if(fcount==0 || bcursor>=fcount) return;
@@ -3930,6 +9110,52 @@ static void browser_enter(void){
         else if(cicmp(e,"wav")==0) wav_start();           /* Step 14.3: auto-detect pilot -> tape cassette, else play as music */
         else if(cicmp(e,"mp3")==0) mp3_start();           /* Step 14.3: same auto-detect for MP3 (turbo-loader archives are MP3) */
         else if(cicmp(e,"tap")==0 || cicmp(e,"tzx")==0) tape_start();   /* Step 14.2: real-time tape load (pulse replay); .tzx = turbo/custom loaders */
+        else if(cicmp(e,"trd")==0 || cicmp(e,"scl")==0){  /* v208 дискета, v218 + SCL (упакованный образ) */
+            char pp[192]; int n=0;
+            for(const char* q=curpath; *q && n<180; q++) pp[n++]=*q;
+            if(n && pp[n-1] != '/') pp[n++]='/';
+            for(const char* q=flist[bcursor]; *q && n<191; q++) pp[n++]=*q;
+            pp[n]=0;
+            int drv = drive_select_dialog(flist[bcursor]);   /* v221: спросить букву привода */
+            if(drv < 0) return;                              /* отменил - образ не трогаем */
+            uint8_t rc = disk_mount_drv(pp, drv);
+            { char m[40]; int k=0;
+              if(rc){ for(const char* q="DISK MOUNT FAILED"; *q; q++) m[k++]=*q; }
+              else  { for(const char* q="DISK IN "; *q; q++) m[k++]=*q; m[k++]=DRV_LTR[drv]; m[k++]=':'; }
+              m[k]=0; dn_status_msg(m); }
+        }
+        else if(cicmp(e,"hdf")==0){                       /* v292: образ винчестера -> вставить в NEMO-IDE */
+            char pp[192]; int n=0;
+            for(const char* q=curpath; *q && n<180; q++) pp[n++]=*q;
+            if(n && pp[n-1] != '/') pp[n++]='/';
+            for(const char* q=flist[bcursor]; *q && n<191; q++) pp[n++]=*q;
+            pp[n]=0;
+            uint8_t rc = ide_mount(pp);
+            if(rc == 0xE2)      dn_status_msg("IDE: PATH TOO LONG");
+            else if(rc)         dn_status_msg("IDE: NOT AN RS-IDE IMAGE");
+            else { char s[64]; int k=0;
+                   for(const char* q="IDE: "; *q; q++) s[k++]=*q;
+                   for(const char* q=g_ide_name; *q && k<40; q++) s[k++]=*q;
+                   s[k++]=' '; itoa_u(g_ide_secs, s+k); k=slen(s);
+                   for(const char* q=" SEC"; *q; q++) s[k++]=*q;
+                   s[k]=0; dn_status_msg(s); }
+        }
+        else if(cicmp(e,"img")==0 || cicmp(e,"vhd")==0 || cicmp(e,"mmc")==0){ /* v327 */
+            char pp[192]; int n=0;
+            for(const char* q=curpath; *q && n<180; q++) pp[n++]=*q;
+            if(n && pp[n-1] != '/') pp[n++]='/';
+            for(const char* q=flist[bcursor]; *q && n<191; q++) pp[n++]=*q;
+            pp[n]=0;
+            { uint8_t rc = divmmc_mount(pp);
+              if(rc == 0xE2) dn_status_msg("DIVMMC: PATH TOO LONG");
+              else if(rc) dn_status_msg("DIVMMC: MOUNT FAILED");
+              else { char s[64]; int k=0;
+                     for(const char* q="DIVMMC: "; *q; q++) s[k++]=*q;
+                     for(const char* q=g_dm_name; *q && k<40; q++) s[k++]=*q;
+                     s[k++]=' '; itoa_u(g_dm_img_secs, s+k); k=slen(s);
+                     for(const char* q=" SEC"; *q; q++) s[k++]=*q; s[k]=0; dn_status_msg(s); } }
+        }
+        else if(cicmp(e,"nes")==0) nes_launch();          /* v0.15.152: NES cart — switch to the NES core and boot it */
         return;
     }
     char came_from[NAMELEN+1]; came_from[0]=0;                 /* on ".." remember the folder we exit -> restore cursor onto it */
@@ -3962,7 +9188,16 @@ static void browser_enter(void){
    apply immediately but do not touch the card until you pick Save). Extensible: more [sections]/
    keys can be added later; the parser matches keys globally and ignores comments/section lines. ---- */
 static FIL  g_cfg;
-static char cfgbuf[1536] __attribute__((aligned(32)));   /* DMA target of f_read (cache-line aligned) */
+/* v0.15.175: было cfgbuf[1536] при конфиге 1936 Б - f_read молча ОБРЕЗАЛ файл, и последняя секция
+   машины (nes.*) не парсилась вообще: настройки экрана NES «не применялись», хотя лежали в ini.
+   Тот же размер, что у буфера записи (4 КБ), чтобы чтение и запись не могли разъехаться. */
+/* v0.15.292: 4 КБ стало мало. Пять машин × (25 числовых ключей + romset + ДВЕ карты кнопок +
+   новый idefile до 95 символов) плюс глобальные ключи и nes_boot дают в худшем случае ~4.2 КБ -
+   то есть ручной Save config упёрся бы в сторож «CONFIG TOO BIG» и молча перестал сохранять
+   настройки. Считано эмуляцией писателя, а не на глаз. Читатель и писатель обязаны быть ОДНОГО
+   размера: разъедутся - f_read снова начнёт молча обрезать последнюю секцию машины (v175). */
+#define CFG_BUF_SZ 8192
+static char cfgbuf[CFG_BUF_SZ] __attribute__((aligned(32)));   /* DMA target of f_read (cache-line aligned) */
 static void cfg_set(const char* k, const char* v){
     if(!cicmp(k,"sort"))
         sortmode = !cicmp(v,"date")?1 : !cicmp(v,"size")?2 : !cicmp(v,"ext")?3 : 0;
@@ -3994,26 +9229,37 @@ static void cfg_set(const char* k, const char* v){
     else if(!cicmp(k,"pause_on_music")) opt_pausemusic = !cicmp(v,"yes")?1:0;
     else if(!cicmp(k,"launch_snd")) opt_launchsnd = !cicmp(v,"music")?1:0;
     else if(!cicmp(k,"boot_nav")) opt_bootnav = !cicmp(v,"no")?0:1;
+    else if(!cicmp(k,"nes_boot")){ int i=0; for(; v[i] && i<191; i++) g_nesboot[i]=v[i]; g_nesboot[i]=0; }   /* v159 */
     else if(!cicmp(k,"defmachine")){ opt_defmachine=0; for(int i=0;i<N_MACHINES;i++) if(!cicmp(v,MACHINE_TAG[i])){ opt_defmachine=i; break; } }   /* Step 15: default boot machine (by tag) */
     else if(!cicmp(k,"defspectrum")){ opt_defspec=0; for(int i=0;i<4;i++) if(!cicmp(v,MACHINE_TAG[i])){ opt_defspec=i; break; } }
-    else if(!cicmp(k,"scr_x")){ int d=0; for(const char*p=v;*p>='0'&&*p<='9';p++) d=d*10+(*p-'0'); if(d<0)d=0; if(d>640)d=640; opt_scr_x=d; }   /* GLOBAL */
-    else if(!cicmp(k,"scr_y")){ int d=0; for(const char*p=v;*p>='0'&&*p<='9';p++) d=d*10+(*p-'0'); if(d<0)d=0; if(d>200)d=200; opt_scr_y=d; }   /* GLOBAL */
+    else if(k[0]=='m'&&k[1]=='s'&&k[2]=='c'&&k[3]=='r'&&k[4]=='_'&&k[5]=='s'&&(k[6]=='x'||k[6]=='y')&&k[7]>='0'&&k[7]<='4'&&k[8]==0){
+        int d=0; for(const char*p=v;*p>='0'&&*p<='9';p++) d=d*10+(*p-'0');           /* v169: per-machine scale */
+        int m=k[7]-'0'; if(d<1)d=1; if(d>8)d=8;
+        if(k[6]=='x') g_mp[m].scr_sx=d; else g_mp[m].scr_sy=d;
+        g_ini_scale_seen[m] = 1;                                                     /* v170 migration flag */
+    }
+    else if(k[0]=='m'&&k[1]=='s'&&k[2]=='c'&&k[3]=='r'&&k[4]=='_'&&(k[5]=='x'||k[5]=='y')&&k[6]>='0'&&k[6]<='4'&&k[7]==0){
+        int d=0; for(const char*p=v;*p>='0'&&*p<='9';p++) d=d*10+(*p-'0');           /* v157: per-machine screen pos */
+        int m=k[6]-'0'; if(d<0)d=0;
+        if(k[5]=='x'){ if(d>1024)d=1024; g_mp[m].scr_x=d; } else { if(d>400)d=400; g_mp[m].scr_y=d; }
+    }   /* legacy global scr_x/scr_y keys are intentionally IGNORED (superseded per machine) */
     else if(!cicmp(k,"fastload")){ int d=v[0]-'0'; if(d<0)d=0; if(d>2)d=2; opt_fastload=d; }
+    else if(!cicmp(k,"region")){ int r=v[0]-'0'; if(r>=0&&r<=2) opt_region=r; }   /* v0.15.189 регион NES */
     else if(!cicmp(k,"snow")){ opt_snow = (v[0]!='0'); }   /* v145 ULA snow (global) */
+    else if(!cicmp(k,"dmrootent")){ opt_dmroot = (v[0]!='0'); }   /* v355 */
+    else if(!cicmp(k,"dmfat32")){ opt_dmfat32 = (v[0]!='0'); }    /* v359 */
+    else if(!cicmp(k,"dmwrite")){ opt_dmwr = (v[0]!='0'); }       /* v405, теперь только DivMMC */
+    else if(!cicmp(k,"zcwrite")){ opt_zcwr = (v[0]!='0'); }       /* v409 */
+    else if(!cicmp(k,"dmfast")){ opt_dmfast = (v[0]!='0'); }      /* v427 */
     else if(!cicmp(k,"wavfast")){ int d=v[0]-'0'; if(d<0)d=0; if(d>1)d=1; opt_wavfast=d; }   /* v130: legacy 2(SAFE4)/3(AUTO) -> FAST (menu is NORMAL/FAST now; KVM mailbox can still poke raw 2/3) */
     else if(!cicmp(k,"tapesync")){ int d=v[0]-'0'; if(d<0)d=0; if(d>2)d=2; opt_tapesync=d; if(v[0]=='y'||v[0]=='Y')opt_tapesync=1; }   /* v132: 0=AUTO 1=ON 2=OFF; легаси y/Y=ON */
     else if(!cicmp(k,"autostart")){ opt_autostart=(v[0]=='1'||v[0]=='y'||v[0]=='Y'); }
     else if(!cicmp(k,"romtrap")){ opt_romtrap=(v[0]=='1'||v[0]=='y'||v[0]=='Y'); }
     else if(!cicmp(k,"smartload")){ opt_smartload=(v[0]=='1'||v[0]=='y'||v[0]=='Y'); }
     else if(!cicmp(k,"joymap") || !cicmp(k,"joymap1") || !cicmp(k,"joymap2")){
-          int pl = (k[6]=='2') ? 1 : 0;   /* joymap2 -> P2; joymap/joymap1 -> P1 */
-          int b=0; const char* q=v;
-          while(b<8 && q[0] && q[1]){
-              int hi=q[0], lo=q[1];
-              hi = (hi>='0'&&hi<='9')?hi-'0':(hi|32)-'a'+10;
-              lo = (lo>='0'&&lo<='9')?lo-'0':(lo|32)-'a'+10;
-              if(hi>=0&&hi<16&&lo>=0&&lo<16) g_joymap[pl][b]=(uint8_t)((hi<<4)|lo);
-              b++; q+=2; if(*q==',')q++; }
+          /* v210: deliberately ignore ambiguous pre-v174 GLOBAL maps.  Copying one legacy map into
+             every machine is how NES Start=Enter reached a ZX profile.  Modern <tag>.joymap1/2 keys
+             below are unambiguous; an old ini safely falls back to each platform's own defaults. */
       }
     else {   /* PER-MACHINE intrinsic: "<tag>.<param>" e.g. pent1024.paper_v=60 / zx128.crop_b=4 */
         for(int m=0;m<N_MACHINES;m++){
@@ -4021,21 +9267,130 @@ static void cfg_set(const char* k, const char* v){
             for(int j=0;j<tl;j++){ char a=k[j],b=MACHINE_TAG[m][j]; if(a>='A'&&a<='Z')a+=32; if(b>='A'&&b<='Z')b+=32; if(a!=b){mm=0;break;} }
             if(mm && k[tl]=='.'){
                 const char* sk=k+tl+1; int d=0; for(const char*p=v;*p>='0'&&*p<='9';p++) d=d*10+(*p-'0'); if(d<0)d=0;
+                /* v0.15.339 ОГРАНИЧИТЕЛИ ini ПРИВЕДЕНЫ К ДИАПАЗОНАМ МЕНЮ (таблица опций ниже: PENT INT V 319,
+                   PENT INT H 447, PAPER H OFF 447, PAPER V OFF 319). Было pint_h 446 / paper_h 127 / paper_v 63 —
+                   огрызки от старых, НЕкруговых ручек. Ручки стали круговыми в B0127, и сохранённый владельцем
+                   `Pan X = 440` («минус восемь пикселей») возвращался из ini как 127: после перезагрузки картинка
+                   уезжала, а виновата была не машина, а разбор конфига.
+                   ⚠ ПОРЯДОК ВАЖЕН: расширение безопасно ТОЛЬКО вместе с правкой `sources/atlas_core/video.v:162`
+                   (`videoEnableLoad` считать от `h_rel[3]`, а не от `hUla[3]` - VIDEO_CLAIMS_REVIEW.md §2.7 и раздел
+                   «ЧТО ИСПРАВЛЕНО 13.08»). Без неё открытый диапазон пускает в сломанную зону
+                   `paper_h mod 16 = 5..14` (измерено стендом; в первой редакции стояло «>= 5» - при 15 всё исправно):
+                   теряются 8 колонок бумаги справа и лезет мусорная клетка. Старая граница 127 (p = 15) в зону НЕ
+                   попадала, а вот «минус восемь» (440, p = 8) попадает ровно в неё - поэтому до выката видеоправки
+                   держать PAPER H OFF <= 4. Рабочие числа владельца не затронуты: PENT INT H = 326 и PAPER H OFF = 2
+                   меньше любого из порогов и проходят как проходили. */
                 if     (!cicmp(sk,"pint_v")){ if(d>319)d=319; g_mp[m].pint_v=d; }
-                else if(!cicmp(sk,"pint_h")){ if(d>446)d=446; g_mp[m].pint_h=d; }
-                else if(!cicmp(sk,"paper_h")){ if(d>127)d=127; g_mp[m].paper_h=d; }
-                else if(!cicmp(sk,"paper_v")){ if(d>63) d=63;  g_mp[m].paper_v=d; }
+                else if(!cicmp(sk,"pint_h")){ if(d>447)d=447; g_mp[m].pint_h=d; }
+                else if(!cicmp(sk,"paper_h")){ if(d>447)d=447; g_mp[m].paper_h=d; }
+                else if(!cicmp(sk,"paper_v")){ if(d>319)d=319; g_mp[m].paper_v=d; }
                 else if(!cicmp(sk,"crop_l")){ if(d>190)d=190; g_mp[m].crop_l=d; }
                 else if(!cicmp(sk,"crop_r")){ if(d>190)d=190; g_mp[m].crop_r=d; }
                 else if(!cicmp(sk,"crop_t")){ if(d>148)d=148; g_mp[m].crop_t=d; }
                 else if(!cicmp(sk,"crop_b")){ if(d>148)d=148; g_mp[m].crop_b=d; }
                 else if(!cicmp(sk,"ula_late")){ if(d>1)d=1; g_mp[m].ula_late=d; }
+                else if(!cicmp(sk,"snow")){ g_mp[m].snow=(d!=0); g_snow_seen |= (1u<<m); }  /* v349 */
+                else if(!cicmp(sk,"zc")){ g_mp[m].zc=(d!=0); }                             /* v350 */
+                else if(!cicmp(sk,"zcmode")){ g_mp[m].zcmode=(d!=0); }                      /* v379 */
+                else if(!cicmp(sk,"zcturbo")){ g_mp[m].zcturbo=(d!=0); }                     /* v430 */
+                else if(!cicmp(sk,"zcfat32")){ g_mp[m].zcfat32=(d!=0); }                    /* v379 */
+                else if(!cicmp(sk,"zcroot")){ g_mp[m].zcroot=(d!=0); }                      /* v379 */
+                else if(!cicmp(sk,"numpad_joy")){ g_mp[m].numjoy=(d!=0); }              /* v176 */
+                else if(!cicmp(sk,"joysrc1")){ if(d>3)d=3; g_mp[m].jsrc[0]=d; }         /* v176 */
+                else if(!cicmp(sk,"joysrc2")){ if(d>3)d=3; g_mp[m].jsrc[1]=d; }
+                else if(!cicmp(sk,"jtype1")){ if(d>3)d=3; g_mp[m].jtype[0]=d; }         /* v199 */
+                else if(!cicmp(sk,"jtype2")){ if(d>3)d=3; g_mp[m].jtype[1]=d; }
+                else if(!cicmp(sk,"socd")){ if(d>2)d=2; g_mp[m].socd=d; }               /* v206 */
+                else if(!cicmp(sk,"scr_x")){  if(d>1279)d=1279; g_mp[m].scr_x=d;  g_ini_scale_seen[m]=1; }
+                else if(!cicmp(sk,"scr_y")){  if(d>719) d=719;  g_mp[m].scr_y=d;  g_ini_scale_seen[m]=1; }
+                else if(!cicmp(sk,"scr_sx")){ if(d<1)d=1; if(d>8)d=8; g_mp[m].scr_sx=d; g_ini_scale_seen[m]=1; }
+                else if(!cicmp(sk,"scr_sy")){ if(d<1)d=1; if(d>8)d=8; g_mp[m].scr_sy=d; g_ini_scale_seen[m]=1; }
+                else if(!cicmp(sk,"svcrom")){ g_mp[m].svcrom = (d>2u) ? 2 : (int)d; }    /* v207; v252: 0/1/2.
+                    Старые ini с svcrom=1 читаются как NMI, а не как ALWAYS: постоянная вставка
+                    выбивает 48 BASIC из окна, и по-умолчанию так стоять не должно. */
+                else if(!cicmp(sk,"dossvc")){ g_mp[m].dossvc = (d>2u) ? 1 : (int)d; }     /* v388:
+                    ключа НЕТ в старых ini - остаётся дефолт профиля AUTO, а AUTO включается только
+                    там, где в слоте 3 доказан вход менеджера (у прежних наборов его нет, значит
+                    поведение прежнее). Чужое значение читаем как AUTO, а не как ON. */
+                else if(!cicmp(sk,"saa")){ if(d>2)d=2; g_mp[m].saa=d; }                  /* v217 */
+                else if(!cicmp(sk,"gs")){ g_mp[m].gs = d ? 1 : 0; }                     /* v265 */
+                else if(!cicmp(sk,"gsram")){ g_mp[m].gsram = (d>3u) ? 1 : (int)d; }     /* v281 */
+                else if(!cicmp(sk,"gsclk")){ g_mp[m].gsclk = (d>3u) ? GSCLK_DEF : (int)d; }  /* v336:
+                    ключа НЕТ в старых ini - значит остаётся дефолт профиля (18 МГц). Так и надо:
+                    прежние конфиги получают рекомендованную частоту, а не тихо 12 МГц. */
+                else if(!cicmp(sk,"ramsize")){ g_mp[m].ramsize = (d>3u) ? 3 : (int)d; } /* v314 */
+                else if(!cicmp(sk,"ide")){ g_mp[m].ide = d ? 1 : 0; }                   /* v292 */
+                else if(!cicmp(sk,"divmmc")){ g_mp[m].divmmc = d ? 1 : 0; }             /* v327 */
+                else if(!cicmp(sk,"dmmode")){ g_mp[m].dmmode = d ? 1 : 0; }             /* v327 */
+                else if(!cicmp(sk,"kmouse")){ g_mp[m].kmouse = (d > 2u) ? 0 : (int)d; } /* v304: чужое
+                    значение из ini не пускаем - неизвестный режим мыши должен читаться как OFF */
+                else if(!cicmp(sk,"idedev")){                                            /* v292: чужое значение
+                    из ini не пускаем - без второго образа MASTER+SLAVE был бы враньём уже на старте */
+                    g_mp[m].idedev = (d && ide_slave_present()) ? 1 : 0; }
+                else if(!cicmp(sk,"idefile")){                          /* v292: путь к образу - СТРОКА */
+                    int i=0; for(; v[i] && i<(int)sizeof(g_mp[m].idefile)-1; i++) g_mp[m].idefile[i]=v[i];
+                    g_mp[m].idefile[i]=0;
+                }
+                else if(!cicmp(sk,"dmfile")){                          /* v327 */
+                    int i=0; for(; v[i] && i<(int)sizeof(g_mp[m].dmfile)-1; i++) g_mp[m].dmfile[i]=v[i];
+                    g_mp[m].dmfile[i]=0;
+                }
+                else if(!cicmp(sk,"zcfile")){                          /* v379 */
+                    int i=0; for(; v[i] && i<(int)sizeof(g_mp[m].zcfile)-1; i++) g_mp[m].zcfile[i]=v[i];
+                    g_mp[m].zcfile[i]=0;
+                }
+                else if(!cicmp(sk,"romset")){                            /* v207: набор ПЗУ - СТРОКА, не число */
+                    int i=0; for(; v[i] && i<(int)sizeof(g_mp[m].romset)-1; i++) g_mp[m].romset[i]=v[i];
+                    g_mp[m].romset[i]=0;
+                }
+                /* v0.15.302: ЧЕТЫРЕ персональных слота (<тег>.rom0..rom3) - тоже СТРОКИ. Старые
+                   ключи romset/svcrom читаются как раньше и работают вместе с этими: набор задаёт
+                   раскладку целиком, слот перекрывает отдельную страницу. */
+                else if(!cicmp(sk,"rom0") || !cicmp(sk,"rom1") || !cicmp(sk,"rom2") || !cicmp(sk,"rom3")){
+                    int s = sk[3]-'0';
+                    int i=0; for(; v[i] && i<ROMSET_NAMEL-1; i++) g_mp[m].rom[s][i]=v[i];
+                    g_mp[m].rom[s][i]=0;
+                }
+                else if(!cicmp(sk,"rombus")){                            /* v302: 0 AUTO, 1..4 = слот 0..3 */
+                    g_mp[m].rombus = (d > (int)ROM_PG_N) ? 0 : d;
+                }
+                /* v0.15.384 РЕЖИМ РАСКЛАДКИ. Понимаем и слова, и число: ini владелец правит руками,
+                   и «rommode=manual» читается человеком лучше единицы. Ключа нет = AUTO = как раньше. */
+                else if(!cicmp(sk,"rommode")){
+                    if(!cicmp(v,"manual"))    g_mp[m].rommode = 1;
+                    else if(!cicmp(v,"auto")) g_mp[m].rommode = 0;
+                    else                      g_mp[m].rommode = d ? 1 : 0;
+                }
+                /* v0.15.384 ТАБЛИЦА РАСКЛАДКИ «2,3,1,0»: позиция = СЛОТ машины (0..3), значение =
+                   номер страницы В ФАЙЛЕ набора; «-» (или любой не-цифра) = слот не грузить. */
+                else if(!cicmp(sk,"rommap")){
+                    const char* q = v;
+                    for(uint32_t s=0; s<ROM_PG_N; s++){
+                        if(!*q){ g_mp[m].rommap[s] = -1; continue; }
+                        g_mp[m].rommap[s] = (*q >= '0' && *q < (char)('0'+(int)ROM_PG_N)) ? (*q - '0') : -1;
+                        while(*q && *q != ',') q++;
+                        if(*q == ',') q++;
+                    }
+                }
+                else if(!cicmp(sk,"joymap1") || !cicmp(sk,"joymap2")){   /* v174: карта кнопок машины */
+                    int pl = (sk[6]=='2') ? 1 : 0; int bb=0; const char* q=v;
+                    while(*q && bb<8){
+                        int hi=q[0], lo=q[1];
+                        hi=(hi>='0'&&hi<='9')?hi-'0':(hi|32)-'a'+10;
+                        lo=(lo>='0'&&lo<='9')?lo-'0':(lo|32)-'a'+10;
+                        if(hi>=0&&hi<16&&lo>=0&&lo<16) g_mp[m].joy[pl][bb]=(uint8_t)((hi<<4)|lo);
+                        bb++; q+=2; if(*q==',')q++; }
+                }
                 break;
             }
         }
     }
 }
 static void config_load(void){
+    /* v0.15.384: ПУСТАЯ ручная раскладка по умолчанию. Позиционные инициализаторы g_mp[] до rommap не
+       доходят (кончаются на socd), а нуль означал бы «слот s <- страница 0»: ini с rommode=1 и без
+       ключа rommap положил бы одну и ту же страницу во все четыре слота. -1 = «слот не грузить». */
+    for(int mm=0; mm<N_MACHINES; mm++) for(uint32_t s=0; s<ROM_PG_N; s++) g_mp[mm].rommap[s] = -1;
     if(!sd_mounted){ if(f_mount(&g_fs,"0:/",1)!=FR_OK) return; sd_mounted=1; }
     UINT br=0;
     if(f_open(&g_cfg,"0:/bulbulator.ini",FA_READ)!=FR_OK) return;     /* no file -> keep defaults */
@@ -4048,81 +9403,206 @@ static void config_load(void){
         if(le<=ls || cfgbuf[ls]=='#' || cfgbuf[ls]==';' || cfgbuf[ls]=='[') continue;
         int eq=-1; for(int j=ls;j<le;j++) if(cfgbuf[j]=='='){ eq=j; break; }
         if(eq<0) continue;
-        char key[24], val[24]; int n;
-        n=0; for(int j=ls;j<eq   && n<23;j++) if(cfgbuf[j]!=' '&&cfgbuf[j]!='\t') key[n++]=cfgbuf[j]; key[n]=0;
-        n=0; for(int j=eq+1;j<le && n<23;j++) if(cfgbuf[j]!=' '&&cfgbuf[j]!='\t') val[n++]=cfgbuf[j]; val[n]=0;
+        /* v0.15.202 (совет консулов 02.08). Было `char key[24], val[24]` с обрезкой на 23 знаках И
+           ВЫРЕЗАНИЕМ пробелов ВНУТРИ значения. Две тихие поломки на реальных данных:
+             - путь автозагрузки `0:/NES/DENDY/T/TANK1990.NES` — 27 знаков, обрезался до 23 и переставал
+               существовать (а `g_nesboot` рассчитан на 191!);
+             - имя файла с пробелом («Battle City (J).nes») склеивалось и не открывалось НИКОГДА.
+           Ключ по-прежнему сжимаем (в нём пробелов не бывает), а значение режем только по краям. */
+        char key[64], val[256]; int n;
+        n=0; for(int j=ls;j<eq && n<63;j++) if(cfgbuf[j]!=' '&&cfgbuf[j]!='\t') key[n++]=cfgbuf[j]; key[n]=0;
+        int vs=eq+1, ve=le;
+        while(vs<ve && (cfgbuf[vs]==' '||cfgbuf[vs]=='\t')) vs++;
+        while(ve>vs && (cfgbuf[ve-1]==' '||cfgbuf[ve-1]=='\t')) ve--;
+        n=0; for(int j=vs;j<ve && n<255;j++) val[n++]=cfgbuf[j]; val[n]=0;
         cfg_set(key,val);
     }
 }
-static int appstr(char* d,int p,const char* s){ for(int i=0;s[i];i++) d[p++]=s[i]; return p; }
+/* v0.15.303 СТОРОЖ РАЗМЕРА КОНФИГА: СЧИТАТЬ ДО ЗАПИСИ, А НЕ ПОСЛЕ.
+   Было: все строки лились прямо в буфер, а проверка «влезло ли» стояла ПОСЛЕ последней из них - то
+   есть сторож лишь констатировал переполнение, держась на запасе в 64 байта, который ничем не
+   гарантирован (одна длинная строка - путь к образу винчестера - съедает больше сотни). И владелец
+   получал «CONFIG TOO BIG» без единого намёка, ЧТО именно не сохранилось.
+   Теперь строка ini собирается ЦЕЛИКОМ в отдельном буфере и переносится в файловый, только если
+   помещается целиком: обрезанный ключ ХУЖЕ отсутствующего - при следующей загрузке он прочитается
+   как ключ с мусорным значением. Первый непоместившийся ключ запоминается ПО ИМЕНИ, его и называем
+   в статусе. Места вызова не меняются: appstr/appch принимают прежние аргументы и возвращают число
+   УЖЕ ЗАПИСАННЫХ (целыми строками) байт. */
+#define CFG_LINE_SZ 192                       /* самая длинная строка - тег + ".idefile=" + 96 байт пути */
+static char        g_cfg_line[CFG_LINE_SZ];   /* строка ini собирается здесь */
+static int         g_cfg_lp   = 0;            /* сколько в ней байт */
+static int         g_cfg_lovf = 0;            /* строка не влезла даже в этот буфер */
+static char*       g_cfg_out  = 0;            /* куда переносим готовые строки */
+static int         g_cfg_p    = 0, g_cfg_cap = 0;
+static char        g_cfg_lost[32] = "";       /* ИМЯ первого ключа, который не сохранён */
+static void cfg_lost_note(void){              /* имя ключа берём из недописанной строки: всё до '=' */
+    if(g_cfg_lost[0]) return;                 /* называем ПЕРВЫЙ - он же и точка, с которой всё поехало */
+    int i=0;
+    for(; i<g_cfg_lp && g_cfg_line[i] != '=' && i<(int)sizeof(g_cfg_lost)-1; i++) g_cfg_lost[i] = g_cfg_line[i];
+    g_cfg_lost[i] = 0;
+    if(!g_cfg_lost[0]){ g_cfg_lost[0] = '?'; g_cfg_lost[1] = 0; }
+}
+static void cfg_flush(void){                  /* строка уходит в файловый буфер ТОЛЬКО ЦЕЛИКОМ */
+    if(!g_cfg_lovf && g_cfg_p + g_cfg_lp <= g_cfg_cap){
+        for(int i=0;i<g_cfg_lp;i++) g_cfg_out[g_cfg_p++] = g_cfg_line[i];
+    } else cfg_lost_note();
+    g_cfg_lp = 0; g_cfg_lovf = 0;
+}
+static int appch(char* d,int p,char c){       /* d/p сохранены ради прежней формы мест вызова */
+    (void)d; (void)p;
+    if(g_cfg_lp < CFG_LINE_SZ) g_cfg_line[g_cfg_lp++] = c; else g_cfg_lovf = 1;
+    if(c=='\n') cfg_flush();                  /* конец строки - решаем, влезает ли она целиком */
+    return g_cfg_p;
+}
+static int appstr(char* d,int p,const char* s){ for(int i=0;s[i];i++) p=appch(d,p,s[i]); return p; }
 static int config_save(void){                  /* 1 = written OK, 0 = failed (card RO/full/removed) */
     if(!sd_mounted) return 0;
+    mp_store(opt_defmachine);                  /* v174: живая карта кнопок/параметры -> слот текущей машины */
     const char* sv = sortmode==1?"date":sortmode==2?"size":sortmode==3?"ext":"name";
     const char* cv = opt_scroll==0?"slow":opt_scroll==2?"fast":"med";
     const char* fv = opt_foldermark==1?"icon":opt_foldermark==2?"slash":"brackets";
     const char* dv = opt_scrdelay==0?"0":opt_scrdelay==2?"500":opt_scrdelay==3?"1000":"300";
-    char o[1536] __attribute__((aligned(32))); int p=0;   /* DMA source of f_write (cache-line aligned); >= total ini size (~450 B with Step-15 keys). Overflow here = stack smash -> ARM hang, so keep ample headroom. */
+    /* v0.15.173: was o[1536] with a comment claiming "~450 B with Step-15 keys" - the real file had
+       already grown to 1525 B (per-machine screen keys, joymaps, two machine sections), i.e. ELEVEN bytes
+       of headroom before the documented failure mode (stack smash -> ARM hang / corrupt config). Buffer
+       raised to 4 KB and a hard guard added below so an oversized config REFUSES to save instead of
+       silently smashing the stack. */
+    static char o[CFG_BUF_SZ] __attribute__((aligned(32))); int p=0;
+    g_cfg_out = o; g_cfg_p = 0; g_cfg_cap = (int)sizeof(o);        /* v303: сторож считает ДО записи */
+    g_cfg_lp = 0; g_cfg_lovf = 0; g_cfg_lost[0] = 0;   /* static: не место на стеке; v292: один размер с cfgbuf */
     p=appstr(o,p,"# BulbuLator config\r\n[browser]\r\n");
-    p=appstr(o,p,"sort=");         p=appstr(o,p,sv); o[p++]='\r'; o[p++]='\n';
-    p=appstr(o,p,"sortrev=");      o[p++]=g_sort_desc?'1':'0'; o[p++]='\r'; o[p++]='\n';
-    p=appstr(o,p,"scroll_speed="); p=appstr(o,p,cv); o[p++]='\r'; o[p++]='\n';
-    p=appstr(o,p,"folder_mark=");  p=appstr(o,p,fv); o[p++]='\r'; o[p++]='\n';
-    p=appstr(o,p,"scroll_delay="); p=appstr(o,p,dv); o[p++]='\r'; o[p++]='\n';
+    p=appstr(o,p,"sort=");         p=appstr(o,p,sv); p=appch(o,p,'\r'); p=appch(o,p,'\n');
+    p=appstr(o,p,"sortrev=");      p=appch(o,p,g_sort_desc?'1':'0'); p=appch(o,p,'\r'); p=appch(o,p,'\n');
+    p=appstr(o,p,"scroll_speed="); p=appstr(o,p,cv); p=appch(o,p,'\r'); p=appch(o,p,'\n');
+    p=appstr(o,p,"folder_mark=");  p=appstr(o,p,fv); p=appch(o,p,'\r'); p=appch(o,p,'\n');
+    p=appstr(o,p,"scroll_delay="); p=appstr(o,p,dv); p=appch(o,p,'\r'); p=appch(o,p,'\n');
     char dimb[8]; itoa_u(opt_dim, dimb);
-    p=appstr(o,p,"dim=");          p=appstr(o,p,dimb); o[p++]='\r'; o[p++]='\n';
+    p=appstr(o,p,"dim=");          p=appstr(o,p,dimb); p=appch(o,p,'\r'); p=appch(o,p,'\n');
     char volb[8]; itoa_u(opt_vol, volb);
-    p=appstr(o,p,"vol=");          p=appstr(o,p,volb); o[p++]='\r'; o[p++]='\n';
+    p=appstr(o,p,"vol=");          p=appstr(o,p,volb); p=appch(o,p,'\r'); p=appch(o,p,'\n');
     char xb[8]; itoa_u(opt_x, xb);
-    p=appstr(o,p,"osd_x=");        p=appstr(o,p,xb); o[p++]='\r'; o[p++]='\n';
+    p=appstr(o,p,"osd_x=");        p=appstr(o,p,xb); p=appch(o,p,'\r'); p=appch(o,p,'\n');
     char yb[8]; itoa_u(opt_y, yb);
-    p=appstr(o,p,"osd_y=");        p=appstr(o,p,yb); o[p++]='\r'; o[p++]='\n';
+    p=appstr(o,p,"osd_y=");        p=appstr(o,p,yb); p=appch(o,p,'\r'); p=appch(o,p,'\n');
     char plxb[8]; itoa_u(opt_pl_x, plxb);
-    p=appstr(o,p,"player_x=");     p=appstr(o,p,plxb); o[p++]='\r'; o[p++]='\n';
+    p=appstr(o,p,"player_x=");     p=appstr(o,p,plxb); p=appch(o,p,'\r'); p=appch(o,p,'\n');
     char plyb[8]; itoa_u(opt_pl_y, plyb);
-    p=appstr(o,p,"player_y=");     p=appstr(o,p,plyb); o[p++]='\r'; o[p++]='\n';
-    p=appstr(o,p,"tape_snd=");     o[p++]=opt_tapesound?'1':'0'; o[p++]='\r'; o[p++]='\n';
-    p=appstr(o,p,"tapemute=");     o[p++]=opt_tapemute?'1':'0'; o[p++]='\r'; o[p++]='\n';
-    { int m=(opt_defmachine>=0&&opt_defmachine<N_MACHINES)?opt_defmachine:0; p=appstr(o,p,"defmachine="); p=appstr(o,p,MACHINE_TAG[m]); o[p++]='\r'; o[p++]='\n'; }  /* Step 15: default boot machine */
-    { int s=(opt_defspec>=0&&opt_defspec<4)?opt_defspec:0; p=appstr(o,p,"defspectrum="); p=appstr(o,p,MACHINE_TAG[s]); o[p++]='\r'; o[p++]='\n'; }  /* Default Spectrum machine */
+    p=appstr(o,p,"player_y=");     p=appstr(o,p,plyb); p=appch(o,p,'\r'); p=appch(o,p,'\n');
+    p=appstr(o,p,"tape_snd=");     p=appch(o,p,opt_tapesound?'1':'0'); p=appch(o,p,'\r'); p=appch(o,p,'\n');
+    p=appstr(o,p,"tapemute=");     p=appch(o,p,opt_tapemute?'1':'0'); p=appch(o,p,'\r'); p=appch(o,p,'\n');
+    { int m=(opt_defmachine>=0&&opt_defmachine<N_MACHINES)?opt_defmachine:0; p=appstr(o,p,"defmachine="); p=appstr(o,p,MACHINE_TAG[m]); p=appch(o,p,'\r'); p=appch(o,p,'\n'); }  /* Step 15: default boot machine */
+    { int s=(opt_defspec>=0&&opt_defspec<4)?opt_defspec:0; p=appstr(o,p,"defspectrum="); p=appstr(o,p,MACHINE_TAG[s]); p=appch(o,p,'\r'); p=appch(o,p,'\n'); }  /* Default Spectrum machine */
     mp_store((opt_defmachine>=0&&opt_defmachine<N_MACHINES)?opt_defmachine:0);   /* flush live opt_* into g_mp[current] before writing ALL machines */
     for(int m=0;m<N_MACHINES;m++){ const char* tg=MACHINE_TAG[m]; char b[8];
-        #define SAVEKV(nm,val) do{ p=appstr(o,p,tg); o[p++]='.'; p=appstr(o,p,nm "="); itoa_u((unsigned)(val),b); p=appstr(o,p,b); o[p++]='\r'; o[p++]='\n'; }while(0)
+        #define SAVEKV(nm,val) do{ p=appstr(o,p,tg); p=appch(o,p,'.'); p=appstr(o,p,nm "="); itoa_u((unsigned)(val),b); p=appstr(o,p,b); p=appch(o,p,'\r'); p=appch(o,p,'\n'); }while(0)
         SAVEKV("pint_v",g_mp[m].pint_v);  SAVEKV("pint_h",g_mp[m].pint_h);
         SAVEKV("paper_h",g_mp[m].paper_h);SAVEKV("paper_v",g_mp[m].paper_v);
         SAVEKV("crop_l",g_mp[m].crop_l);  SAVEKV("crop_r",g_mp[m].crop_r);
         SAVEKV("crop_t",g_mp[m].crop_t);  SAVEKV("crop_b",g_mp[m].crop_b);
         SAVEKV("ula_late",g_mp[m].ula_late);
+        SAVEKV("numpad_joy",g_mp[m].numjoy);
+        SAVEKV("snow",g_mp[m].snow);                                                   /* v349 */
+        SAVEKV("zc",g_mp[m].zc);                                                       /* v350 */                                            /* v176 */
+        SAVEKV("joysrc1",g_mp[m].jsrc[0]);  SAVEKV("joysrc2",g_mp[m].jsrc[1]);
+        SAVEKV("jtype1",g_mp[m].jtype[0]);  SAVEKV("jtype2",g_mp[m].jtype[1]);          /* v199 */
+        SAVEKV("socd",g_mp[m].socd);                                                    /* v206 */
+        SAVEKV("svcrom",g_mp[m].svcrom);                                                /* v207 */
+        SAVEKV("dossvc",g_mp[m].dossvc);                                                /* v388 */
+        SAVEKV("rombus",g_mp[m].rombus);        /* v302: 0 AUTO, 1..4 = машина стартует со слота 0..3 */
+        SAVEKV("rommode",g_mp[m].rommode);      /* v384: 0 AUTO (по содержимому) / 1 MANUAL (таблица ниже) */
+        SAVEKV("saa",g_mp[m].saa);                                                      /* v217 */
+        SAVEKV("gs",g_mp[m].gs);                                                        /* v265 */
+        SAVEKV("gsram",g_mp[m].gsram);                                                  /* v281 */
+        SAVEKV("gsclk",g_mp[m].gsclk);                                                  /* v336 */
+        SAVEKV("ramsize",g_mp[m].ramsize);                                              /* v314 */
+        SAVEKV("ide",g_mp[m].ide);                                                      /* v292 */
+        SAVEKV("idedev",g_mp[m].idedev);                                                /* v292 */
+        SAVEKV("divmmc",g_mp[m].divmmc);                                                /* v327 */
+        SAVEKV("dmmode",g_mp[m].dmmode);                                                /* v327 */
+        SAVEKV("kmouse",g_mp[m].kmouse);                                                /* v304 */
+        SAVEKV("scr_x",g_mp[m].scr_x);    SAVEKV("scr_y",g_mp[m].scr_y);        /* v174: было mscr_x<N> */
+        SAVEKV("scr_sx",g_mp[m].scr_sx);  SAVEKV("scr_sy",g_mp[m].scr_sy);
         #undef SAVEKV
+        /* v207: набор ПЗУ - строка, SAVEKV умеет только числа. Пустая строка = вшитое ПЗУ. */
+        p=appstr(o,p,tg); p=appch(o,p,'.'); p=appstr(o,p,"romset=");
+        p=appstr(o,p,g_mp[m].romset); p=appch(o,p,'\r'); p=appch(o,p,'\n');
+        /* v0.15.302: персональные слоты ПЗУ - четыре СТРОКИ. Пишем и пустые: ключ, исчезнувший из
+           файла, при следующей загрузке молча оставил бы прежнее значение из памяти. */
+        { static const char* const RK[ROM_PG_N] = {"rom0=","rom1=","rom2=","rom3="};
+          for(uint32_t s=0; s<ROM_PG_N; s++){
+              p=appstr(o,p,tg); p=appch(o,p,'.'); p=appstr(o,p,RK[s]);
+              p=appstr(o,p,g_mp[m].rom[s]); p=appch(o,p,'\r'); p=appch(o,p,'\n'); } }
+        /* v0.15.384 ТАБЛИЦА РУЧНОЙ РАСКЛАДКИ - строка «2,3,1,0» (позиция = слот, значение = страница
+           файла, «-» = слот не грузить). Пишем всегда: ключ, исчезнувший из файла, при следующей
+           загрузке молча оставил бы прежнее значение из памяти. */
+        { p=appstr(o,p,tg); p=appch(o,p,'.'); p=appstr(o,p,"rommap=");
+          for(uint32_t s=0; s<ROM_PG_N; s++){
+              int v = g_mp[m].rommap[s];
+              p=appch(o,p, (v>=0 && v<(int)ROM_PG_N) ? (char)('0'+v) : '-');
+              if(s+1 < ROM_PG_N) p=appch(o,p,',');
+          }
+          p=appch(o,p,'\r'); p=appch(o,p,'\n'); }
+        /* v292: путь к образу винчестера - тоже СТРОКА, SAVEKV умеет только числа.
+           Пустая строка = дефолт 0:/HDD.HDF (см. ide_img_path). */
+        p=appstr(o,p,tg); p=appch(o,p,'.'); p=appstr(o,p,"idefile=");
+        p=appstr(o,p,g_mp[m].idefile); p=appch(o,p,'\r'); p=appch(o,p,'\n');
+        p=appstr(o,p,tg); p=appch(o,p,'.'); p=appstr(o,p,"dmfile=");
+        p=appstr(o,p,g_mp[m].dmfile); p=appch(o,p,'\r'); p=appch(o,p,'\n');
+        /* v0.15.430: Z-Controller - те же три машинных поля, что читаются ниже как <тег>.zc*.
+           До этого писался только включатель `zc=`, и после перезагрузки образ «забывался». */
+        p=appstr(o,p,tg); p=appch(o,p,'.'); p=appstr(o,p,"zcfile=");
+        p=appstr(o,p,g_mp[m].zcfile); p=appch(o,p,'\r'); p=appch(o,p,'\n');
+        p=appstr(o,p,tg); p=appch(o,p,'.'); p=appstr(o,p,"zcmode=");
+        p=appch(o,p,(char)('0'+(g_mp[m].zcmode&1))); p=appch(o,p,'\r'); p=appch(o,p,'\n');
+        p=appstr(o,p,tg); p=appch(o,p,'.'); p=appstr(o,p,"zcturbo=");
+        p=appch(o,p,(char)('0'+(g_mp[m].zcturbo&1))); p=appch(o,p,'\r'); p=appch(o,p,'\n');
+        { const char* hx="0123456789ABCDEF";                                     /* v174: было joymap1/2 */
+          for(int pl=0; pl<2; pl++){
+              p=appstr(o,p,tg); p=appch(o,p,'.'); p=appstr(o,p, pl?"joymap2=":"joymap1=");
+              for(int bb=0;bb<8;bb++){ p=appch(o,p,hx[(g_mp[m].joy[pl][bb]>>4)&15]); p=appch(o,p,hx[g_mp[m].joy[pl][bb]&15]); if(bb<7)p=appch(o,p,','); }
+              p=appch(o,p,'\r'); p=appch(o,p,'\n'); } }
     }
-    { char b[8]; itoa_u(opt_scr_x,b); p=appstr(o,p,"scr_x="); p=appstr(o,p,b); o[p++]='\r'; o[p++]='\n'; }   /* GLOBAL */
-    { char b[8]; itoa_u(opt_scr_y,b); p=appstr(o,p,"scr_y="); p=appstr(o,p,b); o[p++]='\r'; o[p++]='\n'; }   /* GLOBAL */
-    { p=appstr(o,p,"fastload="); o[p++]=(char)('0'+(opt_fastload&3)); o[p++]='\r'; o[p++]='\n'; }                    /* GLOBAL tape-service */
-    { p=appstr(o,p,"snow=");     o[p++]=(char)('0'+(opt_snow&1));     o[p++]='\r'; o[p++]='\n'; }                    /* v145 ULA snow (GLOBAL) */
-    { p=appstr(o,p,"wavfast="); o[p++]=(char)('0'+(opt_wavfast&3)); o[p++]='\r'; o[p++]='\n'; }
-    { p=appstr(o,p,"tapesync="); o[p++]=(char)('0'+(opt_tapesync%3)); o[p++]='\r'; o[p++]='\n'; }   /* v132: 0=AUTO 1=ON 2=OFF */
-    { p=appstr(o,p,"autostart="); o[p++]=opt_autostart?'1':'0'; o[p++]='\r'; o[p++]='\n'; }
-    { p=appstr(o,p,"romtrap="); o[p++]=opt_romtrap?'1':'0'; o[p++]='\r'; o[p++]='\n'; }
-    { p=appstr(o,p,"smartload="); o[p++]=opt_smartload?'1':'0'; o[p++]='\r'; o[p++]='\n'; }
-    { const char* hx="0123456789ABCDEF";
-      for(int pl=0; pl<2; pl++){                                   /* v146: two players -> joymap1= / joymap2= */
-          p=appstr(o,p, pl?"joymap2=":"joymap1=");
-          for(int b=0;b<8;b++){ o[p++]=hx[(g_joymap[pl][b]>>4)&15]; o[p++]=hx[g_joymap[pl][b]&15]; if(b<7)o[p++]=','; }
-          o[p++]='\r'; o[p++]='\n'; } }
-    p=appstr(o,p,"timemode=");     o[p++]=opt_timemode?'1':'0'; o[p++]='\r'; o[p++]='\n';
-    p=appstr(o,p,"showhidden=");   o[p++]=opt_showhidden?'1':'0'; o[p++]='\r'; o[p++]='\n';
-    p=appstr(o,p,"mp3_tape=");     o[p++]=opt_mp3tape?'1':'0'; o[p++]='\r'; o[p++]='\n';
-    p=appstr(o,p,"preload=");      o[p++]=opt_preload?'1':'0'; o[p++]='\r'; o[p++]='\n';
-    { char tb[8]; itoa_u(tune_hys_mp3, tb); p=appstr(o,p,"mp3_hys="); p=appstr(o,p,tb); o[p++]='\r'; o[p++]='\n'; }
+    { p=appstr(o,p,"fastload="); p=appch(o,p,(char)('0'+(opt_fastload&3))); p=appch(o,p,'\r'); p=appch(o,p,'\n'); }                    /* GLOBAL tape-service */
+    { p=appstr(o,p,"region=");   p=appch(o,p,(char)('0'+(opt_region&3)));   p=appch(o,p,'\r'); p=appch(o,p,'\n'); }                  /* v0.15.189 регион NES */
+    { p=appstr(o,p,"snow=");     p=appch(o,p,(char)('0'+(opt_snow&1)));     p=appch(o,p,'\r'); p=appch(o,p,'\n'); }
+    { p=appstr(o,p,"dmrootent="); p=appch(o,p,(char)('0'+(opt_dmroot&1))); p=appch(o,p,'\r'); p=appch(o,p,'\n'); }   /* v355 */
+    { p=appstr(o,p,"dmfat32=");   p=appch(o,p,(char)('0'+(opt_dmfat32&1))); p=appch(o,p,'\r'); p=appch(o,p,'\n'); }  /* v359 */
+    { p=appstr(o,p,"dmwrite=");   p=appch(o,p,(char)('0'+(opt_dmwr&1))); p=appch(o,p,'\r'); p=appch(o,p,'\n'); }  /* v405 */
+    { p=appstr(o,p,"zcwrite=");   p=appch(o,p,(char)('0'+(opt_zcwr&1))); p=appch(o,p,'\r'); p=appch(o,p,'\n'); }  /* v409 */
+    { p=appstr(o,p,"dmfast=");    p=appch(o,p,(char)('0'+(opt_dmfast&1))); p=appch(o,p,'\r'); p=appch(o,p,'\n'); }  /* v427 */
+    { p=appstr(o,p,"zcfat32=");   p=appch(o,p,(char)('0'+(opt_zcfat32&1))); p=appch(o,p,'\r'); p=appch(o,p,'\n'); }  /* v379 */
+    { p=appstr(o,p,"zcroot=");    p=appch(o,p,(char)('0'+(opt_zcroot&1))); p=appch(o,p,'\r'); p=appch(o,p,'\n'); }   /* v379 */                    /* v145 ULA snow (GLOBAL) */
+    { p=appstr(o,p,"wavfast="); p=appch(o,p,(char)('0'+(opt_wavfast&3))); p=appch(o,p,'\r'); p=appch(o,p,'\n'); }
+    { p=appstr(o,p,"tapesync="); p=appch(o,p,(char)('0'+(opt_tapesync%3))); p=appch(o,p,'\r'); p=appch(o,p,'\n'); }   /* v132: 0=AUTO 1=ON 2=OFF */
+    { p=appstr(o,p,"autostart="); p=appch(o,p,opt_autostart?'1':'0'); p=appch(o,p,'\r'); p=appch(o,p,'\n'); }
+    { p=appstr(o,p,"romtrap="); p=appch(o,p,opt_romtrap?'1':'0'); p=appch(o,p,'\r'); p=appch(o,p,'\n'); }
+    { p=appstr(o,p,"smartload="); p=appch(o,p,opt_smartload?'1':'0'); p=appch(o,p,'\r'); p=appch(o,p,'\n'); }
+    p=appstr(o,p,"timemode=");     p=appch(o,p,opt_timemode?'1':'0'); p=appch(o,p,'\r'); p=appch(o,p,'\n');
+    p=appstr(o,p,"showhidden=");   p=appch(o,p,opt_showhidden?'1':'0'); p=appch(o,p,'\r'); p=appch(o,p,'\n');
+    p=appstr(o,p,"mp3_tape=");     p=appch(o,p,opt_mp3tape?'1':'0'); p=appch(o,p,'\r'); p=appch(o,p,'\n');
+    p=appstr(o,p,"preload=");      p=appch(o,p,opt_preload?'1':'0'); p=appch(o,p,'\r'); p=appch(o,p,'\n');
+    { char tb[8]; itoa_u(tune_hys_mp3, tb); p=appstr(o,p,"mp3_hys="); p=appstr(o,p,tb); p=appch(o,p,'\r'); p=appch(o,p,'\n'); }
     const char* pv = opt_playmode==1?"file":opt_playmode==2?"folderloop":opt_playmode==3?"fileloop":opt_playmode==4?"random":"folder";
-    p=appstr(o,p,"playmode=");     p=appstr(o,p,pv); o[p++]='\r'; o[p++]='\n';
-    p=appstr(o,p,"pause_on_music="); p=appstr(o,p, opt_pausemusic?"yes":"no"); o[p++]='\r'; o[p++]='\n';
-    p=appstr(o,p,"launch_snd=");     p=appstr(o,p, opt_launchsnd?"music":"machine"); o[p++]='\r'; o[p++]='\n';
-    p=appstr(o,p,"boot_nav=");       p=appstr(o,p, opt_bootnav?"yes":"no"); o[p++]='\r'; o[p++]='\n';
+    p=appstr(o,p,"playmode=");     p=appstr(o,p,pv); p=appch(o,p,'\r'); p=appch(o,p,'\n');
+    p=appstr(o,p,"pause_on_music="); p=appstr(o,p, opt_pausemusic?"yes":"no"); p=appch(o,p,'\r'); p=appch(o,p,'\n');
+    p=appstr(o,p,"launch_snd=");     p=appstr(o,p, opt_launchsnd?"music":"machine"); p=appch(o,p,'\r'); p=appch(o,p,'\n');
+    p=appstr(o,p,"boot_nav=");       p=appstr(o,p, opt_bootnav?"yes":"no"); p=appch(o,p,'\r'); p=appch(o,p,'\n');
+    /* v0.15.201: ключ автозагрузки NES ЧИТАЕТСЯ при старте, но НЕ ЗАПИСЫВАЛСЯ - то есть ручной
+       «Save config» стирал автозагрузку картриджа, и машина стартовала с пустым слотом. */
+    if(g_nesboot[0]){ p=appstr(o,p,"nes_boot="); p=appstr(o,p,g_nesboot); p=appch(o,p,'\r'); p=appch(o,p,'\n'); }
     UINT bw=0;
+    p = g_cfg_p;                                  /* v303: в файл идут только ЦЕЛЫЕ строки */
+    if(g_cfg_lost[0]){                            /* не влезло - НАЗЫВАЕМ КЛЮЧ, а не жалуемся вообще */
+        char msg[56]; int k=0;
+        for(const char* q="CONFIG FULL, NOT SAVED: "; *q && k<(int)sizeof(msg)-1; q++) msg[k++]=*q;
+        for(int i=0; g_cfg_lost[i] && k<(int)sizeof(msg)-1; i++) msg[k++]=g_cfg_lost[i];
+        msg[k]=0; dn_status_msg(msg);
+    }
     if(f_open(&g_cfg,"0:/bulbulator.ini",FA_CREATE_ALWAYS|FA_WRITE)!=FR_OK){ sd_unmount(); return 0; }
     FRESULT wr = f_write(&g_cfg,o,p,&bw);
     f_close(&g_cfg);
-    return (wr==FR_OK && (int)bw==p) ? 1 : 0;
+    if(!(wr==FR_OK && (int)bw==p)) return 0;
+    return g_cfg_lost[0] ? 2 : 1;                 /* v303: 2 = записано, но ключ потерян (сообщение уже стоит) */
 }
 
 /* ---- reusable, data-driven OSD menu engine (decl. menu = title + items; generic render with
@@ -4140,6 +9620,28 @@ typedef struct {
     void              (*onchange)(void);/* CHOICE/RANGE: called after a value change (e.g. write a reg) */
     int                rmax;            /* RANGE: clamp maximum (minimum is 0) */
     const char*        unit;            /* RANGE: value suffix, e.g. "%" or "" */
+    /* 🥇 v0.15.305 «ПРИМЕНЯЕТСЯ ПО ENTER». Ставится у пунктов, чей onchange РАЗРУШИТЕЛЕН: сбрасывает
+       машину, перезаливает ПЗУ, перезагружает ядро через PCAP или перезапускает карту GS. У такого
+       пункта стрелки только ДВИГАЮТ значение (оно помечается '*' = выбрано, но не применено), а всю
+       работу делает Enter. Без этого проезд курсором по строке через три значения означал три
+       сброса машины подряд - и потерю всего, что в ней было. Отмена бесплатная: уход с пункта или
+       выход из меню возвращают прежнее значение. Поле ПОСЛЕДНЕЕ в структуре не случайно: все
+       инициализаторы таблиц позиционные, и у неупомянувших его пунктов оно честно 0. */
+    uint8_t            defer;
+    /* 🥇 v0.15.334 ЧЕСТНАЯ ПОМЕТКА «СЕЙЧАС ЭТОТ ПЕРЕКЛЮЧАТЕЛЬ НЕ ДЕЙСТВУЕТ» (две жалобы владельца
+       12.08: «SYNC LOADER не выключается» и «на машине MiSTer не работает выключатель снега»).
+       В обоих случаях сам переключатель исправен, а его значение перебивает кто-то другой:
+       демандовую ленту принудительно включает режим скорости 8x в ФАБРИКЕ, а снег умеет только
+       ядро Atlas. Интерфейс об этом молчал - и владелец законно считал сломанным пункт меню, хотя
+       ломать было нечего. Правило владельца «опция без объяснения, когда её трогать, бесполезна»
+       распространяется и на такой случай: если опция сейчас ни на что не влияет, это обязано быть
+       написано ТАМ ЖЕ, где она нарисована.
+         vnote - короткий хвост к значению («AUTO (ON: 8x)»), видно не открывая ничего;
+         vwhy  - фраза в строку состояния о том, КОГДА пункт вообще что-то значит.
+       Оба поля добавлены В КОНЕЦ структуры по той же причине, что и defer: инициализаторы таблиц
+       позиционные, и у пунктов, которые их не упомянули, они честно нулевые. */
+    const char*       (*vnote)(void);
+    const char*       (*vwhy)(void);
 } menu_item;
 typedef struct { const char* title; menu_item* items; int count; int cursor; int top; } menu_t;
 
@@ -4153,7 +9655,9 @@ static void act_save(void){
     sdop_freeze_begin();                 /* SD write mid-tape-load would underrun the pulse FIFO -> freeze the machine (bit-exact) */
     int ok = config_save();
     sdop_freeze_end();
-    dn_status_msg(ok ? "SAVED" : "SAVE FAILED");               /* transient on the DN status row */
+    /* v0.15.303: ok==2 - файл записан, но какой-то ключ не поместился. Подробное сообщение с ИМЕНЕМ
+       ключа уже стоит в строке состояния, и затирать его бодрым «SAVED» нельзя. */
+    if(ok != 2) dn_status_msg(ok ? "SAVED" : "SAVE FAILED");    /* transient on the DN status row */
 }
 static void act_eject(void){           /* safe-eject: unmount so the card can be pulled cleanly (read-only now; add f_sync when writes land) */
     sd_unmount();
@@ -4174,8 +9678,115 @@ static void apply_pos(void){ DDR_OSD_POS = ((unsigned)opt_y<<16) | (unsigned)opt
    cold-reboots the machine (the F11 RESET+wipe path), like a real machine swap. At boot we only set
    the register (the machine cold-starts anyway). index 1 = Pentagon 1024K -> Pentagon timing bit. */
 static void apply_pint(void){ PENT_INT = ((unsigned)opt_pintv<<16) | (unsigned)opt_pinth; }  /* LIVE only: pokes register. Core keeps running, border not broken. */
-static void apply_paper(void){ PAPER_H = (unsigned)opt_paper_h; PAPER_V = (unsigned)opt_paper_v; }  /* LIVE only: pokes register. Core keeps running, border not broken. */
-static void apply_scr(void){ SCR_POS = ((unsigned)opt_scr_y<<16) | ((unsigned)opt_scr_x & 0xFFFFu); }  /* LIVE: whole-frame HDMI position (border+paper together) - moves the captured picture on screen, independent of PAPER */
+static void apply_paper(void){ PAPER_H = (unsigned)opt_paper_h; PAPER_V = (unsigned)opt_paper_v; }
+static void apply_ulatune(void){
+    unsigned val = (1u << 31); /* TUNE_ENABLE */
+    val |= ((unsigned)opt_bord_phase & 0xFu);
+    val |= (((unsigned)opt_io_cont & 0x7u) << 4);
+    val |= ((((unsigned)opt_sincl_inth) & 0x1FFu) << 15);
+    val |= (((unsigned)opt_bord_delay & 0x3u) << 24);
+    val |= (((unsigned)opt_pap_delay & 0xFu) << 26);
+    ULA_TUNE_REG = val;
+}  /* LIVE only: pokes register. Core keeps running, border not broken. */
+/* v0.15.157 PER-MACHINE whole-frame HDMI position. The menu edits opt_scr_x/y (the VIEW); apply
+   stores them into the CURRENT machine's pair and pushes the register. scr_view_sync loads the view
+   from the machine's pair on every machine switch / submenu retarget / boot. */
+static int scr_view_m = -1;      /* v170: which machine the VIEW currently mirrors */
+static void scr_view_sync(void){
+    int m = (opt_defmachine>=0 && opt_defmachine<5) ? opt_defmachine : 0;
+    opt_scr_x = g_mp[m].scr_x;   opt_scr_y = g_mp[m].scr_y;
+    opt_scr_sx = g_mp[m].scr_sx; opt_scr_sy = g_mp[m].scr_sy;   /* v169: scale is per machine too */
+    scr_view_m = m;
+}
+/* v170: an ini written before per-machine scale -> that machine returns to the compiled defaults. */
+static void scr_migrate_ini(void){
+    for(int m=0;m<5;m++) if(!g_ini_scale_seen[m]){
+        g_mp[m].scr_x=SCR_DEF_X[m];   g_mp[m].scr_y=SCR_DEF_Y[m];
+        g_mp[m].scr_sx=SCR_DEF_SX[m]; g_mp[m].scr_sy=SCR_DEF_SY[m];
+    }
+    scr_view_m = -1;                                    /* force a re-sync before the next apply */
+}
+/* v169: source window this machine actually shows (NES capture is a FIXED 256x240; the ZX window is
+   the 384x302 capture minus the live crop). Needed to clamp/centre the picture in the 1280x720 raster. */
+static void scr_src_size(int m, int* w, int* h){
+    if(m==4){ *w=256; *h=240; return; }
+    int l=opt_crop_l, r=opt_crop_r, t=opt_crop_t, b=opt_crop_b;
+    if(l+r > 380) { r = 380-l; if(r<0){l=380;r=0;} }
+    if(t+b > 298) { b = 298-t; if(b<0){t=298;b=0;} }
+    *w = 384-l-r; *h = 302-t-b;
+}
+static void apply_scr(void){
+    int m = (opt_defmachine>=0 && opt_defmachine<5) ? opt_defmachine : 0;
+    /* v170 ROOT FIX. The machine index lives in the NC mailbox and changes at boot AFTER the view was
+       synced (core detect sets it from the PL VERSION), and again on every live machine switch. Writing
+       a stale view into the NEW machine's slot silently overwrote its settings - that is exactly how the
+       NES lost its x4/x3 default and kept the ZX x2. Never apply a view that mirrors another machine. */
+    if(m != scr_view_m){ scr_view_sync(); }
+    if(opt_scr_sx<1) opt_scr_sx=1;  if(opt_scr_sy<1) opt_scr_sy=1;   /* fb_line_disp divides by this */
+    int w,h; scr_src_size(m,&w,&h);
+    /* v0.15.172 (owner: "scale options where a large part goes off-screen are not needed, cap it at 3x3").
+       Cap = min(3, what actually FITS the 1280x720 raster) computed per machine from its own window, so
+       the limit follows the crop too: NES 256x240 -> x3/x3 (768x720, fills the height); ZX 384x302 -> x3
+       across but only x2 down (302*3 = 906 > 720). An out-of-range value snaps back here, so the menu row
+       can never show a setting that would push the picture outside the screen. */
+    int mx = (w > 0) ? (1280/w) : 1, my = (h > 0) ? (720/h) : 1;
+    if(mx > 3) mx = 3;  if(my > 3) my = 3;
+    if(mx < 1) mx = 1;  if(my < 1) my = 1;
+    if(opt_scr_sx > mx) opt_scr_sx = mx;
+    if(opt_scr_sy > my) opt_scr_sy = my;
+    int pw = w*opt_scr_sx, ph = h*opt_scr_sy;                         /* picture size ON the raster */
+    if(opt_scr_x<0) opt_scr_x=0;  if(opt_scr_y<0) opt_scr_y=0;
+    if(opt_scr_x + pw > 1280) opt_scr_x = (pw > 1280) ? 0 : (1280-pw);  /* raising the scale must never
+    push the picture off the screen: clamp instead of letting the right/bottom edge fall outside */
+    if(opt_scr_y + ph > 720)  opt_scr_y = (ph > 720)  ? 0 : (720-ph);
+    g_mp[m].scr_x  = opt_scr_x;   g_mp[m].scr_y  = opt_scr_y;
+    g_mp[m].scr_sx = opt_scr_sx;  g_mp[m].scr_sy = opt_scr_sy;
+    SCR_POS   = ((unsigned)opt_scr_y<<16) | ((unsigned)opt_scr_x & 0xFFFFu);
+    SCR_SCALE = ((unsigned)opt_scr_sy<<4) | ((unsigned)opt_scr_sx & 0xFu);
+}
+static void apply_numjoy(void){                 /* v176: живёт сразу + в набор машины */
+    int m=(opt_defmachine>=0&&opt_defmachine<N_MACHINES)?opt_defmachine:0;
+    g_mp[m].numjoy = opt_numjoy ? 1 : 0;
+    g_joy_last = 0xFFFFFFFFu;                   /* v180: владелец блока сменился -> перезалить JOY_STATE */
+}
+static void apply_jsrc(void){                  /* v176: PAD-источники доступны только при поднятом кэпе */
+    unsigned caps = LOAD_CAPS_R;
+    int m=(opt_defmachine>=0&&opt_defmachine<N_MACHINES)?opt_defmachine:0;
+    int* v[2] = { &opt_jsrc1, &opt_jsrc2 };
+    for(int pl=0; pl<2; pl++){
+        int x = *v[pl];
+        if(x==1 && !(caps & JOYCAP_PAD1)) x=0;
+        if(x==2 && !(caps & JOYCAP_PAD2)) x=0;
+        if(x==3 && !(caps & (JOYCAP_PAD1|JOYCAP_PAD2))) x=0;
+        *v[pl]=x; g_mp[m].jsrc[pl]=x;
+    }
+}
+/* v0.15.199: тип джойстика - настройка МАШИНЫ, как и карта кнопок. Смена типа не должна оставить
+   зажатую цифру в матрице: pump сначала отпустит всё ТЕМИ кодами, которыми нажимал (см. g_jmx_code),
+   и только потом перейдёт на новый тип. */
+static void apply_socd(void){
+    int m=(opt_defmachine>=0&&opt_defmachine<N_MACHINES)?opt_defmachine:0;
+    if(opt_socd<0||opt_socd>2) opt_socd=0;
+    g_mp[m].socd = opt_socd;
+    g_joy_last = 0xFFFFFFFFu;                 /* пересчитать порт немедленно */
+}
+static void apply_jtype(void){
+    int m=(opt_defmachine>=0&&opt_defmachine<N_MACHINES)?opt_defmachine:0;
+    if(opt_jtype1<0||opt_jtype1>3) opt_jtype1=0;
+    if(opt_jtype2<0||opt_jtype2>3) opt_jtype2=0;
+    if(m<4) opt_jtype1=opt_jtype2=0;          /* ZX policy: one Kempston, never matrix injection */
+    g_mp[m].jtype[0]=opt_jtype1; g_mp[m].jtype[1]=opt_jtype2;
+    g_joy_last = 0xFFFFFFFFu;                  /* матричный игрок уходит из порта - перезалить JOY_STATE */
+}
+static void act_scr_center(void){                 /* one keypress instead of hunting X/Y by eye */
+    int m = (opt_defmachine>=0 && opt_defmachine<5) ? opt_defmachine : 0;
+    int w,h; scr_src_size(m,&w,&h);
+    int pw = w*opt_scr_sx, ph = h*opt_scr_sy;
+    opt_scr_x = (pw >= 1280) ? 0 : (1280-pw)/2;
+    opt_scr_y = (ph >= 720)  ? 0 : (720-ph)/2;
+    apply_scr();
+    dn_status_msg("CENTERED");
+}
 /* LIVE crop: L/R/T/B trim the captured 384x302 frame. Compute the effective fb_line_disp window
    (origin sx0/sy0 + size cropw/croph), clamped so it can never invert. Global (machine-independent). */
 static void apply_crop(void){
@@ -4187,10 +9798,75 @@ static void apply_crop(void){
     CROP_A = (sy0<<16) | (sx0 & 0xFFFFu);
     CROP_B = (croph<<16) | (cropw & 0xFFFFu);
 }
+static void rom_reapply_and_reset(void);   /* v302: общий хвост всех правок ПЗУ (тело ниже) */
+static void rom_slots_ui_sync(void);       /* v302: строки слотов; тело у таблиц меню - ему нужна mi_opts */
 static unsigned machine_cfg_word(void){
     unsigned cfg = (opt_defmachine==1) ? 1u : (opt_defmachine>=2 && opt_defmachine<=3) ? 2u : 0u;   /* idx 2,3 = 48K submode (Atlas or MiSTer core) */
     if(opt_defmachine!=1 && opt_defmachine!=4 && opt_ulalate) cfg |= 4u;       /* Ferranti ULA variation exists on 48K and 128K, not Pentagon */
     if(!opt_snow) cfg |= 16u;                             /* bit4 = snow_off: ULA snow OFF (clean). Atlas core honours it; mister48 ignores it. Default ON = faithful. */
+    if(opt_svcrom == 2 && g_svc_ok) cfg |= 512u;           /* v207 bit9 = сервисная страница ПЗУ в окне.
+                                                             Только когда она РЕАЛЬНО залита: иначе в
+                                                             окне были бы нули = NOP-склон вместо машины. */
+    if(opt_svcrom == 1 && g_svc_ok) cfg |= 8192u;          /* v252 бит13 = МАГИЧЕСКАЯ КНОПКА (ядро B0101):
+                                                             сервисная страница встаёт по NMI и уходит по
+                                                             опкоду RETN. Биты 8/9/10/11-12 заняты
+                                                             (трап TR-DOS / страница / BDI A-B / SAA). */
+    if(g_trdos_ok) cfg |= 256u;                           /* v207 bit8 = трап входа в TR-DOS. Поднимаем ТОЛЬКО когда
+                                                             в залитом наборе реально есть страница TR-DOS: иначе трап
+                                                             увёл бы машину в пустую страницу на первом же M1 в 0x3Dxx.
+                                                             Бит8, а не бит5: биты 0..6 этого же слова у NES заняты
+                                                             (region[1:0], palette[5:4], sprlimit[6]) - на отказе смены
+                                                             ядра ZX получил бы чужой бит как «включить трап». */
+    /* 🥇 v0.15.388 бит25 = под вставленным TR-DOS страницу ПЗУ выбирает ПАРА {DOS, 7FFD[4]}
+       (ядро B0146): сброс бита 4 порта #7FFD вставляет СЕРВИСНУЮ страницу, а не оставляет TR-DOS.
+       Поднимаем ТОЛЬКО когда в наборе реально есть И TR-DOS (иначе защёлка не взводится вовсе, бит
+       бессмыслен), И сервисная страница - ровно тот же сторож g_svc_ok, что у битов 9 и 13: без него
+       окно уехало бы в незаписанную страницу 3 = поле 0x00 = NOP-склон вместо машины.
+       AUTO вдобавок требует доказанный вход менеджера (g_svc_entry), поэтому на наборах, где такого
+       входа нет (Gluk, диагностические, двухстраничные), поведение остаётся бит-в-бит прежним. */
+    if(g_trdos_ok && g_svc_ok &&
+       (opt_dossvc == 2 || (opt_dossvc == 1 && g_svc_entry))) cfg |= (1u << 25);
+    cfg |= RAMSIZE_CFG[(opt_ramsize >= 0 && opt_ramsize <= 3) ? opt_ramsize : 3] << 14;
+                                                         /* v314 биты 16:14 = каких старших бит
+                                                            банка у машины НЕТ (объём ОЗУ).
+                                                            Ставим ДО перекрытия под NES - у него
+                                                            слово собирается заново. */
+    cfg |= ((unsigned)(opt_saa & 3)) << 11;               /* v217 биты 12:11 = режим SAA1099 на порте #FF.
+                                                             Ставится ДО перекрытия под NES: у NES это слово
+                                                             собирается заново, и чужие биты туда не уедут. */
+    /* 🥇 v342 DivMMC. Раньше бит17 не ставил НИКТО, поэтому опция в меню ничего не делала.
+       Биты - таблица DIVMMC_PLAN.md §3.2, значения - решение владельца 13.08: в режиме DivMMC
+       всё грузится через esxDOS (NMI ведёт в его браузер, оттуда TAP, TRD, SCL и музыка).
+       ⚠ Два взаимоисключения держит ПРОШИВКА, потому что в фабрике они на одном проводе:
+       трап TR-DOS (бит8) - страница ПЗУ 2 занята esxDOS; магическая кнопка (бит13) - вход
+       0x0066 отдан браузеру. Поднять их вместе значит получить машину, которая уходит то в
+       TR-DOS, то в esxDOS от одной и той же инструкции. */
+    /* v350: Z-Controller. Бит НЕЗАВИСИМ от DivMMC - карта одна, конфликта нет, а автомаппера у
+       ZC нет вовсе, поэтому трап TR-DOS он не отбирает и с бета-диском уживается. */
+    if(opt_zc && opt_defmachine != 4 && (LOAD_CAPS_R & LOADCAP_DIVMMC)){
+        cfg |= (1u << 19);
+    }
+    /* v383/v387 Бит скорости SPI принадлежит ОБЩЕМУ движку карты, а не одному транспорту: карта в
+       фабрике одна, и оба порта (#57 у Z-Controller, #EB у DivMMC) сдвигают через неё же. Раньше бит
+       ставился только внутри ветки Z-Controller, поэтому конфигурация «DivMMC включён, ZC выключен»
+       уезжала в Standard-режим - а он был сломан с B0142 (стартовый импульс движка промахивался мимо
+       разрешающего такта, обмена не было вовсе; модель карты вдобавок сэмплировала УРОВЕНЬ sck).
+       В v383 это прикрывалось форсажем Turbo. С ядра B0145 Standard исправлен и проверен
+       симуляцией связки usd_bulb+divmmc_card на обеих скоростях, поэтому форсаж СНЯТ: выбор
+       владельца в диалоге Z-Controller действует для обоих транспортов. */
+    if((opt_zc || opt_divmmc) && opt_defmachine != 4 && (LOAD_CAPS_R & LOADCAP_DIVMMC)){
+        if(opt_zcturbo) cfg |= (1u << 20);
+    }
+    if(opt_divmmc && opt_defmachine != 4 && (LOAD_CAPS_R & LOADCAP_DIVMMC)){
+        cfg &= ~(256u | 8192u | (1u << 25));   /* трап TR-DOS, магическая кнопка и пара {DOS,7FFD[4]}
+                                                  (v388: без трапа защёлка не взводится, а страницу 2
+                                                  занимает ПЗУ esxDOS) - выключены */
+        cfg |= (1u << 17);             /* автомаппер и карта включены */
+        cfg |= (1u << 18);             /* входы 0x0008/0x0038/0x04C6/0x0562 - только при 48 BASIC */
+        cfg |= (1u << 21);             /* 22:21 = 01: ловушки ленты у esxDOS */
+        cfg |= (1u << 23);             /* защита записи MAPRAM (страница 3 только на чтение) */
+        cfg |= (1u << 24);             /* вход 0x0066 -> NMI-браузер esxDOS */
+    }
     if(opt_defmachine==4) {
         /* NES overrides: region<<0, palette<<4, sprlimit<<6 (assume 1) */
         cfg = ((unsigned)opt_region & 3u) | (((unsigned)opt_palette & 3u) << 4) | (1u << 6);
@@ -4203,6 +9879,11 @@ static void apply_machine(void){
     int changed = (applied >= 0 && applied != opt_defmachine);
     if(changed){                                   /* live SWITCH: load the incoming machine's OWN parameter set */
         if(g_tape_on) tape_stop();                 /* a tape was loading into the machine we are wiping -> abort it (music playback is a separate service, untouched) */
+        /* v226 (владелец): дискеты принадлежат ПРЕЖНЕЙ машине - при смене их надо извлечь, а не
+           оставлять висеть в списке. И делать это ОБЯЗАТЕЛЬНО здесь, ДО перезагрузки ядра: у другого
+           ядра (например NES) дисковода нет вовсе, и незаписанный сектор потерялся бы молча.
+           disk_eject_safe дожидается простоя контроллера и дописывает буферы FatFs на карту. */
+        for(int d=0; d<NDRV; d++) (void)disk_eject_safe(d);
         g_menu_restructure = 1;                    /* the Machine submenu item set changes -> force a full menu re-render */
         mp_store(applied);                         /* save the machine we are leaving (keep its live tweaks) */
         mp_load(opt_defmachine);                   /* load the machine we are entering -> opt_* */
@@ -4227,7 +9908,10 @@ static void apply_machine(void){
             char cp[64]; core_path(cp, tgt);
             rc = pl_reload(cp);                        /* 0 = OK: PL is now `tgt`, fabric re-initialised into opt_defmachine */
             if(rc == 0) {
-                g_cur_core = tgt;
+                /* v0.15.340: имя ядра ставит САМ pl_reload - по пути файла, сверенному со словом
+                   семейства MACHINE_ID. Здесь его больше НЕ переписываем: `tgt` - это НАМЕРЕНИЕ, и
+                   присваивание `g_cur_core = tgt` затирало бы честное расхождение «в файле с
+                   каноническим именем лежит другое ядро». Не возвращать сюда ни tgt, ни VERSION. */
                 fabric_reinit_after_reload();
             }
         }
@@ -4239,6 +9923,19 @@ static void apply_machine(void){
         }
         applied = opt_defmachine;
         machine_menu_sync();                       /* menu re-render off a stopped, coherent core */
+        /* v0.15.207: НАБОР ПЗУ этой машины - здесь, пока процессор ещё стоит. Порядок важен: сначала
+           ядро и сброс (выше), потом ПЗУ, и только потом отпускаем HALT - иначе Z80 успеет стартовать
+           со ПЗУ прошлой машины. MACHINE_CFG перетолкиваем повторно: бит5 (трап TR-DOS) зависит от
+           того, есть ли в залитом наборе страница TR-DOS, а это выясняется только при заливке. */
+        if(LOAD_CAPS_R & LOADCAP_ROM){
+            g_rom_msg[0] = 0;
+            romset_apply();
+            MACHINE_CFG = machine_cfg_word();
+        }
+        /* v0.15.302: строки слотов пересобираем ПОСЛЕ заливки. machine_menu_sync выше отработал до
+           неё, то есть видел ещё прошлое содержимое страниц - оставить так значит показать владельцу
+           вчерашнюю раскладку. Зовём и на ядрах без порта: там правильный ответ - погасить группу. */
+        rom_slots_ui_sync();
         apply_halt();                              /* release per halt_src (idempotent after a reload) -> the new ROM runs */
         if(changed){ g_app_stopped = 0; g_app_path[0] = 0; update_banner(); }   /* old app gone with the wipe/reload */
     } else {                                       /* re-apply of the SAME machine (idempotent onchange): no wipe */
@@ -4248,7 +9945,227 @@ static void apply_machine(void){
     }
     if(browser_on && !g_menu_open) draw_topstatus();   /* live machine label in the top-right */
 }
+static void apply_region(void){          /* v0.15.189: sys_type[1:0] в MACHINE_CFG; ядро само сбросится */
+    if(opt_defmachine == 4) MACHINE_CFG = machine_cfg_word();
+}
+/* v0.15.303 ОДНА ОХРАНА ПОРТА ЗАЛИВКИ НА ВСЕ ПРАВКИ ПЗУ. Было врозь: apply_rombus честно печатал
+   «порта нет», а выбор набора на том же ядре молча доходил до machine_reset() - машина
+   перезагружалась, ПЗУ при этом не менялось (romset_apply возвращает 0 первой же строкой), и
+   владелец видел сброс без причины. Один вход, одно сообщение, одинаковое поведение. */
+static int rom_port_ok(void){
+    if(LOAD_CAPS_R & LOADCAP_ROM) return 1;
+    dn_status_msg("ROM PORT ABSENT");
+    return 0;
+}
 static void apply_snow(void){ MACHINE_CFG = machine_cfg_word(); }   /* v145: LIVE ULA-snow toggle. Only bit4 changes vs the running mode -> the vmmA1 mux flips, no ROM/paging glitch, no reset. */
+/* v0.15.207 ROM SET: смена набора ПЗУ - это смена ЛИЦА машины, поэтому обязателен холодный старт
+   (иначе Z80 продолжит исполнять адреса прежнего ПЗУ). MACHINE_CFG перетолкивается ПОСЛЕ заливки:
+   бит5 (трап TR-DOS) зависит от того, нашлась ли в наборе страница TR-DOS. */
+static void apply_romset(void){
+    int m = (opt_defmachine>=0 && opt_defmachine<N_MACHINES) ? opt_defmachine : 0;
+    /* Имя набора запоминаем ВСЕГДА, даже если залить его сейчас нечем: оно уедет в ini и применится,
+       как только под машину встанет ядро с портом заливки. */
+    { const char* s = (opt_romset>0 && opt_romset<g_rs_n) ? g_rs_name[opt_romset] : "";
+      /* 🥇 v0.15.386 ДРУГОЙ ФАЙЛ - ДРУГИЕ СТРАНИЦЫ, ЗНАЧИТ РУЧНАЯ РАСКЛАДКА БОЛЬШЕ НЕ ЗНАЧИТ
+         НИЧЕГО. rommap хранит НОМЕРА СТРАНИЦ В ФАЙЛЕ. Оставить его при смене набора значит применить
+         к новому файлу таблицу, составленную для старого: у 32-КБ набора номера 2 и 3 просто не
+         существуют, rom_manual_map превращает их в «не грузить», и слот 0 - ЗАГРУЗОЧНЫЙ - молча
+         остаётся с ПЗУ прежнего набора. Сбрасываем в AUTO: ручную раскладку задают в диалоге
+         «ROM file and banks», а он идёт своим путём и сюда не заходит. */
+      if(cicmp(s, g_mp[m].romset)){
+          g_mp[m].rommode = 0;
+          for(uint32_t q=0; q<ROM_PG_N; q++) g_mp[m].rommap[q] = -1;
+      }
+      int i=0; for(; s[i] && i<(int)sizeof(g_mp[m].romset)-1; i++) g_mp[m].romset[i]=s[i];
+      g_mp[m].romset[i]=0; }
+    if(!rom_port_ok()) return;             /* v303: ядро без порта - НЕ сбрасываем машину впустую */
+    if(g_tape_on) tape_stop();             /* v207: смена ПЗУ = сброс+вайп машины. Лента, которая в неё
+                                              грузилась, обязана остановиться - иначе ARM продолжит
+                                              стримить дескрипторы в уже сброшенную машину («лента
+                                              играет, а грузить нечего»). Ровно как в apply_machine. */
+    rom_reapply_and_reset();
+}
+/* v0.15.302: перезалить ПЗУ текущей машины и холодно её перезапустить. Общий хвост для смены
+   набора, смены файла в слоте и смены стартовой страницы: любая из них меняет ЛИЦО машины, и без
+   сброса Z80 продолжил бы исполнять адреса прежнего ПЗУ. MACHINE_CFG перетолкивается ПОСЛЕ заливки:
+   бит8 (трап TR-DOS) и бит9/13 (сервисная страница) зависят от того, что реально легло. */
+static void rom_reapply_and_reset(void){
+    if(!rom_port_ok()) return;             /* v303: последний рубеж - сюда сходятся ВСЕ правки ПЗУ */
+    g_rom_msg[0] = 0;
+    romset_apply();
+    rom_slots_ui_sync();                   /* строки слотов показывают РЕЗУЛЬТАТ, а не намерение */
+    MACHINE_CFG = machine_cfg_word();
+    machine_reset();                       /* сброс+вайп с уже залитым ПЗУ; кончается HALTED */
+    apply_halt();                          /* отпустить процессор - он стартует с нового ПЗУ */
+    /* v305: УДЕРЖАННОЕ сообщение. Сразу за возвратом отсюда закрывается меню, а закрытие перерисовывает
+       навигатор целиком - обычный dn_status_msg жил доли секунды, и единственный отчёт о том, ЧТО
+       легло в страницы (или почему не легло), пропадал у владельца на глазах. */
+    if(g_rom_msg[0]) dn_status_hold(g_rom_msg);
+}
+/* v0.15.302 СТАРТОВАЯ СТРАНИЦА. Смена = та же перезаливка: страница, которую машина читает при
+   сбросе, зашита в ядре, поэтому «выбор» физически делается перекладкой содержимого (rom_load_set). */
+static void apply_rombus(void){
+    int m = (opt_defmachine>=0 && opt_defmachine<N_MACHINES) ? opt_defmachine : 0;
+    if(opt_rombus < 0 || opt_rombus > (int)ROM_PG_N) opt_rombus = 0;
+    g_mp[m].rombus = opt_rombus;
+    if(!rom_port_ok()) return;             /* v303: та же охрана и то же сообщение, что у всех правок ПЗУ */
+    if(g_tape_on) tape_stop();             /* как в apply_romset: машину сейчас сбросит */
+    rom_reapply_and_reset();
+}
+/* v0.15.207 СЕРВИСНОЕ ПЗУ (страница 3 набора). Без этого пункта четвёртая страница набора вообще
+   недостижима машиной - 4 плитки BRAM висели бы мёртвым грузом. Выбор статический: пока включено,
+   в окне 0x0000 стоит сервисная страница (трап TR-DOS имеет приоритет над ней). */
+static void apply_svcrom(void){
+    int m = (opt_defmachine>=0 && opt_defmachine<N_MACHINES) ? opt_defmachine : 0;
+    if(opt_svcrom && !g_svc_ok){            /* сервисной страницы в наборе нет - включать нечего */
+        opt_svcrom = 0; g_mp[m].svcrom = 0;
+        dn_status_msg("NO SERVICE ROM IN SET");
+        return;
+    }
+    if(opt_svcrom < 0 || opt_svcrom > 2) opt_svcrom = 0;   /* v252: три позиции, чужое значение из ini не пускаем */
+    g_mp[m].svcrom = opt_svcrom;                           /* v252: 0 OFF / 1 NMI / 2 ALWAYS */
+    if(g_tape_on) tape_stop();
+    MACHINE_CFG = machine_cfg_word();
+    machine_reset();                        /* смена страницы ПЗУ под работающим Z80 = мусорный PC */
+    apply_halt();
+}
+/* 🥇 v0.15.388 СТРАНИЦА ПЗУ ПОД TR-DOS (ядро B0146). Эталоны расходятся, поэтому это опция:
+     OFF  - под вставленным TR-DOS в окне ВСЕГДА слот 2 (поведение до B0146). Нужен двухстраничным
+            наборам, заводскому ПЗУ битстрима (ROM SET = BUILT-IN) и вообще любому набору без
+            сервисной страницы: там слот 3 не записан, и окно ушло бы в поле 0x00 = NOP-склон.
+     AUTO  - ON только если в слоте 3 доказан вход штатного менеджера (12 нулей по 0x3FF0 и
+            0x3FFC = DI; JP). ЭТО ДЕФОЛТ: на всех прежних наборах признака нет, значит поведение
+            прежнее, а наборы с настоящих пентагонов (FATALL, Proteus) начинают работать сами.
+     ON   - как настоящий Пентагон всегда: {DOS=1, 7FFD[4]=0} = сервисная страница. Ставить, если
+            менеджер входит иначе, чем через известный нам вход, и владелец знает, что слот 3 цел.
+   Проверять при включённом DivMMC нельзя: трап TR-DOS там погашен (memory.v: trdos_en & ~mapper),
+   а слот 2 занят ESXMMC.ROM - переключатель просто ни на что не влияет.
+   Сброс машины обязателен по той же причине, что у apply_svcrom: карта ПЗУ меняется под живым PC. */
+static void apply_dossvc(void){
+    int m = (opt_defmachine>=0 && opt_defmachine<N_MACHINES) ? opt_defmachine : 0;
+    if(opt_dossvc < 0 || opt_dossvc > 2) opt_dossvc = 1;
+    g_mp[m].dossvc = opt_dossvc;                   /* выбор владельца запоминаем ВСЕГДА */
+    if(opt_dossvc && !(g_trdos_ok && g_svc_ok)){
+        /* 🥇 РЕВЬЮ 19.08: ЗДЕСЬ НЕЛЬЗЯ ПЕРЕПИСЫВАТЬ ВЫБОР НА OFF. У apply_svcrom такой откат
+           безобиден (там OFF и есть дефолт), а у этого пункта дефолт AUTO: один Enter на BUILT-IN или
+           на двухстраничном наборе оставил бы в профиле dossvc=0 НАВСЕГДА, а «Save config» унёс бы
+           этот нуль в ini - после чего FATALL/Proteus снова «не грузятся», причём молча. Включать
+           сейчас действительно нечего, но безопасность держит НЕ это место: бит25 поднимается в
+           machine_cfg_word только при g_trdos_ok && g_svc_ok. Поэтому слово владельца сохраняем, а
+           машину не сбрасываем - слово MACHINE_CFG от этой правки не изменилось. */
+        dn_status_msg("NEEDS A SET WITH TR-DOS + SERVICE PAGE");
+        return;
+    }
+    if(g_tape_on) tape_stop();
+    MACHINE_CFG = machine_cfg_word();
+    machine_reset();
+    apply_halt();
+}
+/* v0.15.217 SAA1099 (ядро B0087). Чип сидит на порте #FF, где A8 выбирает адресный регистр
+   (#01FF) или данные (#00FF) - проверено по коду E-TUNES 7. На машине с Beta Disk тот же
+   младший байт - системный регистр дисковода, поэтому порт делится ПО ВРЕМЕНИ, и режим - опция:
+     AUTO - SAA не слышит #FF, пока вставлена страница ПЗУ TR-DOS ИЛИ реально идёт обмен с
+            дискетой. Загрузка: порт у дисковода (записи TR-DOS не сыплют мусор в регистры SAA).
+            Программа загрузилась, дисковод встал - порт у SAA, музыка играет. ЭТО ДЕФОЛТ.
+     ON   - слышен всегда (софт, который лезет к SAA при вставленном TR-DOS).
+     OFF  - не слышит никогда (поведение до B0087, когда в битстриме была заглушка чипа).
+   Живая правка: меняются только биты 12:11 того же слова - ни ПЗУ, ни страничность, ни сброс. */
+static void apply_saa(void){
+    int m = (opt_defmachine>=0 && opt_defmachine<N_MACHINES) ? opt_defmachine : 0;
+    if(opt_saa < 0 || opt_saa > 2) opt_saa = 0;
+    g_mp[m].saa = opt_saa;
+    MACHINE_CFG = machine_cfg_word();
+}
+/* v0.15.281 ОБЪЁМ ОЗУ КАРТЫ. Менять можно только с перезапуском карты: прошивка GS мерит память
+   один раз при инициализации и потом отвечает софту запомненным числом страниц. Если карта сейчас
+   поднята - поднимаем заново, иначе новое значение применится при включении. */
+/* v0.15.314 ОБЪЁМ ОЗУ. Меняется страничность, то есть КАРТА ПАМЯТИ под работающим Z80 - живьём
+   это тот же отказ, что и живая смена модели: процессор продолжит исполнять адреса, которых под
+   ним больше нет. Поэтому холодный старт по той же схеме, что у смены машины: HALT -> защёлкнуть
+   слово -> сброс с очисткой -> отпустить. */
+static void apply_ramsize(void){
+    int m = (opt_defmachine>=0 && opt_defmachine<N_MACHINES) ? opt_defmachine : 0;
+    if(opt_ramsize < 0 || opt_ramsize > 3) opt_ramsize = 3;
+    g_mp[m].ramsize = opt_ramsize;
+    IJ_CTRL = 1;                                                     /* HALT */
+    for(volatile uint32_t t=0; t<8000000u && !(IJ_STAT & 1u); t++){}  /* ждём HALT_ACK */
+    MACHINE_CFG = machine_cfg_word();                                /* защёлкиваем на стоящем Z80 */
+    machine_reset();
+    apply_halt();
+    { char msg[40]; int k = 0;
+      for(const char* q = "RAM "; *q; q++) msg[k++] = *q;
+      for(const char* q = CH_RAMSIZE[opt_ramsize]; *q; q++) msg[k++] = *q;
+      msg[k] = 0; dn_status_msg(msg); }
+}
+static void apply_gsram(void){
+    int m = (opt_defmachine>=0 && opt_defmachine<N_MACHINES) ? opt_defmachine : 0;
+    if(opt_gsram < 0 || opt_gsram > 3) opt_gsram = 1;
+    g_mp[m].gsram = opt_gsram;
+    gs_set_ram_kb(GSRAM_KB[opt_gsram]);
+    if(g_gs_live){
+        dn_status_msg("GS: RESTARTING CARD");
+        gs_boot();
+        { char msg[40]; int k = 0;
+          for(const char* q = "GS MEMORY "; *q; q++) msg[k++] = *q;
+          for(const char* q = CH_GSRAM[opt_gsram]; *q; q++) msg[k++] = *q;
+          msg[k] = 0; dn_status_msg(msg); }
+    }
+}
+/* v0.15.336 ЧАСТОТА КАРТЫ. Меняется ЖИВЬЁМ и без перезапуска: у карты нет ни одного состояния,
+   которое зависело бы от частоты. Счётчик до прерывания досчитывает старым остатком и заряжается
+   уже новым периодом, дробь Брезенхэма считается по неизменным 37480 Гц, долг времени хранится в
+   тактах и сам упирается в новый потолок. Прошивка карты частоту не мерит (память - мерит, поэтому
+   её объём и требует перезапуска, а частота нет). Отсюда defer=0: стрелка по строке применяет
+   значение сразу, и разницу слышно на играющем модуле.
+   Прибор темпа обнуляем: его номинал изменился, и «худшее за всё время», измеренное в прежней
+   шкале, стало бы враньём в новой. */
+static void apply_gsclk(void){
+    int m = (opt_defmachine>=0 && opt_defmachine<N_MACHINES) ? opt_defmachine : 0;
+    if(opt_gsclk < 0 || opt_gsclk > 3) opt_gsclk = GSCLK_DEF;
+    g_mp[m].gsclk = opt_gsclk;
+    gs_set_clock_hz(GSCLK_HZ[opt_gsclk]);
+    gs_meter_reset();
+    { char msg[40]; int k = 0;
+      for(const char* q = "GS CLOCK "; *q; q++) msg[k++] = *q;
+      for(const char* q = CH_GSCLK[opt_gsclk]; *q; q++) msg[k++] = *q;
+      msg[k] = 0; dn_status_msg(msg); }
+}
+/* v0.15.265 GENERAL SOUND (ядро B0107). Карта живёт на ARM: процессор, страничная память, каналы и
+   микшер в gs_arm.c, в фабрике - только ловушка портов #BB/#B3 и гейт «карта включена». Звук
+   СУММИРУЕТСЯ с машиной (0x78 бит1), а не скрещивается с ней: GS - довесок к машине, а не плеер,
+   который её заменяет. Включение стоит ~5 с реального времени (прогон инициализации прошивки GS),
+   поэтому делается ОДИН раз здесь, а не при каждом запуске софта. */
+static void apply_gs(void){
+    int m = (opt_defmachine>=0 && opt_defmachine<N_MACHINES) ? opt_defmachine : 0;
+    if(opt_gs < 0 || opt_gs > 1) opt_gs = 0;
+    g_mp[m].gs = opt_gs;
+    if(opt_gs){
+        if(opt_defmachine > 2){          /* ловушка есть только в ядре Atlas */
+            opt_gs = 0; g_mp[m].gs = 0;
+            dn_status_msg("GENERAL SOUND: ZX MACHINES ONLY");
+            return;
+        }
+        if(!g_gs_live){
+            dn_status_msg("GENERAL SOUND: STARTING");
+            if(gs_boot()) dn_status_msg("GENERAL SOUND: ON");
+            else {
+                opt_gs = 0; g_mp[m].gs = 0;
+                /* v305: называем ТОТ путь, по которому прошивка карты ищется на самом деле. С v301
+                   это 0:/GS/ (0:/ROMS/ остался лишь запасным для карт со старой раскладкой), а текст
+                   отказа продолжал посылать владельца в папку ПЗУ машины - ровно туда, куда её класть
+                   не надо. */
+                dn_status_msg("NO GS FIRMWARE: 0:/GS/GS105B.ROM");
+            }
+        }
+    } else if(g_gs_live){
+        g_gs_live = 0;
+        player_gs_enable(0);
+        GS_CTL = 0; g_gs_ctl_lv = 0xFFFFFFFFu; g_gs_en_last = 0;   /* снять гейт: порты #BB/#B3 снова
+                                                                      принадлежат машине */
+        if(!player_active() && !g_tape_on) AUDIO_CTRL = 0;
+        dn_status_msg("GENERAL SOUND: OFF");
+    }
+}
 static unsigned cur_fmode(void){
     /* WAV/MP3 with animated/custom loaders cannot safely use CPU-only FAST8:
        mode3 is the hybrid fast-prefix -> whole-core alias. v0.15.129: the alias now
@@ -4275,7 +10192,105 @@ static const char* const CH_SCROLL[] = {"SLOW","MED","FAST"};
 static const char* const CH_FOLDER[] = {"BRACKETS","ICON","SLASH"};
 static const char* const CH_DELAY[]  = {"0S","300MS","500MS","1S"};
 static void mp3_sens_dialog(void);   /* fwd: dedicated numeric editor for MP3 sens (defined after the dialog primitives) */
-static void machine_select_dialog(void);   /* fwd: modal machine picker (radio list) */static menu_item opt_items[] = {
+static void machine_select_dialog(void);   /* fwd: modal machine picker (radio list) */
+static void romset_select_dialog(void);    /* v214: modal list of files from 0:/ROMS/ */
+/* v0.15.302: у каждого слота свой пункт, а движок меню зовёт обработчик БЕЗ параметра - отсюда
+   четыре тонкие обёртки над одним диалогом. */
+static void rom_slot0_dialog(void);
+static void rom_slot1_dialog(void);
+static void rom_slot2_dialog(void);
+static void rom_slot3_dialog(void);
+static void apply_rombus(void);            /* v302: смена стартовой страницы = перезаливка + сброс */
+
+/* ================= v0.15.334: ПОЧЕМУ ДВА ПЕРЕКЛЮЧАТЕЛЯ «НЕ РАБОТАЮТ» =============================
+   Оба отказа - не отказы прошивки, а умолчание интерфейса о том, что решение принимает не он.
+   Диагноз записан здесь, рядом с кодом, который его показывает.
+
+   1) SYNC LOADER. В фабрике (`sources/bulbulator_zx_ddr_top.v:745`) стоит
+         wire sync_effective = tsync_s[1] | (fm_s1 == 2'd1);
+      то есть режим скорости 8x ВКЛЮЧАЕТ демандовую ленту сам, чего бы ни стояло в меню. Так и
+      задумано: быстрая загрузка построена ровно на этом гейте, снимать его нельзя. А по умолчанию
+      как раз `opt_fastload = 1` (8x) - поэтому владелец в жизни не видел выключенного SYNC.
+      Смотрим именно на opt_fastload, а не на cur_fmode(): у WAV/MP3 «FAST» - это режим 3 (гибрид),
+      под гейт fm==1 он не попадает, и врать про него нельзя.
+      Логику НЕ трогаем: значение по-прежнему пишется в ini и по-прежнему действует на NORMAL.
+
+   2) ULA SNOW. Бит4 слова MACHINE_CFG (snow_off, см. machine_cfg_word) исполняет ТОЛЬКО ядро
+      Atlas; ядро MiSTer-48 его игнорирует, у NES снега нет как явления.
+      🥇 Признак КОСВЕННЫЙ, и это сказано честно: бита «умею снег» в LOAD_CAPS (0xC0) не существует -
+      там заняты 0 (джойстик), 1/2 (источники ввода), 3 (готовый кадр клавиатуры), 4 (порт заливки
+      ПЗУ), 5 (регистры ATA), 6 (мышь), 7 (DRQ). Поэтому спрашиваем ЯДРО, которое сейчас в ПЛИС
+      (g_cur_core: на старте - слово семейства MACHINE_ID, дальше его ставит pl_reload по пути
+      залитого файла, сверенному с тем же словом), а не имя
+      выбранной машины: пока ядро не перезагрузили, правда - это то, что реально лежит в ПЛИС.
+      Появится бит возможностей - править надо будет ровно snow_core_ok(), одно место.
+=================================================================================================*/
+static const char* note_tapesync(void){
+    return (opt_fastload == 1) ? " (ON: 8x)" : 0;
+}
+static const char* why_tapesync(void){
+    return (opt_fastload == 1) ? "SYNC LOADER FORCED ON BY TAP/TZX SPEED = 8x"
+                               : "SYNC LOADER APPLIES AT TAP/TZX SPEED = NORMAL";
+}
+/* v0.15.336 ПОДСКАЗКА К «GS CLOCK». Правило владельца: опция без объяснения, КОГДА её трогать,
+   бесполезна. Поэтому у каждого значения своя фраза в строке состояния, а пометка у самого
+   значения честно говорит, что при выключенной карте переключатель сейчас ни на что не влияет. */
+static const char* note_gsclk(void){ return g_gs_live ? 0 : " (GS off)"; }
+static const char* why_gsclk(void){
+    switch(opt_gsclk){
+        case 1:  return "14 MHZ: HEADROOM IF 12 STILL GLITCHES. ARM COST +8%";
+        case 2:  return "18 MHZ: WIDE HEADROOM, CLEAN TO 1000 US POLL (WE POLL AT 333). ARM +31%";
+        case 3:  return "24 MHZ: FX HEADROOM ONLY, NO GAIN OVER 18 ON MUSIC. ARM +55%";
+        default: return "12 MHZ = REAL CARD, AND ENOUGH SINCE THE REPLY-QUEUE FIX. RAISE ONLY IF YOU HEAR GAPS";
+    }
+}
+static int snow_core_ok(void){ return cicmp(g_cur_core, "ATLAS") == 0; }
+static const char* note_snow(void){
+    if(!snow_core_ok())                             return " (core ignores)";
+    /* v352: на Пентагоне снег - отступление от оригинала, и пометка говорит это у самого значения */
+    if(opt_defmachine == MACH_PENT1024 && opt_snow) return " (not on real Pentagon)";
+    return 0;
+}
+static const char* why_snow(void){
+    if(!snow_core_ok()) return "ULA SNOW IS HONOURED BY THE ATLAS CORE ONLY";
+    if(opt_defmachine == MACH_PENT1024)
+        return opt_snow ? "REAL PENTAGON HAS NO CONTENTION AND NO SNOW - ON IS A DELIBERATE DEVIATION"
+                        : "OFF = FAITHFUL PENTAGON. TURN ON ONLY TO COMPARE AGAINST A 128K";
+    return opt_snow ? "ON = FAITHFUL 128K/48K HARDWARE (SNOW WHEN I POINTS AT SCREEN RAM)"
+                    : "OFF = CLEAN RASTER. USE IF SOFTWARE PAINTS THROUGH THE SNOW";
+}
+
+/* v0.15.388 ПОДСКАЗКА К «SVC PAGE UNDER TR-DOS». Правило владельца: опция без объяснения, КОГДА её
+   трогать, бесполезна и хуже отсутствия опции. Поэтому пометка у значения говорит, что переключатель
+   сейчас решает, а строка состояния - когда каждая позиция нужна и когда её брать НЕЛЬЗЯ. */
+/* ревью 19.08: условие DivMMC здесь обязано быть ТЕМ ЖЕ, что в machine_cfg_word - иначе на ядре без
+   DivMMC (MiSTer-48, старый Atlas) с оставленной галкой пометка говорила «trap off», хотя трап жив, а
+   бит25 никто не гасил. И порядок: сначала «набора нет», потом «DivMMC» - у машины без порта ПЗУ
+   правдивая причина именно первая. */
+static int dossvc_dm_gates(void){
+    return (opt_divmmc && opt_defmachine != 4 && (LOAD_CAPS_R & LOADCAP_DIVMMC)) ? 1 : 0;
+}
+static const char* note_dossvc(void){
+    if(!g_trdos_ok || !g_svc_ok)  return " (no TR-DOS + service page)";
+    if(dossvc_dm_gates())         return " (DivMMC: trap off)";
+    if(opt_dossvc == 1)           return g_svc_entry ? " (auto: ON)" : " (auto: off)";
+    return 0;
+}
+static const char* why_dossvc(void){
+    if(!g_trdos_ok || !g_svc_ok)
+        return "NEEDS A ROM SET WITH BOTH TR-DOS AND A SERVICE PAGE (SLOT 2 + SLOT 3)";
+    if(dossvc_dm_gates())
+        return "DIVMMC IS ON: TR-DOS TRAP IS OFF AND SLOT 2 HOLDS ESXMMC.ROM - NO EFFECT";
+    switch(opt_dossvc){
+        case 2:  return "ON = REAL PENTAGON: OUT #7FFD BIT4=0 UNDER TR-DOS PAGES IN SLOT 3";
+        case 1:  return g_svc_entry
+                     ? "AUTO: SLOT 3 HAS THE MANAGER ENTRY (12 NOPS AT 3FF0 + DI/JP AT 3FFC) - ON"
+                     : "AUTO: NO MANAGER ENTRY IN SLOT 3 - STAYS OFF, PAGING AS BEFORE B0146";
+        default: return "OFF = SLOT 2 STAYS PAGED UNDER TR-DOS. USE FOR 2-PAGE SETS AND BUILT-IN ROM";
+    }
+}
+
+static menu_item opt_items[] = {
     {"SORT",     ITEM_CHOICE, &sortmode,       CH_SORT,   4, 0, sort_changed},   /* live re-sort (menu value-item parity with F3) */
     {"SCROLL",   ITEM_CHOICE, &opt_scroll,     CH_SCROLL, 3, 0},
     {"SCROLL DELAY", ITEM_CHOICE, &opt_scrdelay,   CH_DELAY,  4, 0},
@@ -4297,25 +10312,114 @@ static void machine_select_dialog(void);   /* fwd: modal machine picker (radio l
     {"ON LAUNCH", ITEM_CHOICE, &opt_launchsnd, CH_LAUNCH, 2, 0},   /* [17] program launched while music plays: MACHINE=suspend music (machine sound) / MUSIC=keep music (machine muted) */
     {"BOOT NAV",  ITEM_CHOICE, &opt_bootnav,   CH_NOYES,  2, 0},   /* [18] show the navigator at boot (NO = boot to the machine, F12 opens it) */
     {"TAPE MUTE", ITEM_CHOICE, &opt_tapemute,  CH_NOYES,  2, 0, apply_tapemute},   /* [19] mute the machine beeper while a tape loads */
-    {"MACHINE", ITEM_CHOICE, &opt_defmachine, CH_MACHINE, N_MACHINES, machine_select_dialog, apply_machine},   /* [20] Enter/Space opens the modal picker; onchange (apply_machine) reboots into the chosen machine */
+    /* [20] Enter/Space открывает модальный выбор; onchange (apply_machine) перезагружает ЯДРО через
+       PCAP и стирает ОЗУ машины - поэтому defer=1: стрелки только двигают значение. */
+    {"MACHINE", ITEM_CHOICE, &opt_defmachine, CH_MACHINE, N_MACHINES, machine_select_dialog, apply_machine, 0, 0, 1},
     {"PENT INT V", ITEM_RANGE, &opt_pintv, 0, 1, 0, apply_pint, 319, ""},   /* [21] step 1 (hold to repeat) */
     {"PENT INT H", ITEM_RANGE, &opt_pinth, 0, 1, 0, apply_pint, 447, ""},   /* [22] step 1 */
-    {"PAPER H OFF", ITEM_RANGE, &opt_paper_h, 0, 1, 0, apply_paper, 127, ""}, /* [23] step 1: paper h within frame */
-    {"PAPER V OFF", ITEM_RANGE, &opt_paper_v, 0, 1, 0, apply_paper, 63, ""}, /* [24] step 1: paper v within frame */
-    {"SCREEN X",   ITEM_RANGE, &opt_scr_x, 0, 1, 0, apply_scr, 640, ""},    /* [25] step 1: whole frame H position on HDMI (HMARGIN, live) */
-    {"SCREEN Y",   ITEM_RANGE, &opt_scr_y, 0, 1, 0, apply_scr, 200, ""},    /* [26] step 1: whole frame V position on HDMI (VMARGIN, live) - moves BORDER+paper together */
+    {"PAPER H OFF", ITEM_RANGE, &opt_paper_h, 0, 1, 0, apply_paper, 447, ""}, /* [23] step 1: paper h within frame. B0127: диапазон ВСЯ СТРОКА (447), потому что ручка стала КРУГОВОЙ: 447 = минус один пиксель, 440 = минус восемь. Раньше 127 и упор в ноль - владелец не мог увести бумагу влево, а именно это и нужно, когда бумага разъехалась с бордюром (INT H двигает их вместе и не помогает). */
+    {"PAPER V OFF", ITEM_RANGE, &opt_paper_v, 0, 1, 0, apply_paper, 319, ""}, /* [24] step 1: paper v within frame. B0127: круговая по числу строк кадра (319 = минус одна строка). */
+    {"SCREEN X",   ITEM_RANGE, &opt_scr_x, 0, 1, 0, apply_scr, 1280, ""},    /* [25] step 1: whole frame H position on HDMI (HMARGIN, live) */
+    {"SCREEN Y",   ITEM_RANGE, &opt_scr_y, 0, 1, 0, apply_scr, 720, ""},    /* [26] step 1: whole frame V position on HDMI (VMARGIN, live) - moves BORDER+paper together */
     {"CROP L",     ITEM_RANGE, &opt_crop_l, 0, 1, 0, apply_crop, 190, ""},  /* [27] step 1: trim left edge (global display) */
     {"CROP R",     ITEM_RANGE, &opt_crop_r, 0, 1, 0, apply_crop, 190, ""},  /* [28] trim right */
     {"CROP T",     ITEM_RANGE, &opt_crop_t, 0, 1, 0, apply_crop, 148, ""},  /* [29] trim top */
     {"CROP B",     ITEM_RANGE, &opt_crop_b, 0, 1, 0, apply_crop, 148, ""},  /* [30] trim bottom */
     {"TAP/TZX SPEED",  ITEM_CHOICE, &opt_fastload, CH_FASTLOAD, 3, 0, apply_fast}, /* [31] .tap/.tzx load speed: OFF / FAST 8x (CPU-only) / SAFE 4x (whole-core) */
     {"WAV/MP3 SPEED", ITEM_CHOICE, &opt_wavfast, CH_WAVMP3LOAD, 2, 0, apply_fast}, /* [32] v130: NORMAL(1x) / FAST(hybrid). Legacy 2/3 from ini clamp to FAST via cur_fmode */
-    {"SYNC LOADER", ITEM_CHOICE, &opt_tapesync, CH_SYNCMODE, 3, 0, apply_tapesync},   /* [33] demand tape: wait for the loader between blocks */
-    {"AUTO-START", ITEM_CHOICE, &opt_autostart, CH_NOYES, 2, 0},
-    {"ROM-TRAP", ITEM_CHOICE, &opt_romtrap, CH_NOYES, 2, 0},   /* [35] #65: instant load of STANDARD ROM-loader tapes (turbo/custom -> leave OFF, use warp) */   /* [34] reset the machine into its own tape loader on load (128/Pentagon: ENTER at the menu) */
-    {"SMART LOAD", ITEM_CHOICE, &opt_smartload, CH_NOYES, 2, 0},   /* [36] instant byte-inject: TAP/TZX from file bytes; v133 also WAV/MP3 via the checksum-verified edge decoder (custom loaders auto-fall back to pulses) */
-    {"ULA TIMING", ITEM_CHOICE, &opt_ulalate, CH_ULATIM, 2, 0, apply_machine}, /* [37] real Ferranti Type 1/Early vs Type 2/Late phase; 48K/128K */
-    {"ULA SNOW", ITEM_CHOICE, &opt_snow, CH_SNOW, 2, 0, apply_snow}, /* [38] v145 128/48-Atlas ULA snow ON(faithful)/OFF(clean), live toggle */
+    /* v0.15.334: строка честно говорит, что на скорости 8x лента демандовая независимо от выбора
+       (см. разбор над таблицей). Значение и его сохранение прежние - меняется только показ. */
+    {"SYNC LOADER", ITEM_CHOICE, &opt_tapesync, CH_SYNCMODE, 3, 0, apply_tapesync, 0, 0, 0,
+     note_tapesync, why_tapesync},   /* [33] demand tape: wait for the loader between blocks */
+    /* ⚠ v354: ПОДПИСИ НИЖЕ БЫЛИ СДВИНУТЫ НА ЕДИНИЦУ и стоили нам дефекта (строка «ULA snow» в меню
+       Пентагона показывала EARLY/LATE, потому что индекс взяли из подписи). Индекс для подменю
+       брать СЧЁТОМ элементов, а не подписью: подпись никто не проверяет. */
+    {"AUTO-START", ITEM_CHOICE, &opt_autostart, CH_NOYES, 2, 0},   /* [35] reset the machine into its own tape loader on load (128/Pentagon: ENTER at the menu) */
+    {"ROM-TRAP", ITEM_CHOICE, &opt_romtrap, CH_NOYES, 2, 0},   /* [36] #65: instant load of STANDARD ROM-loader tapes (turbo/custom -> leave OFF, use warp) */
+    {"SMART LOAD", ITEM_CHOICE, &opt_smartload, CH_NOYES, 2, 0},   /* [37] instant byte-inject: TAP/TZX from file bytes; v133 also WAV/MP3 via the checksum-verified edge decoder (custom loaders auto-fall back to pulses) */
+    {"ULA TIMING", ITEM_CHOICE, &opt_ulalate, CH_ULATIM, 2, 0, apply_machine}, /* [38] real Ferranti Type 1/Early vs Type 2/Late phase; 48K/128K */
+    /* v0.15.334: у ядра, которое бит снега игнорирует (MiSTer-48), строка это показывает - раньше
+       она молча обещала работу, которой нет. Пункт остаётся живым: значение общее для всех машин и
+       понадобится, как только вернёшься на Atlas. */
+    {"ULA SNOW", ITEM_CHOICE, &opt_snow, CH_SNOW, 2, 0, apply_snow, 0, 0, 0,
+     note_snow, why_snow}, /* [39] v145 128/48-Atlas ULA snow ON(faithful)/OFF(clean), live toggle */
+    /* v169 APPEND ONLY - indices 0..39 are hard-wired as &opt_items[N] in every submenu below. */
+    {"SCREEN SCALE X", ITEM_RANGE, &opt_scr_sx, 0, 1, 0, apply_scr, 3, "x"},   /* [40] per-machine, capped at 3 */
+    {"SCREEN SCALE Y", ITEM_RANGE, &opt_scr_sy, 0, 1, 0, apply_scr, 3, "x"},   /* [41] per-machine, capped at 3 */
+    {"CENTER SCREEN",  ITEM_ACTION, 0, 0, 0, act_scr_center},                  /* [42] */
+    {"NUMPAD AS JOYSTICK", ITEM_CHOICE, &opt_numjoy, CH_NOYES, 2, 0, apply_numjoy},   /* [43] v176 */
+    {"PLAYER 1 INPUT", ITEM_CHOICE, &opt_jsrc1, CH_JOYSRC, 4, 0, apply_jsrc},         /* [44] v176 */
+    {"PLAYER 2 INPUT", ITEM_CHOICE, &opt_jsrc2, CH_JOYSRC, 4, 0, apply_jsrc},         /* [45] v176 */
+    {"REGION",   ITEM_CHOICE, &opt_region, CH_REGION, 3, 0, apply_region, 0, 0, 1},   /* [46] NES: NTSC/PAL/Денди; defer=1 - смена региона сбрасывает ядро NES. ДОБАВЛЯТЬ ТОЛЬКО В КОНЕЦ - иначе поедут ссылки строк меню (сторож поймает) */
+    {"JOYSTICK 1 TYPE", ITEM_CHOICE, &opt_jtype1, CH_JTYPE, 4, 0, apply_jtype},   /* [47] v199 */
+    {"JOYSTICK 2 TYPE", ITEM_CHOICE, &opt_jtype2, CH_JTYPE, 4, 0, apply_jtype},   /* [48] v199 */
+    {"OPPOSITE DIRS",   ITEM_CHOICE, &opt_socd,   CH_SOCD,  3, 0, apply_socd},    /* [49] v206 */
+    /* [50] v214 НАБОР ПЗУ. choices/nchoices подставляет machine_menu_sync() на старте, а модальный
+       picker пересканирует 0:/ROMS/ при каждом открытии, чтобы видеть новые файлы без рестарта ARM. */
+    /* v305 defer=1 у обоих: смена набора = перезаливка ПЗУ + холодный старт машины, смена режима
+       сервисной страницы = machine_reset. Стрелками такое применять нельзя. */
+    {"ROM SET",         ITEM_CHOICE, &opt_romset, 0,        0, romset_select_dialog, apply_romset, 0, 0, 1},  /* [50] v213 */
+    {"SERVICE ROM",     ITEM_CHOICE, &opt_svcrom, CH_SVCROM, 3, 0, apply_svcrom, 0, 0, 1},  /* [51] v207; v252: OFF/NMI/ALWAYS */
+    {"SAA1099",         ITEM_CHOICE, &opt_saa,    CH_SAA,   3, 0, apply_saa},     /* [52] v217 */
+    {"MOUNT TO DRIVE",  ITEM_CHOICE, &opt_drvsel, CH_DRIVE, 4, 0},               /* [53] v220: у Beta Disk четыре привода A..D */
+    {"DISK WRITE",      ITEM_CHOICE, &opt_diskwr, CH_DISKWR, 2, 0, disk_wp_refresh},  /* [54] v223: по умолчанию только чтение */
+    {"DISK DRIVES",     ITEM_ACTION, 0, 0, 0, tv_bdi_drives_dialog},                   /* [55] v414: настройки приводов (путь у каждой буквы) */
+    /* v305 defer=1 у троих: включение GS - это ~5 с прогона прошивки карты, смена объёма ОЗУ -
+       перезапуск карты с потерей её состояния, а переключение NEMO-IDE закрывает и открывает образ
+       винчестера. Ни одно из этих действий не должно случаться от проезда стрелкой по строке. */
+    {"GENERAL SOUND",   ITEM_CHOICE, &opt_gs, CH_GS, 2, 0, apply_gs, 0, 0, 1},        /* [56] v265: карта на ARM, ловушка #BB/#B3 */
+    {"GS MEMORY",       ITEM_CHOICE, &opt_gsram, CH_GSRAM, 4, 0, apply_gsram, 0, 0, 1},   /* [57] v281: объём ОЗУ карты */
+    {"NEMO-IDE",        ITEM_CHOICE, &opt_ide, CH_IDE, 2, 0, apply_ide, 0, 0, 1},     /* [58] v283; v292 живое применение */
+    {"IDE IMAGE",       ITEM_ACTION, 0, 0, 0, ide_info_dialog},                       /* [59] v292: что вставлено, размер, извлечь */
+    {"IDE DEVICE",      ITEM_CHOICE, &opt_idedev, CH_IDEDEV, 1, 0, apply_idedev},     /* [60] v292: nchoices=1, пока нет slave */
+    {"GS SPEED",        ITEM_ACTION, 0, 0, 0, gs_speed_dialog},                       /* [61] v298: честный прибор темпа карты */
+    /* [62..65] v0.15.302 ЧЕТЫРЕ СЛОТА ПЗУ. Пункт-выбор с ОДНИМ вариантом: строка значения - это то,
+       что РЕАЛЬНО лежит в странице (см. rom_slot_disp_sync), а сама работа делается модальным
+       выбором файла по Enter. Один вариант, потому что стрелками перебирать нечего: каталог карты
+       читается заново при каждом открытии диалога. choices подставляет rom_slots_ui_sync(). */
+    {"ROM SLOT 0",      ITEM_CHOICE, &g_slot_zero, 0, 1, rom_slot0_dialog, 0},        /* [62] 128-меню */
+    {"ROM SLOT 1",      ITEM_CHOICE, &g_slot_zero, 0, 1, rom_slot1_dialog, 0},        /* [63] 48 BASIC */
+    {"ROM SLOT 2",      ITEM_CHOICE, &g_slot_zero, 0, 1, rom_slot2_dialog, 0},        /* [64] TR-DOS */
+    {"ROM SLOT 3",      ITEM_CHOICE, &g_slot_zero, 0, 1, rom_slot3_dialog, 0},        /* [65] сервисное */
+    {"ROM BOOT SLOT",   ITEM_CHOICE, &opt_rombus, CH_ROMBUS, 5, 0, apply_rombus, 0, 0, 1},  /* [66] v302; defer=1 - перезаливка ПЗУ + сброс */
+    {"KEMPSTON MOUSE",  ITEM_CHOICE, &opt_kmouse, CH_KMOUSE, 3, 0, apply_kmouse},     /* [67] v304 */
+    {"RAM SIZE",        ITEM_CHOICE, &opt_ramsize, CH_RAMSIZE, 4, 0, apply_ramsize, 0, 0, 1},  /* [68] v314: холодный старт -> defer=1 */
+    {"DIVMMC",          ITEM_CHOICE, &opt_divmmc, CH_DIVMMC, 2, 0, apply_divmmc, 0, 0, 1},   /* [69] v327 */
+    {"DIVMMC MODE",     ITEM_CHOICE, &opt_dmmode, CH_DMMODE, 2, 0, apply_dmmode, 0, 0, 1},  /* [70] */
+    {"SD CARD: DIVMMC / Z-DISK", ITEM_ACTION, 0, 0, 0, divmmc_info_dialog},                  /* [71] v353 */
+    /* [72] v0.15.336 ЧАСТОТА КАРТЫ GS. defer=0 - смена безопасна на лету (см. apply_gsclk). */
+    {"GS CLOCK", ITEM_CHOICE, &opt_gsclk, CH_GSCLK, 4, 0, apply_gsclk, 0, 0, 0,
+     note_gsclk, why_gsclk},
+    /* 🥇 v350 ДОБАВЛЯТЬ ПУНКТЫ ТОЛЬКО В КОНЕЦ. Меню машин ссылаются сюда ПО НОМЕРУ
+       (opt_items[21], [52], [72]...), поэтому вставка в середину молча сдвигает все следующие:
+       у GS clock пропало значение ровно от этого. Хвост - единственное безопасное место. */
+    {"Z-CONTROLLER",    ITEM_CHOICE, &opt_zc,     CH_DIVMMC, 2, 0, apply_zc,     0, 0, 1},   /* [73] порты #77/#57 */
+    /* [74] v355 ЗАПИСЕЙ КОРНЯ ТОМА. Свойство КАРТЫ, не машины. defer=1: том пересобирается и
+       машина уходит в холодный старт, менять его под работающей программой нельзя. */
+    {"DIVMMC ROOT ENTRIES", ITEM_CHOICE, &opt_dmroot, CH_DMROOT, 2, 0, apply_dmroot, 0, 0, 1},
+    {"Z-DISK...",       ITEM_ACTION, 0, 0, 0, zdisk_dialog},   /* [75] v358: своё окно транспорта */
+    /* [76] v359 ФОРМАТ ПАПОЧНОГО ТОМА. defer=1: том пересобирается целиком, машина уходит в
+       холодный старт - менять под работающей программой нельзя. */
+    {"DIVMMC FOLDER FS", ITEM_CHOICE, &opt_dmfat32, CH_DMFAT, 2, 0, apply_dmfat32, 0, 0, 1,
+     note_dmfat, why_dmfat},
+    /* [77] v0.15.388 СТРАНИЦА ПЗУ ПОД TR-DOS (ядро B0146, MACHINE_CFG бит25). defer=1: применение
+       сбрасывает машину (меняется карта ПЗУ), стрелкой по строке такое случаться не должно.
+       ДОБАВЛЕНО В КОНЕЦ - меню ссылаются на таблицу ПО НОМЕРУ. */
+    {"SVC PAGE UNDER TR-DOS", ITEM_CHOICE, &opt_dossvc, CH_DOSSVC, 3, 0, apply_dossvc, 0, 0, 1,
+     note_dossvc, why_dossvc},
+    /* [78],[79] v0.15.409 ЗАПИСЬ НА КАРТУ - СВОЙ ВЫКЛЮЧАТЕЛЬ У КАЖДОГО ТРАНСПОРТА. Применение
+       поднимает карту заново (защита записи - её свойство, и ОЗУ карты обнуляется, как при
+       вставке), поэтому по Enter. ДОБАВЛЕНО В КОНЕЦ - меню ссылаются на таблицу ПО НОМЕРУ. */
+    {"DIVMMC WRITE", ITEM_CHOICE, &opt_dmwr, CH_DMWRITE, 2, 0, apply_cardwr, 0, 0, 1,
+     note_dmwr, why_dmwr},
+    {"Z-CONTROLLER WRITE", ITEM_CHOICE, &opt_zcwr, CH_DMWRITE, 2, 0, apply_cardwr, 0, 0, 1,
+     note_zcwr, why_zcwr},
+    /* [80..84] B0156 / v0.15.432: live ULA timing, contention and border tuning */
+    {"IO CONT DLY", ITEM_RANGE, &opt_io_cont, 0, 1, 0, apply_ulatune, 7, " clk"},   /* [80] */
+    {"BORD PHASE",  ITEM_RANGE, &opt_bord_phase, 0, 1, 0, apply_ulatune, 15, ""},   /* [81] */
+    {"BORD DELAY",  ITEM_RANGE, &opt_bord_delay, 0, 1, 0, apply_ulatune, 3, " px"},  /* [82] */
+    {"PAPER DELAY", ITEM_RANGE, &opt_pap_delay,  0, 1, 0, apply_ulatune, 15, " px"}, /* [83] */
+    {"SINCL INT H", ITEM_RANGE, &opt_sincl_inth, 0, 1, 0, apply_ulatune, 127, ""},   /* [84] */
 };
 /* (no opt_menu instance any more: opt_items[] feed the Options > Settings nested dropdown directly) */
 
@@ -4334,8 +10438,20 @@ typedef struct {
   const Menu* sub;          /* submenu (cmd==0 && sub!=NULL), or NULL */
   menu_item*  value;        /* OPTIONAL inline value-item -> reuses the settings engine */
   uint8_t     disabled;
+  /* 🥇 v0.15.406 СОСТОЯНИЕ ПУНКТА, ВИДНОЕ БЕЗ ВХОДА В ЕГО ОКНО: короткая строка в ПРАВЫЙ слот -
+     тот самый, где TurboVision печатает `param` пункта меню («F5», «Alt+F1»). Работает у ЛЮБОГО
+     пункта, поэтому новое устройство получает показ состояния само.
+     v0.15.407: метки-галочки слева (канон FAR, символ 0xFB) здесь НЕТ намеренно - решение
+     владельца: строка состояния уже отвечает на «включено ли», и галочка дублировала бы её.
+     ДОПИСАНО В КОНЕЦ: инициализаторы таблиц позиционные. */
+  const char* (*st_txt)(void);
 } MenuItem;
 struct Menu { const MenuItem* items; int count; int deflt; };   /* deflt = remembered cursor */
+/* v0.15.293: ЧИСЛО СТРОК БЕРЁМ У САМОЙ ТАБЛИЦЫ. Движок обходит ровно `count`, терминатора у таблиц
+   нет - написанный руками счётчик отстаёт от массива молча, и строка просто перестаёт существовать
+   (так на ZX-машинах пропали четыре пункта: в таблице 22, в счётчике 18). Считает компилятор -
+   расходиться нечему, а сторож ниже остаётся вторым рубежом. */
+#define MENU_N(tab) ((int)(sizeof(tab)/sizeof((tab)[0])))
 typedef struct { const char* title; Menu* menu; } BarItem; /* title carries ~hotkey~ */
 
 enum { /* app commands (loader) */
@@ -4343,47 +10459,150 @@ enum { /* app commands (loader) */
   cmPlayStart, cmPlayStop, cmPlayPause, cmPlayMode,
   cmTapePlay, cmTapeStop,
   cmOptSettings, cmOptSave, cmOptEject,
-  cmHelpAbout, cmHelpKeys
+  cmHelpAbout, cmHelpKeys,
+  cmFileSdInfo,           /* v227: дописано В КОНЕЦ - иначе сдвинулись бы значения существующих команд */
+  cmFileNewTrd, cmFileViewImg, cmFileNemoIde, cmFileZController, cmFileDivMMC,
+  cmOptRomBanks           /* v384: Options > ROM > «ROM file and banks...» (дописано В КОНЕЦ - иначе
+                             сдвинулись бы значения существующих команд) */
 };
+
+/* v0.15.406 Состояние дисковых устройств для меню. Коротко и по делу: включено ли устройство
+   (метка) и чем именно оно сейчас является (правый слот). Запись показываем честно - `R/W` только
+   когда носитель её ДЕЙСТВИТЕЛЬНО примет, иначе `R/O`: у папочного тома писать пока нечем, а образ
+   на карте может оказаться доступным только для чтения. */
+static const char* dev_txt_ide(void){
+    if(!opt_ide)     return "OFF";
+    if(!g_ide_open)  return "NO IMG";       /* включён, но образ не открыт: файла нет или не читается */
+    return "HDF R/O";                        /* работает; пути записи у этого устройства нет вовсе */
+}
+static const char* dev_txt_card(void){
+    static char b[12];
+    int rw = card_write_ok();          /* v0.15.409: показ и поведение из ОДНОГО решения */
+    const char* med = (g_dm_backend == 1) ? "IMG" : "DIR";
+    int p = 0;
+    for(const char* q = med; *q; q++) b[p++] = *q;
+    b[p++] = ' ';
+    b[p++] = 'R'; b[p++] = '/'; b[p++] = rw ? 'W' : 'O';
+    b[p] = 0;
+    return b;
+}
+static const char* dev_txt_zc(void){ return opt_zc ? dev_txt_card() : "OFF"; }
+static const char* dev_txt_dm(void){ return opt_divmmc ? dev_txt_card() : "OFF"; }
+static const char* dev_txt_bdi(void){ return opt_diskwr ? "R/W" : "R/O"; }
+/* v0.15.411 Состояние прочих меню: то же правило «видно, не заходя внутрь». Возврат 0 = сообщать
+   нечего, и строки не будет - пустая пометка хуже отсутствующей. */
+static const char* st_txt_machine(void){ return machine_type(); }
+static const char* st_txt_play(void){
+    if(!player_active()) return 0;
+    return player_paused() ? "PAUSED" : "PLAYING";
+}
+static const char* st_txt_tape(void){ return g_tape_on ? "LOADING" : 0; }
+static const MenuItem mi_controllers[] = {
+  /* v0.15.410 В МЕНЮ - ТОЛЬКО СОСТОЯНИЕ, НАСТРОЙКИ - В ОКНЕ СВОЕГО КОНТРОЛЛЕРА (решение владельца).
+     Справа видно, включено ли устройство и принимает ли оно запись: `OFF`, `R/O`, `DIR R/O`,
+     `IMG R/W`. Сама галочка разрешения записи живёт внутри окна настроек этого контроллера, рядом с
+     его же путём и форматом, - там, где она и есть свойство устройства. */
+  {"~B~DI / TR-DOS drives...", 0, 0, NULL, NULL, &opt_items[55], 0, dev_txt_bdi},
+  {"~N~EMO-IDE...",            cmFileNemoIde,      0, NULL, NULL, NULL, 0, dev_txt_ide},
+  {"~Z~-Controller...",        cmFileZController,  0, NULL, NULL, NULL, 0, dev_txt_zc},
+  {"~D~ivMMC & esxDOS...",     cmFileDivMMC,       0, NULL, NULL, NULL, 0, dev_txt_dm},
+};
+static Menu m_controllers = { mi_controllers, MENU_N(mi_controllers), 0 };
 
 static const MenuItem mi_files[] = {
   {"~L~oad / Run", cmFileLoad,  0, "Enter"},
   {"~U~p one dir", cmFileUp,    0, NULL},              /* also the ".." row + Enter */
-  {NULL},                                                   /* separator */
-  {"~R~ename...",  cmFileRename,0, "F6"},              /* modal DN rename dialog */
-  {"~C~opy...",    cmFileCopy,  0, "F5"},              /* copy file to another folder (creates missing dirs) */
-  {"~D~elete...",  cmFileDelete,0, "F8"},             /* delete (recursive w/ double confirm for non-empty folders) */
-  {"~M~ake dir...",cmFileMkdir, 0, "F7"},              /* create directory (chain) */
   {NULL},
-  {"~S~ort...",    cmFileSort,  0, NULL},              /* opens the Sort dialog (field + direction) */
+  {"~R~ename...",  cmFileRename,0, "F6"},              /* modal DN rename dialog */
+  {"~C~opy...",    cmFileCopy,  0, "F5"},              /* copy file to another folder */
+  {"~D~elete...",  cmFileDelete,0, "F8"},             /* delete */
+  {"~M~ake dir...",cmFileMkdir, 0, "F7"},              /* create directory */
+  {"~S~ort...",    cmFileSort,  0, "Alt+B"},           /* диалог сортировки */
+  {"~I~nfo about card", cmFileSdInfo, 0, "Ctrl+L"},    /* инфо-панель по карте */
+  {NULL},
+  {"~V~iew disk image", cmFileViewImg, 0, NULL},        /* каталог TRD/SCL */
+  {"~N~ew disk image...", cmFileNewTrd, 0, NULL},       /* пустой TRD */
 };
-static Menu m_files = { mi_files, 9, 0 };
+static Menu m_files = { mi_files, MENU_N(mi_files), 0 };
 
 static const MenuItem mi_play[] = {
-  {"~S~tart",   cmPlayStart, 0, "Space"},
+  {"~S~tart",   cmPlayStart, 0, "Space", NULL, NULL, 0, st_txt_play},   /* v411: PLAYING / PAUSED */
   {"S~t~op",    cmPlayStop,  0, "BkSp"},
   {"~P~ause / Resume", cmPlayPause, 0, "Space"},
   {NULL},
   {"~M~ode",    cmPlayMode,  0, "F2"},
   {"MP3 pre~l~oad",0,0,NULL,NULL,&opt_items[12]},   /* value-item: preload whole MP3 to DDR (no SD-GC stalls during playback; also helps MP3-as-tape) */
 };
-static Menu m_play = { mi_play, 6, 0 };
+static Menu m_play = { mi_play, MENU_N(mi_play), 0 };
 
 static const MenuItem mi_tape[] = {                        /* all tape / MP3 params live here (not duplicated in Options) */
-  {"~P~lay tape", cmTapePlay, 0, NULL},
+  {"~P~lay tape", cmTapePlay, 0, NULL, NULL, NULL, 0, st_txt_tape},     /* v411: LOADING, пока лента идёт */
   {"S~t~op tape", cmTapeStop, 0, "BkSp"},
   {NULL},
   {"Tape S~o~und", 0,0,NULL,NULL,&opt_items[10]},           /* value-item: TAPE SOUND */
   {"~M~P3/WAV as tape",0,0,NULL,NULL,&opt_items[11]},       /* value-item: MP3/WAV TAPE (force tape path) */
   {"MP3 se~n~s",   0,0,NULL,NULL,&opt_items[13]},           /* value-item: MP3 sens (pilot hysteresis) */
-  {"M~u~te machine on load",0,0,NULL,NULL,&opt_items[19]},  /* value-item: mute the ZX beeper while loading (independent of Tape Sound) */
-  {"T~A~P/TZX SPEED",  0,0,NULL,NULL,&opt_items[31]},       /* GLOBAL: warp (8x) while loading; NO progress bar in fast mode */
-  {"~W~AV/MP3 SPEED",0,0,NULL,NULL,&opt_items[32]},
-  {"S~y~nc loader",0,0,NULL,NULL,&opt_items[33]},
-  {"Auto-sta~r~t", 0,0,NULL,NULL,&opt_items[34]},
-  {"~S~mart load", 0,0,NULL,NULL,&opt_items[36]},          /* instant byte-inject for standard ROM loaders + auto pulse-fallback for custom loaders. (ROM-trap [35] retired - Model A freeze/inject is architecturally dead for a real CPU, loaded nothing; smart load replaces it) */
+  {"M~u~te machine on load",0,0,NULL,NULL,&opt_items[20]},  /* [20] TAPE MUTE. v0.15.185: было [19] = BOOT NAV (см. сторож ниже) */
+  {"T~A~P/TZX SPEED",  0,0,NULL,NULL,&opt_items[32]},       /* [32]. v0.15.185: было [31] = CROP B -> строка молча резала кадр снизу вместо выбора скорости (жалоба владельца) */
+  {"~W~AV/MP3 SPEED",0,0,NULL,NULL,&opt_items[33]},   /* [33]. было [32] = скорость TAP */
+  {"S~y~nc loader",0,0,NULL,NULL,&opt_items[34]},     /* [34]. было [33] = скорость WAV */
+  {"Auto-sta~r~t", 0,0,NULL,NULL,&opt_items[35]},     /* [35]. было [34] = SYNC LOADER */
+  {"~S~mart load", 0,0,NULL,NULL,&opt_items[37]},     /* [37]. было [36] = ROM-TRAP (он остаётся без строки, снят намеренно) */          /* instant byte-inject for standard ROM loaders + auto pulse-fallback for custom loaders. (ROM-trap [35] retired - Model A freeze/inject is architecturally dead for a real CPU, loaded nothing; smart load replaces it) */
 };
-static Menu m_tape = { mi_tape, 12, 0 };
+static Menu m_tape = { mi_tape, MENU_N(mi_tape), 0 };
+
+/* v0.15.185 СТОРОЖ ИНДЕКСОВ (оплачено дважды).
+   Строки меню ссылаются на элементы ЧИСЛОВЫМ индексом `&opt_items[N]`. Когда в таблицу вставили
+   BOOT NAV на позицию 19, всё после неё сдвинулось на единицу, а строки меню не перенумеровали:
+   «TAP/TZX SPEED» стала молча резать кадр снизу (CROP B), «Smart load» переключала ROM-trap, а
+   TAPE MUTE / AUTO-START / SMART LOAD вообще пропали из интерфейса. Симптом при этом выглядит как
+   баг совсем в другом месте. Теперь ожидаемый ярлык для каждого используемого индекса записан рядом
+   с таблицей: расхождение ловится на старте, пишется в `g_menu_drift` (читаемо по JTAG) и кричит
+   в строке состояния. Вставили элемент - обязаны поправить эту таблицу, и это заметно сразу. */
+static const struct { short ix; const char* lab; } MENU_IX_EXPECT[] = {
+    { 0,"SORT"},{ 1,"SCROLL"},{ 2,"SCROLL DELAY"},{ 5,"PAUSE MUS"},{ 6,"VOLUME"},{ 7,"OSD DIM"},{ 8,"WINDOW X"},
+    { 9,"WINDOW Y"},{10,"TAPE SOUND"},{11,"MP3/WAV TAPE"},{12,"MP3 PRELOAD"},{13,"MP3 HYS"},
+    {14,"EJECT SD"},{15,"JOYSTICK MAP"},{16,"SAVE"},{17,"SHOW HIDDEN"},{18,"ON LAUNCH"},{19,"BOOT NAV"},
+    {20,"TAPE MUTE"},{21,"MACHINE"},{22,"PENT INT V"},{23,"PENT INT H"},{24,"PAPER H OFF"},
+    {25,"PAPER V OFF"},{26,"SCREEN X"},{27,"SCREEN Y"},{28,"CROP L"},{29,"CROP R"},{30,"CROP T"},
+    {31,"CROP B"},{32,"TAP/TZX SPEED"},{33,"WAV/MP3 SPEED"},{34,"SYNC LOADER"},{35,"AUTO-START"},
+    {36,"ROM-TRAP"},{37,"SMART LOAD"},{38,"ULA TIMING"},{39,"ULA SNOW"},{40,"SCREEN SCALE X"},
+    {41,"SCREEN SCALE Y"},{42,"CENTER SCREEN"},{43,"NUMPAD AS JOYSTICK"},{44,"PLAYER 1 INPUT"},
+    {45,"PLAYER 2 INPUT"},{46,"REGION"},{47,"JOYSTICK 1 TYPE"},{48,"JOYSTICK 2 TYPE"},
+    {49,"OPPOSITE DIRS"},{50,"ROM SET"},{51,"SERVICE ROM"},{52,"SAA1099"},{53,"MOUNT TO DRIVE"},{54,"DISK WRITE"},{55,"DISK DRIVES"},
+    {56,"GENERAL SOUND"},{57,"GS MEMORY"},{58,"NEMO-IDE"},{59,"IDE IMAGE"},{60,"IDE DEVICE"},
+    {61,"GS SPEED"},
+    {62,"ROM SLOT 0"},{63,"ROM SLOT 1"},{64,"ROM SLOT 2"},{65,"ROM SLOT 3"},{66,"ROM BOOT SLOT"},   /* v302 */
+    {67,"KEMPSTON MOUSE"},                                                                            /* v304 */
+    {68,"RAM SIZE"},
+    {69,"DIVMMC"},{70,"DIVMMC MODE"},{71,"SD CARD: DIVMMC / Z-DISK"},   /* ревью: ярлык переименован
+       в v353, а сторож остался с прежним - он ЛОМАЛСЯ на 71 (ложный «MENU INDEX DRIFT» на каждом
+       старте) и дальше не шёл, то есть 72..77 не проверялись вовсе, сколько бы их тут ни дописали. */
+    {72,"GS CLOCK"},                                                                              /* v336 */
+    /* v0.15.388: хвост 73..76 сторож не проверял вовсе - сдвиг в нём прошёл бы молча. Закрыто. */
+    {73,"Z-CONTROLLER"},{74,"DIVMMC ROOT ENTRIES"},{75,"Z-DISK..."},{76,"DIVMMC FOLDER FS"},
+    {77,"SVC PAGE UNDER TR-DOS"},                                                                 /* v388 */
+    {78,"DIVMMC WRITE"},{79,"Z-CONTROLLER WRITE"},
+    {80,"IO CONT DLY"},{81,"BORD PHASE"},{82,"BORD DELAY"},{83,"PAPER DELAY"},{84,"SINCL INT H"},                                                /* v409 */
+};
+/* v231 АУДИТ ВЫСОТ МЕНЮ. Тот же приём, что MENU_IX_EXPECT для индексов: проверяем инвариант на
+   старте, а не ждём жалобы на артефакты. Подменю машин уже дважды перерастало окружение, когда в
+   него добавляли строки (сегодня - пять сразу). Здесь проверяется, что меню помещается НА ЭКРАН:
+   в буфер фона оно влезает теперь всегда (см. BOXSAVE_*), а на канву 25 строк - нет. */
+static int g_menu_toohigh = -1;                /* -1 не проверяли, иначе число строк худшего меню */
+static int g_menu_drift = -1;                  /* -1 = ещё не проверяли, 0 = порядок цел, иначе первый сбойный индекс */
+static void menu_index_audit(void){
+    int n = (int)(sizeof(opt_items)/sizeof(opt_items[0]));
+    g_menu_drift = 0;
+    for(unsigned k=0; k<sizeof(MENU_IX_EXPECT)/sizeof(MENU_IX_EXPECT[0]); k++){
+        int ix = MENU_IX_EXPECT[k].ix; const char* want = MENU_IX_EXPECT[k].lab;
+        if(ix >= n || !opt_items[ix].label){ g_menu_drift = ix; break; }
+        const char* got = opt_items[ix].label; int i=0;
+        while(want[i] && got[i] && want[i]==got[i]) i++;
+        if(want[i] || got[i]){ g_menu_drift = ix; break; }
+    }
+    if(g_menu_drift) dn_status_msg("!!! MENU INDEX DRIFT - CHECK opt_items");
+}
 
 /* Settings = a NESTED dropdown (owner: second-level menu, no buttons - buttons belong to modal
    dialogs only). Every row wraps an opt_items[] value-item verbatim: Enter/Right cycles forward,
@@ -4396,57 +10615,240 @@ static Menu m_tape = { mi_tape, 12, 0 };
    is always present so you can switch; the rest is that machine's intrinsic parameter set.
    machine_menu_sync() repoints m_machine when opt_defmachine changes. */
 /* The Machine submenu = THIS machine's OWN parameters (owner: "the machine menu - and there are its
-   parameters"). All per-machine: paper, INT timing, AND crop (crop differs per machine - different
-   line counts). ZX 128K has no paper/INT tuners (pentagon-gated in RTL) but still has its own crop. */
+   parameters"): интерфейсы, ПЗУ, звуковые карты, тайминги ULA/INT, ввод.
+   v0.15.293 РАЗЛОЖЕНО ПО СМЫСЛУ, ЧТОБЫ ВСЁ БЫЛО ВИДНО. У ZX-машин в таблице было 22 строки, а
+   показывалось 18: движок обходит ровно `count`, и Crop top / Crop bottom / Kempston map /
+   NumPad as joystick не открывались НИ НА ОДНОЙ машине. Поднять счётчик нельзя - меню и так упёрлось
+   в высоту канвы. Поэтому геометрия КАРТИНКИ (положение окна, масштаб, панорама, обрезка краёв)
+   уехала в собственное подменю Options > Display, где ей и место: она описывает не машину, а вывод
+   на телевизор, и набор её строк у машин разный ровно так же. Свойства ОБРАЗОВ (дисководы, запись,
+   винчестер) переехали в Files ещё в v231/v292. Ничего не выброшено - всё стало доступно. */
+/* v0.15.302 ПЗУ УЕХАЛО В СОБСТВЕННУЮ ГРУППУ Options > ROM (см. mi_rom ниже) - строк у него стало
+   семь, и внутрь подменю машины они не помещаются. Вложить группу третьим уровнем нельзя: движок
+   держит РОВНО два уровня боксов (menu_open_sub работает с st[0]/st[1], фоны - в стеке, а вход в
+   подменю разрешён только при lvl==0). Поэтому ROM стоит рядом с Machine/Display/Navigator/Audio,
+   тем же уровнем, и остаётся при этом настройкой ТЕКУЩЕЙ машины - как и Machine. */
 static const MenuItem mi_machine_zx[] = {
   {"Machine",        0,0,NULL, NULL, &opt_items[21]},
-  {"ULA timing",     0,0,NULL, NULL, &opt_items[38]},      /* 128/+2 Ferranti ULA also has the physical Early/Late variation */
-  {"ULA snow",       0,0,NULL, NULL, &opt_items[39]},      /* v145: 128K ULA I:R snow ON(faithful)/OFF(clean) */
-  {"Paper H off",    0,0,NULL, NULL, &opt_items[24]},      /* paper within frame - H (border distribution) */
-  {"Paper V off",    0,0,NULL, NULL, &opt_items[25]},      /* paper within frame - V */
-  {"Crop left",      0,0,NULL, NULL, &opt_items[28]},      /* per-machine crop */
-  {"Crop right",     0,0,NULL, NULL, &opt_items[29]},
-  {"Crop top",       0,0,NULL, NULL, &opt_items[30]},
-  {"Crop bottom",    0,0,NULL, NULL, &opt_items[31]},
+  {"SAA1099 on #FF", 0,0,NULL, NULL, &opt_items[52]},   /* v217: AUTO/ON/OFF, делит порт с Beta Disk */
+  {"General Sound",  0,0,NULL, NULL, &opt_items[56]},   /* v265: карта на ARM (#BB/#B3), звук СУММИРУЕТСЯ с AY */
+  {"GS memory",      0,0,NULL, NULL, &opt_items[57]},   /* v281: 128K базовая (её ждёт Mod Player) / 512K / 1M / 2M */
+  {"GS clock",       0,0,NULL, NULL, &opt_items[72]},   /* v336: 12 (как железо) / 14 / 18 (дефолт) / 24 МГц */
+  {"GS speed...",    0,0,NULL, NULL, &opt_items[61]},   /* v298: прибор темпа карты - там же, где её опции */
+  {"ULA timing",     0,0,NULL, NULL, &opt_items[38]},
+  {"ULA snow",       0,0,NULL, NULL, &opt_items[39]},
+  {"IO contention",  0,0,NULL, NULL, &opt_items[80]},
+  {"Border phase",   0,0,NULL, NULL, &opt_items[81]},
+  {"Border delay",   0,0,NULL, NULL, &opt_items[82]},
+  {"Paper delay",    0,0,NULL, NULL, &opt_items[83]},
+  {"Sinclair INT H", 0,0,NULL, NULL, &opt_items[84]},
+  {"Kempston map",   0,0,NULL, NULL, &opt_items[15]},   /* ввод - свойство машины, а не картинки */
+  {"NumPad as joystick",0,0,NULL, NULL, &opt_items[43]},
+  {"Kempston mouse", 0,0,NULL, NULL, &opt_items[67]},   /* v304: #FADF/#FBDF/#FFDF; KEYPAD = водит цифровой блок */
 };
 static const MenuItem mi_machine_pent[] = {
   {"Machine",        0,0,NULL, NULL, &opt_items[21]},
-  {"Paper H off",    0,0,NULL, NULL, &opt_items[24]},      /* paper within frame - H (border distribution) */
-  {"Paper V off",    0,0,NULL, NULL, &opt_items[25]},      /* paper within frame - V */
-  {"Pentagon INT V", 0,0,NULL, NULL, &opt_items[22]},      /* TIMING (not position); changing re-times border FX -> reload demo */
-  {"Pentagon INT H", 0,0,NULL, NULL, &opt_items[23]},      /* (future here: Turbo, INT len, ROM, RAM) */
-  {"Crop left",      0,0,NULL, NULL, &opt_items[28]},      /* per-machine crop */
-  {"Crop right",     0,0,NULL, NULL, &opt_items[29]},
-  {"Crop top",       0,0,NULL, NULL, &opt_items[30]},
-  {"Crop bottom",    0,0,NULL, NULL, &opt_items[31]},
+  {"SAA1099 on #FF", 0,0,NULL, NULL, &opt_items[52]},   /* v217: AUTO/ON/OFF, делит порт с Beta Disk */
+  {"General Sound",  0,0,NULL, NULL, &opt_items[56]},   /* v265: карта на ARM (#BB/#B3), звук СУММИРУЕТСЯ с AY */
+  {"GS memory",      0,0,NULL, NULL, &opt_items[57]},   /* v281: 128K базовая (её ждёт Mod Player) / 512K / 1M / 2M */
+  {"GS clock",       0,0,NULL, NULL, &opt_items[72]},   /* v336: 12 (как железо) / 14 / 18 (дефолт) / 24 МГц */
+  {"GS speed...",    0,0,NULL, NULL, &opt_items[61]},   /* v298: прибор темпа карты - там же, где её опции */
+  {"RAM size",       0,0,NULL, NULL, &opt_items[68]},   /* v314: 128К/256К/512К/1024К - старшие биты 7FFD */
+  {"ULA snow",       0,0,NULL, NULL, &opt_items[39]},   /* v352: у Пентагона его нет - дефолт OFF, но A/B оставлен */
+  {"Pentagon INT V", 0,0,NULL, NULL, &opt_items[22]},
+  {"Pentagon INT H", 0,0,NULL, NULL, &opt_items[23]},
+  {"Kempston map",   0,0,NULL, NULL, &opt_items[15]},
+  {"NumPad as joystick",0,0,NULL, NULL, &opt_items[43]},
+  {"Kempston mouse", 0,0,NULL, NULL, &opt_items[67]},   /* v304 */
+  {"Service page under TR-DOS", 0,0,NULL, NULL, &opt_items[77]},   /* v388: {DOS,7FFD[4]} - вход в
+                                                            файловый менеджер сервисной страницы */
 };
 static const MenuItem mi_machine_48[] = {
   {"Machine",        0,0,NULL, NULL, &opt_items[21]},
-  {"ULA timing",     0,0,NULL, NULL, &opt_items[38]},      /* Type 1/Early or Type 2/Late, exactly 1 CPU T apart */
-  {"ULA snow",       0,0,NULL, NULL, &opt_items[39]},      /* v145: 48K ULA I:R snow ON(faithful)/OFF(clean) - Atlas 48K only */
-  {"Paper H off",    0,0,NULL, NULL, &opt_items[24]},      /* paper within frame - H */
-  {"Paper V off",    0,0,NULL, NULL, &opt_items[25]},      /* paper within frame - V */
+  {"SAA1099 on #FF", 0,0,NULL, NULL, &opt_items[52]},   /* v217: AUTO/ON/OFF, делит порт с Beta Disk */
+  {"General Sound",  0,0,NULL, NULL, &opt_items[56]},   /* v265: карта на ARM (#BB/#B3), звук СУММИРУЕТСЯ с AY */
+  {"GS memory",      0,0,NULL, NULL, &opt_items[57]},   /* v281: 128K базовая (её ждёт Mod Player) / 512K / 1M / 2M */
+  {"GS clock",       0,0,NULL, NULL, &opt_items[72]},   /* v336: 12 (как железо) / 14 / 18 (дефолт) / 24 МГц */
+  {"GS speed...",    0,0,NULL, NULL, &opt_items[61]},   /* v298: прибор темпа карты - там же, где её опции */
+  {"ULA timing",     0,0,NULL, NULL, &opt_items[38]},
+  {"ULA snow",       0,0,NULL, NULL, &opt_items[39]},
+  {"IO contention",  0,0,NULL, NULL, &opt_items[80]},
+  {"Border phase",   0,0,NULL, NULL, &opt_items[81]},
+  {"Border delay",   0,0,NULL, NULL, &opt_items[82]},
+  {"Paper delay",    0,0,NULL, NULL, &opt_items[83]},
+  {"Sinclair INT H", 0,0,NULL, NULL, &opt_items[84]},
+  {"Kempston map",   0,0,NULL, NULL, &opt_items[15]},
+  {"NumPad as joystick",0,0,NULL, NULL, &opt_items[43]},
+  {"Kempston mouse", 0,0,NULL, NULL, &opt_items[67]},   /* v304 */
+};
+static const MenuItem mi_machine_nes[] = {
+  {"Machine",        0,0,NULL, NULL, &opt_items[21]},
+  {"Region",         0,0,NULL, NULL, &opt_items[46]},      /* v0.15.189: NTSC 60Гц / PAL 50Гц / Денди 50Гц */
+  {"Joystick map",   0,0,NULL, NULL, &opt_items[15]},
+  {"NumPad as joystick",0,0,NULL, NULL, &opt_items[43]},
+  {"Player 1 input", 0,0,NULL, NULL, &opt_items[44]},
+  {"Player 2 input", 0,0,NULL, NULL, &opt_items[45]},
+};
+/* v0.15.293 ПОДМЕНЮ ИЗОБРАЖЕНИЯ. Тот же набор слов и тот же порядок для всех машин (требование
+   владельца из v182 - одинаковые вещи называть одинаково), значения по-прежнему ПЕРСОНАЛЬНЫЕ для
+   каждой машины: их хранит профиль g_mp[], меню лишь показывает живые opt_*.
+     Screen X/Y      - где стоит ОКНО вывода на телевизоре (HMARGIN/VMARGIN, реестр SCR_POS)
+     Screen scale    - целочисленное увеличение окна (SCR_SCALE)
+     Center screen   - действие: посчитать центр под текущий масштаб
+     Pan X/Y         - сдвиг САМОЙ КАРТИНКИ внутри окна
+     Crop            - обрезка краёв кадра (у NES её не было и раньше: строк в кадре другое число,
+                       и обрезчик у нас пока ZX-овый - выдумывать несуществующее хуже, чем не
+                       показывать строку) */
+static const MenuItem mi_display_zx[] = {
+  {"Screen X",       0,0,NULL, NULL, &opt_items[26]},
+  {"Screen Y",       0,0,NULL, NULL, &opt_items[27]},
+  {"Screen scale X", 0,0,NULL, NULL, &opt_items[40]},
+  {"Screen scale Y", 0,0,NULL, NULL, &opt_items[41]},
+  {"Center screen",  0,0,NULL, NULL, &opt_items[42]},
+  {"Pan X",          0,0,NULL, NULL, &opt_items[24]},
+  {"Pan Y",          0,0,NULL, NULL, &opt_items[25]},
   {"Crop left",      0,0,NULL, NULL, &opt_items[28]},
   {"Crop right",     0,0,NULL, NULL, &opt_items[29]},
   {"Crop top",       0,0,NULL, NULL, &opt_items[30]},
   {"Crop bottom",    0,0,NULL, NULL, &opt_items[31]},
 };
-static Menu m_machine = { mi_machine_pent, 9, 0 };         /* set by machine_menu_sync() */
-static void machine_menu_sync(void){                       /* point the Machine submenu at the current machine's param set */
-    if(opt_defmachine==1){ m_machine.items=mi_machine_pent; m_machine.count=9; }
-    else if(opt_defmachine>=2){ m_machine.items=mi_machine_48; m_machine.count=9; }   /* both 48K variants (Atlas / MiSTer) share the 48K submenu (+ULA snow row) */
-    else                 { m_machine.items=mi_machine_zx;   m_machine.count=9; }      /* 128K submenu (+ULA snow row) */
-    m_machine.deflt=0;
+static const MenuItem mi_display_nes[] = {
+  {"Screen X",       0,0,NULL, NULL, &opt_items[26]},
+  {"Screen Y",       0,0,NULL, NULL, &opt_items[27]},
+  {"Screen scale X", 0,0,NULL, NULL, &opt_items[40]},
+  {"Screen scale Y", 0,0,NULL, NULL, &opt_items[41]},
+  {"Center screen",  0,0,NULL, NULL, &opt_items[42]},
+  {"Pan X",          0,0,NULL, NULL, &opt_items[24]},
+  {"Pan Y",          0,0,NULL, NULL, &opt_items[25]},
+};
+/* v0.15.293: варианты подменю - настоящие Menu, а не голые таблицы. Так число строк живёт в ОДНОМ
+   месте (его считает MENU_N), а сторож высоты берёт его оттуда же, откуда движок, и разъехаться
+   с проверяемым уже не может. */
+/* v0.15.302 ГРУППА ПЗУ - ЧЕТЫРЕ ЯВНЫХ СЛОТА (жалоба владельца: «надо более простое переключение
+   банков ПЗУ или очевидное»). Раньше в меню был ОДИН пункт «ROM set», за именем которого пряталась
+   раскладка по четырём страницам, и что реально лежит в каждой, из интерфейса видно не было.
+   Теперь строка на страницу, справа - имя файла, чьё содержимое в ней ЛЕЖИТ (а не то, что мы
+   когда-то собирались туда положить). Подписи страниц - наша каноническая раскладка: номер каждой
+   зашит в ядре (трап TR-DOS ходит в страницу 2, сервисная = 3), поэтому переименовать их нельзя.
+   «Whole set» оставлен: он по-прежнему раскладывает четыре страницы одним движением, и после него
+   слоты показывают результат этой раскладки. */
+/* v0.15.384 ПЕРВАЯ СТРОКА - ОДИН ЭКРАН НА ВСЁ (задание владельца 19.08: «меню управления банками ром
+   не совсем логично выглядит, надо уметь показывать какие банки или содержимое в ром файле, и выбирать
+   из разных вариантов любого ром файла»). В диалоге видны файл, его размер, ЧИСЛО СТРАНИЦ, содержимое
+   КАЖДОЙ страницы и то, в какой слот она уедет; там же переключатель AUTO/MANUAL и сама таблица.
+   Строки-слоты ниже остались: они по-прежнему показывают, что РЕАЛЬНО легло, и кладут отдельный
+   файл в отдельную страницу. Команда, а не ITEM_ACTION: модальные диалоги нового каркаса берут слот
+   фона: выпадашка занимает свой уровень стека - menubar_exec закрывает её ДО app_dispatch. */
+static const MenuItem mi_rom[] = {
+  {"ROM ~f~ile and banks...", cmOptRomBanks, 0, NULL},
+  {NULL},
+  {"Slot ~0~: 128 menu", 0,0,NULL, NULL, &opt_items[62]},
+  {"Slot ~1~: 48 BASIC", 0,0,NULL, NULL, &opt_items[63]},
+  {"Slot ~2~: TR-DOS",   0,0,NULL, NULL, &opt_items[64]},
+  {"Slot ~3~: Service",  0,0,NULL, NULL, &opt_items[65]},
+  {"~B~oot machine from",0,0,NULL, NULL, &opt_items[66]},   /* AUTO / SLOT 0..3 */
+  {"~W~hole ROM set",    0,0,NULL, NULL, &opt_items[50]},   /* v207: набор целиком с карты (0:/ROMS/) */
+  {"Service ROM ~m~ode", 0,0,NULL, NULL, &opt_items[51]},   /* v207/v252: OFF / NMI / ALWAYS */
+  {"Service page under ~T~R-DOS", 0,0,NULL, NULL, &opt_items[77]},   /* v388: OFF / AUTO / ON */
+};
+static Menu m_rom       = { mi_rom,          MENU_N(mi_rom),          0 };
+static Menu m_mach_zx   = { mi_machine_zx,   MENU_N(mi_machine_zx),   0 };
+static Menu m_mach_pent = { mi_machine_pent, MENU_N(mi_machine_pent), 0 };
+static Menu m_mach_48   = { mi_machine_48,   MENU_N(mi_machine_48),   0 };
+static Menu m_mach_nes  = { mi_machine_nes,  MENU_N(mi_machine_nes),  0 };
+static Menu m_disp_zx   = { mi_display_zx,   MENU_N(mi_display_zx),   0 };
+static Menu m_disp_nes  = { mi_display_nes,  MENU_N(mi_display_nes),  0 };
+static Menu m_machine = { mi_machine_pent, MENU_N(mi_machine_pent), 0 };   /* set by machine_menu_sync() */
+static Menu m_display = { mi_display_zx,   MENU_N(mi_display_zx),   0 };   /* set by machine_menu_sync() */
+/* v0.15.303 ОДНА ТОЧКА ПЕРЕСКАНИРОВАНИЯ 0:/ROMS/. Каталог перечитывают ТРИ места (открытие подменю
+   машины и два модальных диалога), а список строк, по которому рисуется пункт «Whole ROM set», живёт
+   в opt_items[50]. Пересканировать и НЕ обновить эту пару - готовое падение: файлов на карте стало
+   меньше, g_rs_n уменьшился, а рендер по-прежнему обходит СТАРЫЙ nchoices и разыменовывает указатель
+   на имя, которого больше нет. Поэтому скан и подстановка списка теперь неразделимы. Заодно
+   пересчитываем индекс выбранного набора: после пересканирования номера имён другие, а исчезнувший с
+   карты набор честно превращается в BUILT-IN. */
+static void romset_rescan_sync(void){
+    int m = (opt_defmachine>=0 && opt_defmachine<N_MACHINES) ? opt_defmachine : 0;
+    romset_scan();
+    opt_romset = 0;
+    if(g_mp[m].romset[0])
+        for(int i=1; i<g_rs_n; i++) if(!cicmp(g_rs_name[i], g_mp[m].romset)){ opt_romset=i; break; }
+    /* 🥇 v0.15.384 НАБОР МОЖЕТ ЛЕЖАТЬ ВНЕ 0:/ROMS/. Диалог «ROM file and banks» выбирает файл
+       универсальным picker'ом по ЛЮБОМУ пути (0:/zc/PROTEUS.ROM и т.п.), а обход каталога такого имени
+       не найдёт - и пункт «Whole ROM set» показывал бы BUILT-IN при живом наборе, то есть ВРАЛ. Кладём
+       выбранный путь в список отдельным последним элементом: он же уедет назад в ini через mp_store. */
+    /* 🥇 v0.15.386 ДОПИСЫВАЕМ ТОЛЬКО СУЩЕСТВУЮЩИЙ ФАЙЛ. Условие «имя есть, а в списке его нет»
+       накрывает ТРИ разных случая, и правильный ответ у них разный:
+         - внешний путь (0:/zc/PROTEUS.ROM) - обход 0:/ROMS/ не найдёт его НИКОГДА -> дописать;
+         - файл ЛЕЖИТ в 0:/ROMS/, но отброшен фильтром содержимого rom_file_probe (у FATALL26.ROM
+           нет двух пар DB FE/D3 FE) - в списке его нет, а набор рабочий -> дописать, иначе первый
+           же mp_store перепишет romset пустой строкой и ВЫБОР ВЛАДЕЛЬЦА ПРОПАДЁТ;
+         - файла на карте больше НЕТ (удалили, подменили карту) - тут правило стоит с v207 и записано
+           в mp_load: молча BUILT-IN, имя в ini не трогаем. Дописать = врать про выбранный набор.
+       Различает их не форма имени, а НАЛИЧИЕ ФАЙЛА: один f_stat против пробы содержимого всего
+       каталога, которую romset_scan только что сделал, - цена никакая. */
+    int rs_have = 0;
+    if(g_mp[m].romset[0]){
+        /* Карты нет - существование опровергнуть НЕЧЕМ, а правило v207 прямое: карту могли просто
+           вынуть, и терять из-за этого настройку нельзя. Тогда оставляем набор на месте. */
+        if(!sd_mounted) rs_have = 1;
+        else {
+            char rsp[ROMSET_PATHL+16]; rom_path_make(rsp, (int)sizeof(rsp), g_mp[m].romset);
+            FILINFO rsf; if(f_stat(rsp, &rsf) == FR_OK && !(rsf.fattrib & AM_DIR)) rs_have = 1;
+        }
+    }
+    if(!opt_romset && rs_have){
+        /* Место под внешний путь ПЕРЕИСПОЛЬЗУЕМ, а не дописываем каждый раз: romset_scan() при
+           недоступной карте выходит РАНО и старый список не разрушает, поэтому «дописывать» значило бы
+           плодить дубликаты на каждое открытие меню, пока не кончится массив. */
+        int slot = (g_rs_n > 1 && g_rs_name[g_rs_n-1] == g_rs_extra) ? g_rs_n-1
+                 : (g_rs_n <= ROMSET_MAX+1 ? g_rs_n : -1);
+        if(slot >= 0){
+            int i=0; for(; g_mp[m].romset[i] && i<ROMSET_PATHL-1; i++) g_rs_extra[i]=g_mp[m].romset[i];
+            g_rs_extra[i]=0;
+            g_rs_name[slot]  = g_rs_extra;
+            g_rs_pages[slot] = 0;                    /* число страниц узнаём пробой, а не каталогом */
+            g_rs_kind[slot]  = 3;
+            opt_romset = slot;
+            if(slot == g_rs_n) g_rs_n++;
+        }
+    }
+    opt_items[50].choices  = g_rs_name;              /* подставляем ПОСЛЕ возможного добавления */
+    opt_items[50].nchoices = g_rs_n;
+}
+static void machine_menu_sync(void){                     /* point the Machine/Display submenus at the current machine's param set */
+    const Menu *mm, *dd;
+    if(opt_defmachine==4)      { mm=&m_mach_nes;  dd=&m_disp_nes; }   /* v0.15.189: +Region */ /* v176: +NumPad, +оба входа */
+    else if(opt_defmachine==1) { mm=&m_mach_pent; dd=&m_disp_zx;  }
+    else if(opt_defmachine>=2) { mm=&m_mach_48;   dd=&m_disp_zx;  }
+    else                       { mm=&m_mach_zx;   dd=&m_disp_zx;  }
+    m_machine.items=mm->items; m_machine.count=mm->count;
+    m_display.items=dd->items; m_display.count=dd->count;
+    m_machine.deflt=0; m_display.deflt=0;
+    /* v207 РАНТАЙМ-СПИСОК НАБОРОВ ПЗУ. Обходим 0:/ROMS/ здесь: подменю машины открывается именно
+       через эту функцию, значит список всегда свежий (карту могли поменять). opt_items не const,
+       рендер разыменовывает choices/nchoices на каждой перерисовке - подстановки достаточно. */
+    romset_rescan_sync();                                   /* v303: скан + список пункта [50] + индекс набора */
+    /* v292: у пункта устройств столько значений, сколько образов ДЕЙСТВИТЕЛЬНО подключено. Второго
+       нет - остаётся одно, MASTER, и строка честно неактивна вместо обещания, которого не сдержим. */
+    opt_items[60].nchoices = ide_slave_present() ? 2 : 1;
+    if(!ide_slave_present()) opt_idedev = 0;
+    /* v304: ядро без портов мыши (MiSTer-48, NES, любой битстрим до B0116) обещать мышь не должно -
+       строка честно оставляет один вариант OFF. Признак берём из LOAD_CAPS, а не из версии ядра. */
+    if(!(LOAD_CAPS_R & LOADCAP_KMOUSE)){ opt_items[67].nchoices = 1; opt_kmouse = 0; }
+    else                                 opt_items[67].nchoices = 3;
+    rom_slots_ui_sync();                                    /* v302: строки слотов + гашение группы ROM */
+    scr_view_sync();                                        /* v157: the Screen X/Y rows show THIS machine's pair */
+    apply_jsrc();                                           /* v176: PAD-источники зажать, если кэпа нет */
+    kbd_leds_set(kbd_led_mask());                           /* v216: не затереть ScrollLock-паузу */
 }
 
-static const MenuItem mi_display[] = {                     /* GLOBAL DISPLAY: machine-independent (crop moved to Machine - it's per-machine) */
-  {"Screen X",       0,0,NULL, NULL, &opt_items[26]},      /* whole frame H position on HDMI */
-  {"Screen Y",       0,0,NULL, NULL, &opt_items[27]},      /* whole frame V position on HDMI */
-  {"OSD dim",        0,0,NULL, NULL, &opt_items[7]},
-};
-static Menu m_display = { mi_display, 3, 0 };
-
+/* v0.15.171 (owner): "OSD dim" moved to Options > Navigator - it dims the NAVIGATOR/OSD overlay, so it
+   belongs with the other UI rows. (v0.15.293: Options > Display вернулось - но уже не пустым и не
+   «глобальным», а с геометрией картинки текущей машины; сюда, в Navigator, по-прежнему идёт только
+   то, что относится к САМОЙ оболочке.) */
 static const MenuItem mi_navigator[] = {                   /* UI / browser */
+  {"OSD dim",        0,0,NULL, NULL, &opt_items[7]},       /* v171: was Options > Display */
   {"Window X",       0,0,NULL, NULL, &opt_items[8]},       /* navigator (DN canvas) position */
   {"Window Y",       0,0,NULL, NULL, &opt_items[9]},
   {"Scroll speed",   0,0,NULL, NULL, &opt_items[1]},
@@ -4454,51 +10856,172 @@ static const MenuItem mi_navigator[] = {                   /* UI / browser */
   {"Show hidden",    0,0,NULL, NULL, &opt_items[17]},      /* macOS .DS_Store/._* junk toggle */
   {"Show navigator on boot",0,0,NULL, NULL, &opt_items[19]},
 };
-static Menu m_navigator = { mi_navigator, 6, 0 };
+static Menu m_navigator = { mi_navigator, MENU_N(mi_navigator), 0 };
 
 static const MenuItem mi_audio[] = {                       /* (tape/MP3 params -> Tape menu; play mode -> Play menu) */
   {"Volume",         0,0,NULL, NULL, &opt_items[6]},
   {"Pause on music", 0,0,NULL, NULL, &opt_items[5]},
   {"On launch (music)",0,0,NULL, NULL, &opt_items[18]},
 };
-static Menu m_audio = { mi_audio, 3, 0 };
+static Menu m_audio = { mi_audio, MENU_N(mi_audio), 0 };
 
-static const MenuItem mi_opts[] = {
-  {"~M~achine",      0,           0, NULL, &m_machine},     /* per-machine intrinsic params */
-  {"~D~isplay",      0,           0, NULL, &m_display},     /* global display (position/crop/dim) */
-  {"~N~avigator",    0,           0, NULL, &m_navigator},   /* UI / browser */
-  {"~A~udio",        0,           0, NULL, &m_audio},
+/* v0.15.302: таблица Options больше НЕ const - строку ROM надо гасить на ядрах без порта заливки
+   (NES, MiSTer-48): там менять нечего, и живой пункт обещал бы несуществующее. Ставит признак
+   machine_menu_sync() по LOAD_CAPS бит4. */
+#define MI_OPTS_ROM 1                                       /* индекс строки ROM в mi_opts */
+static MenuItem mi_opts[] = {
+  {"~M~achine",          0,           0, NULL, &m_machine, NULL, 0, st_txt_machine},   /* v411: справа - какая машина и с каким ОЗУ */
+  {"~R~OM",              0,           0, NULL, &m_rom},         /* v302: слоты ПЗУ текущей машины */
+  {"Disk ~c~ontrollers", 0,           0, NULL, &m_controllers}, /* BDI, DivMMC, NEMO-IDE, Z-Controller */
+  {"~D~isplay",          0,           0, NULL, &m_display},     /* v293: геометрия картинки текущей машины */
+  {"~N~avigator",        0,           0, NULL, &m_navigator},   /* UI / browser */
+  {"~A~udio",            0,           0, NULL, &m_audio},
   {NULL},
-  {"Sa~v~e config",  cmOptSave,   0, NULL},                 /* act_save()  */
-  {"~E~ject SD",     cmOptEject,  0, NULL},                 /* act_eject() */
+  {"Sa~v~e config",      cmOptSave,   0, NULL},                 /* act_save()  */
+  {"~E~ject SD",         cmOptEject,  0, NULL},                 /* act_eject() */
 };
-static Menu m_opts = { mi_opts, 7, 0 };
+static Menu m_opts = { mi_opts, MENU_N(mi_opts), 0 };
+/* v0.15.302 СТРОКИ СЛОТОВ. Что показывать - строго по старшинству источников правды:
+     1) g_pg_file[s] - файл, чьё содержимое РЕАЛЬНО легло в страницу (проверено по ROM_LDCNT);
+     2) назначение владельца, которое ещё не удалось залить (нет карты, битый файл) - тогда причина
+        отказа лежит в строке состояния, а сама строка честно показывает, чего он хотел;
+     3) ничего не назначено - «(FROM SET)», если у машины выбран набор, иначе «(BUILT-IN)»:
+        врать именем файла про страницу из битстрима нельзя.
+   Значение пункта - выбор с ОДНИМ вариантом, поэтому стрелки его не крутят (menuitem_value_cycle
+   при nchoices==1 возвращает тот же индекс), а Enter открывает модальный выбор файла. */
+static void rom_slots_ui_sync(void){
+    int m = (opt_defmachine>=0 && opt_defmachine<N_MACHINES) ? opt_defmachine : 0;
+    int have_set = g_mp[m].romset[0] ? 1 : 0;
+    for(uint32_t s=0; s<ROM_PG_N; s++){
+        g_slot_disp[s] = g_pg_file[s][0]   ? g_pg_file[s]
+                       : g_mp[m].rom[s][0] ? g_mp[m].rom[s]
+                       : (have_set ? "(FROM SET)" : "(BUILT-IN)");
+        opt_items[62+s].choices  = (const char* const*)&g_slot_disp[s];
+        opt_items[62+s].nchoices = 1;
+    }
+    /* v305: «AUTO» дописываем НОМЕРОМ страницы, с которой машина стартует на самом деле. Берём его
+       у той же rom_boot_page, которой пользуется заливка, - двух источников правды на один номер
+       быть не должно. */
+    { int bp = rom_boot_page(m); int p = 0; const char* s = "AUTO (SLOT ";
+      for(int j=0; s[j]; j++) g_rombus_auto[p++] = s[j];
+      g_rombus_auto[p++] = (char)('0' + (bp & 3)); g_rombus_auto[p++] = ')'; g_rombus_auto[p] = 0; }
+    /* Ядро без порта заливки (NES, MiSTer-48) менять ПЗУ не умеет - строка группы честно неактивна. */
+    mi_opts[MI_OPTS_ROM].disabled = (LOAD_CAPS_R & LOADCAP_ROM) ? 0 : 1;
+}
 
 static const MenuItem mi_help[] = {
   {"~A~bout...",  cmHelpAbout, 0, "F1"},
   {"~K~eys...",   cmHelpKeys,  0, NULL},
 };
-static Menu m_help = { mi_help, 2, 0 };
+static Menu m_help = { mi_help, MENU_N(mi_help), 0 };
 
 static BarItem g_bar[] = {                                  /* order == LEFT/RIGHT order */
   {"~F~iles",   &m_files}, {"~P~lay", &m_play}, {"~T~ape", &m_tape},
   {"~O~ptions", &m_opts},  {"~H~elp", &m_help} };
 static const int g_bar_n = 5;
 
+/* v0.15.292 АУДИТ ВЫСОТЫ МЕНЮ (сторож g_menu_toohigh объявлен с v231, но тела у него не было -
+   проверять вместимость было нечем, а подменю машины уже дважды перерастало канву).
+   Геометрия (пересчитана в v0.15.293 по коду, а не по памяти): menubox_size даёт H = 2 + строк;
+   menu_open_sub кладёт бокс от top >= 1; тень (dn_shadow) ложится ещё на одну строку НИЖЕ бокса,
+   на top + H. Строка 22 - это строка состояния навигатора (dn_draw_status рисует dn_fill(1,22,...)),
+   и накрывать её нельзя ни рамкой, ни тенью. Отсюда 1 + (2 + строк) <= 21, то есть сам бокс влезает
+   до 19 строк, но у девятнадцати тень садится ровно на строку состояния - честный предел 18.
+   Раньше здесь стояло 20: сторож пропускал и меню Files (19 строк), которое так и жило с тенью на
+   состоянии. Проверяем ВСЕ меню бара и их подменю, а подменю машины и изображения - все варианты
+   сразу: они подменяются в рантайме (machine_menu_sync), и проверка только текущего пропустила бы
+   ровно тот случай, из-за которого сторож и заводился. */
+#define MENU_MAX_ROWS 18
+/* v292: вместимость проверяется ДВУМЯ разными вопросами, и путать их нельзя.
+   (1) ПОКАЗЫВАЕМ ЛИ МЫ ВСЁ, ЧТО НАПИСАЛИ. Движок обходит ровно `count` строк, терминатора у таблиц
+       нет, поэтому строка, дописанная в массив без правки count, просто перестаёт существовать -
+       молча, без единого предупреждения. Так у подменю машин было 22 строки в таблице против
+       count = 18 (v293 разложил их по смыслу, а счёт отдал MENU_N).
+   (2) ВЛЕЗАЕТ ЛИ МЕНЮ НА КАНВУ - см. MENU_MAX_ROWS выше.
+   v0.15.293: обе проверки берут число строк У САМОГО МЕНЮ (m->count - то самое поле, по которому
+   рисует движок), а не из переписанной сюда рукой таблицы. Прежний список чисел был копией, а копия
+   расходится с оригиналом молча - сторож начал бы сторожить вчерашнюю раскладку. */
+static int g_menu_trunc = 0;                   /* v292: сколько строк объявлено, но не показывается */
+static void menu_height_audit(void){
+    static const struct { const Menu* m; int have; } M[] = {
+        { &m_files,     MENU_N(mi_files)        },
+        { &m_controllers, MENU_N(mi_controllers) },
+        { &m_play,      MENU_N(mi_play)         },
+        { &m_tape,      MENU_N(mi_tape)         },
+        { &m_navigator, MENU_N(mi_navigator)    },
+        { &m_audio,     MENU_N(mi_audio)        },
+        { &m_opts,      MENU_N(mi_opts)         },
+        { &m_help,      MENU_N(mi_help)         },
+        { &m_mach_zx,   MENU_N(mi_machine_zx)   },
+        { &m_mach_pent, MENU_N(mi_machine_pent) },
+        { &m_mach_48,   MENU_N(mi_machine_48)   },
+        { &m_mach_nes,  MENU_N(mi_machine_nes)  },
+        { &m_disp_zx,   MENU_N(mi_display_zx)   },
+        { &m_disp_nes,  MENU_N(mi_display_nes)  },
+        { &m_rom,       MENU_N(mi_rom)          },   /* v302: новая группа ПЗУ - под тем же сторожем */
+    };
+    g_menu_toohigh = 0; g_menu_trunc = 0;
+    for(unsigned i = 0; i < sizeof(M)/sizeof(M[0]); i++){
+        int shown = M[i].m->count;
+        if(shown > MENU_MAX_ROWS && shown > g_menu_toohigh) g_menu_toohigh = shown;
+        if(M[i].have > shown) g_menu_trunc += M[i].have - shown;
+    }
+    if(g_menu_toohigh)     dn_status_msg("!!! MENU TOO HIGH - CHECK MENU ROWS");
+    else if(g_menu_trunc)  dn_status_msg("!!! MENU ROWS HIDDEN - count < TABLE");
+}
+
+static int kbd_note(uint32_t code, int release);   /* v0.15.184: kbd_flush ведёт таблицу клавиш, а тело kbd_note ниже */
 static void kbd_flush(void) {
     /* Pop until the FIFO reports empty (bit8). NEVER compare the whole word against a sentinel:
        an empty read returns {stale head, empty=1, garbage code} - see axi_ctl.v. Bounded: the
        FIFO is 32 deep, so 64 pops always clears it even if keys arrive mid-flush. */
-    for (int i = 0; i < 64 && !(KBD_DATA & 0x100u); i++) { }
+    /* v0.15.184 ЗАСТРЯВШИЕ МОДИФИКАТОРЫ (владелец: "плюс и минус выделяют файлы, а не громкость").
+       Выброшенный кадр - это в половине случаев ОТПУСКАНИЕ, и таблица g_kd оставалась с зажатой
+       клавишей: после диалога с маской простой KP+ выглядел как Shift+KP+ и выделял файлы вместо
+       громкости. Тот же механизм давал «залипшие» клавиши после модальных окон. Кадры по-прежнему
+       НЕ становятся действиями (в этом смысл flush), но состояние клавиш обновляем честно. */
+    for (int i = 0; i < 64; i++) {
+        uint32_t d = KBD_DATA;
+        if (d & 0x100u) break;                       /* FIFO пуст */
+        kbd_note(d & 0xFFu, (d & 0x200u) != 0);      /* отпускание больше не теряется */
+    }
+    g_kbd_ext = 0;      /* v0.15.192: выброшенный E0 не должен свернуть СЛЕДУЮЩУЮ настоящую клавишу */
 }
 
+static void joymap_eval(void);        /* fwd: тело выше, но объявление нужно и здесь */
 static void bg_pump(void) {
+    dmmc_drain();                 /* v423: вспышку карты вычерпать ДО gs_pump, иначе mkdir снова ждёт звук.
+                                     v343: и из ожидания клавиши - у карты дедлайн 1.30 с, а модальное
+                                     окно живёт минутами; без этого открытое меню во время обмена =
+                                     «Disk error» на исправном железе */
+    /* Насос вызывается ИЗ ЦИКЛОВ ДИАЛОГОВ (get_keysym_blocking), то есть при поднятом клипе
+       интерьера, и намеренно обновляет строку состояния и маркизу ПОД окном. Возвратов внутри нет,
+       поэтому оборачиваем целиком. */
+    clip_push_full();
     /* Background work while a modal loop waits for a key: the producers must never starve.
        Machine-agnostic by design: pumps + UI ticks only, nothing here knows about the ZX. */
+    /* v0.15.191 ДЖОЙСТИК НЕ ЗАМИРАЕТ В ИНТЕРФЕЙСЕ (найдено приборно: при открытом навигаторе теневая
+       копия JOY висела на метке 0xFFFFFFFF, потому что joymap_eval вызывался ТОЛЬКО из главного цикла).
+       Пока открыто меню, диалог или навигатор, ввод обслуживает модальный цикл - и джойстик у машины
+       переставал обновляться, хотя игра под оболочкой продолжает идти. Теперь состояние пересчитывается
+       и здесь: как на MiSTer, оверлей не отбирает управление у машины. */
+    joymap_eval();
+    kmouse_eval();   /* v304: и мышь - по той же причине, что джойстик: под модальным окном машина
+                        продолжает идти, и брошенная зажатой кнопка досталась бы ей навсегда */
+    /* v0.15.293 ВИНЧЕСТЕР ОБСЛУЖИВАЕТСЯ И ПОД МОДАЛЬНЫМ ОКНОМ. Команда ATA идёт с поднятым BSY, и
+       снять его может только эта служба: пока модальный цикл ждал клавишу, машина стояла посреди
+       чтения сектора - для софта это выглядит как зависший диск, а виноват открытый диалог. У
+       дисковода такое дообслуживание давно есть (disk_eject_safe зовёт disk_service), у IDE не было. */
+    nemo_service();
+    /* 🥇 v0.15.298 КАРТА GENERAL SOUND ТОЖЕ ИГРАЕТ ПОД МОДАЛЬНЫМ ОКНОМ. Её виртуальное время двигает
+       ТОЛЬКО этот насос, и пока модальный цикл ждал клавишу, карта стояла целиком: открытое меню
+       или диалог = гарантированное замирание музыки и провал измеренного темпа. Ровно та же болезнь,
+       что была у ленты и у винчестера, и лечится тем же местом. */
+    gs_pump();
     tape_pump();                                                 /* an open menu must not kill a running tape load */
     if (g_tape_on && g_tape_fmt == TAPE_FMT_MP3) tape_pump();    /* heavier decode path: main-loop parity */
     pump_autoadvance();                                          /* track ended while a menu/dialog is open -> play next */
-    if (!g_tape_on && browser_on) {
+    if (!g_tape_on && browser_on && g_modal_level == 0 && !g_menu_open) {
         if (player_active()) {                                   /* keep the row-22 music status live under the menu */
             unsigned pct = player_progress(); if (pct > 100u) pct = 100u;
             unsigned el = player_elapsed_s();
@@ -4509,6 +11032,7 @@ static void bg_pump(void) {
            Delete, etc.). The main loop animates the marquee when the browser is the top surface. */
         status_scroll_tick();                                    /* row 22 sits below every dialog - always safe */
     }
+    clip_pop();
 }
 
 /* ================= unified key-state layer (single source of truth) =============================
@@ -4520,16 +11044,56 @@ static void bg_pump(void) {
    a >1.5 s silence auto-releases a key (self-heals a genuinely lost break). Machine-agnostic ARM layer. */
 static uint8_t g_kd[256];
 static XTime   g_kd_t[256];
+/* F12 is the focus-boundary key itself. toggle_view() deliberately clears g_kd[] while the
+   physical key is still down; without this independent latch the first typematic make is seen as
+   a fresh press and immediately re-opens the browser that was just closed. Release clears the
+   latch; the 1.5 s gap rule still self-heals a genuinely lost break. */
+static uint8_t g_f12_phys_down;
 static volatile uint32_t g_kbd_diag __attribute__((used)) = 0;   /* Step 15: PS/2 {resend<<16 | parity_err} mirror (JTAG) */
 #define KD_STALE (COUNTS_PER_SECOND*3u/2u)     /* 1.5 s: longer than any typematic gap, so only a real
                                                   re-press (or a lost break) re-arms a held key */
-static int kbd_note(uint32_t code, int release){
-    if(code==0xF0u || code==0xE0u || code==0xE1u) return 0;   /* prefix bytes are not keys */
-    if(release){ g_kd[code]=0; return 0; }
+/* v0.15.186 УСТОЙЧИВОСТЬ К СБОЯМ PS/2 (владелец: "плюс-минус громкостью не управляют").
+   Приборно снято: 25 ошибок чётности за одну загрузку. Сбойный кадр = потерянное ОТПУСКАНИЕ, а
+   `g_kd[code]` гаснет только по отпусканию (давность `KD_STALE` использовалась лишь для фронта).
+   Один сбой калечил ВСЕ комбинации с Shift навсегда: простой KP+ уходил в ветку выделения по маске,
+   которая без открытого браузера не делает ничего - клавиша выглядела мёртвой.
+   Лечим тремя независимыми линиями, чтобы отказ одной не возвращал симптом:
+     1) `kbd_mod_held()` - для МОДИФИКАТОРОВ спрашиваем не только флаг, но и свежесть (5 с). Цена
+        ошибки здесь мала и обратима: получишь громкость вместо выделения, а не мёртвую клавишу.
+     2) `kbd_state_clear()` по КАЖДОМУ приросту счётчика ошибок чётности: канал глюкнул -> наша
+        модель недостоверна, сбрасываем всё зажатое. Реально удерживаемая клавиша вернётся
+        тайпматиком через ~90 мс, а джойстик пересчитается тут же.
+     3) сами клавиши громкости больше не могут быть мёртвыми (см. обработчик KP+/KP-/KP*). */
+#define KD_MOD_FRESH (COUNTS_PER_SECOND*5u)
+static int kbd_mod_held(uint32_t code){
+    if(!g_kd[code]) return 0;
     XTime now; XTime_GetTime(&now);
-    int was = g_kd[code] && ((uint64_t)(now - g_kd_t[code]) < (uint64_t)KD_STALE);
+    return ((uint64_t)(now - g_kd_t[code]) < (uint64_t)KD_MOD_FRESH);
+}
+/* v0.15.191: пересечение границы фокуса (навигатор/оверлей открылся или закрылся) обнуляет
+   «зажатое». Приборно видно, зачем: в таблице жили 0x74/0x92/0xDA/0xF2 - следы инжектов и
+   PS/2-шного «фальшивого Shift» (E0 12), которые keyboard посылает вокруг клавиш цифрового блока.
+   Реально удерживаемая клавиша вернётся тайпматиком за ~90 мс, а фантом не переживёт переключения. */
+static void kbd_state_clear(void){
+    for(int i=0;i<256;i++) g_kd[i]=0;
+    g_kbd_ext = 0;                      /* v0.15.192: и незавершённый префикс тоже */
+    kb_alt = 0; g_kb_shift = 0;
+}
+static int kbd_note(uint32_t code, int release){
+    /* v175: префиксы E0/F0/E1 свёрнуты в kbd_data_read, сюда приходят только настоящие клавиши */
+    if(release){
+        g_kd[code]=0;
+        if(code==SC_F12) g_f12_phys_down=0;
+        return 0;
+    }
+    XTime now; XTime_GetTime(&now);
+    uint64_t age = (uint64_t)(now - g_kd_t[code]);
+    int was = g_kd[code] && (age < (uint64_t)KD_STALE);
+    int f12_was = g_f12_phys_down && (age < (uint64_t)KD_STALE);
+    if(code==SC_F12) g_f12_phys_down=1;
     g_kd[code]=1; g_kd_t[code]=now;
-    return !was;                               /* 1 = rising edge (fresh press, not typematic repeat) */
+    if(code==SC_F11 && !was) g_hard_rst_req = 1;   /* v0.15.394 F11 = железный сброс, см. hard_reset_service */
+    return (code==SC_F12) ? !f12_was : !was; /* focus clear cannot turn held F12 into a new edge */
 }
 /* ---- Step 15: PS/2 HOST TX (LEDs / typematic / resend). The fabric ps2_tx does the hardware-timed
    handshake; we just write the byte and wait for busy to drop. Audio is pumped throughout so a
@@ -4542,17 +11106,46 @@ static void kbd_tx_byte(uint32_t b){
 }
 /* Step 15: pull ONE specific device response byte out of the RX FIFO, discarding anything else, with a
    bounded spin timeout. Audio is pumped and the deadman kicked while we wait. 1 = seen, 0 = timed out. */
+/* v0.15.196: раньше эта функция была ТИХИМ УБИЙЦЕЙ НАЖАТИЙ - всё, что не совпало с ожидаемым байтом,
+   она выбрасывала. А зовут её команды лампочек (NumLock-переключатель, индикатор паузы), по два
+   ожидания на команду. Съеденное ОТПУСКАНИЕ = зажатая клавиша в g_kd и залипшая защёлка nl_held:
+   «то с первого, то с третьего раза». Теперь чужие кадры складываются и возвращаются в поток, а
+   ответ устройства принимается и из потока, и из ящика фильтра (см. g_kbd_prot_last). */
 static int kbd_wait_byte(uint32_t want, uint32_t spins){
-    uint32_t g=0;
+    if(g_kbd_cooked > 0){                      /* v200: ответы устройства идут не в поток, а в ящик 0x13C */
+        uint32_t seq0 = (PS2_DIAG >> 24) & 0xFFu;
+        for(uint32_t g = 0; g < spins; g++){
+            uint32_t d = PS2_DIAG;
+            uint32_t sq = (d >> 24) & 0xFFu;
+            if(sq != seq0){                    /* пришёл НОВЫЙ ответ */
+                seq0 = sq;
+                if(((d >> 16) & 0xFFu) == want) return 1;
+            }
+            player_pump(); KBD_HB = 1u;
+        }
+        return 0;
+    }
+    uint32_t stash[16]; int ns = 0; uint32_t g = 0; int ok = 0;
+    g_kbd_prot_last = 0x100u;                        /* ждём НОВЫЙ ответ, старый не считаем */
     while(g++ < spins){
         uint32_t d = KBD_DATA;                       /* atomic pop+read; bit8 = empty */
         if(!(d & 0x100u)){                           /* a byte is present */
-            if((d & 0xFFu) == want) return 1;        /* the one we wanted */
-            /* else: some other byte (echo/noise/ACK) - drop it and keep looking */
+            if((d & 0xFFu) == want){ ok = 1; break; }
+            if(ns < 16) stash[ns++] = d;             /* настоящая клавиша - НЕ терять */
         }
+        if(g_kbd_prot_last == want){ ok = 1; break; } /* ответ забрал фильтр kbd_data_read */
         player_pump(); KBD_HB = 1u;
     }
-    return 0;
+    for(int i = 0; i < ns; i++) kinj_push(stash[i]);  /* вернуть в поток, порядок сохранён */
+    return ok;
+}
+static void kbd_leds_set(uint32_t mask){       /* 0xED + маска; ответ 0xFA на каждый байт */
+    /* v0.15.196: спины 200000 -> 12000. Столько же стоит в пути паузы (kbd_set_leds), где уже написано
+       почему: тугой предел превращает редкий медленный ACK в незаметную заминку вместо ~0.3 с стойки
+       главного цикла. Долгая стойка тут особенно вредна - на ней рвётся последовательность
+       «префикс + код» у расширенных клавиш (стрелки владельца), см. KBD_EXT_WAIT. */
+    kbd_tx_byte(0xEDu);      kbd_wait_byte(0xFAu, 12000u);
+    kbd_tx_byte(mask & 7u);  kbd_wait_byte(0xFAu, 12000u);
 }
 /* Step 15: set the keyboard LEDs, WAITING for the device ACK (0xFA) after each byte. That ACK-wait is
    what keeps the device's command FSM in sync: 0xED (LED cmd) -> 0xFA -> bitmap -> 0xFA. Without it a
@@ -4562,6 +11155,14 @@ static void kbd_set_leds(uint32_t mask){
     kbd_tx_byte(0xEDu);                                                           /* "set LEDs" command */
     kbd_wait_byte(0xFAu, 12000u);                                                 /* wait for the 0xED ACK (usually ~1ms) so the device is ready for the argument; capped TIGHT so a rare slow ACK is an imperceptible blip, not a visible ~0.3s stall */
     kbd_tx_byte(mask & 0x07u);                                                    /* the LED bitmap (no second ACK-wait: the device is never left waiting after it, so no desync risk) */
+}
+/* v0.15.216: клавиатура принимает ВСЕ три лампы одной общей маской — отдельной команды «измени
+   только NumLock» у PS/2 нет. Поэтому каждый владелец обязан сохранять состояние второго:
+   NumLock показывает владение цифровым блоком, ScrollLock — видимую паузу машины. Раньше первый
+   проход цикла после kbd_init() отправлял чистый 0 и мгновенно гасил правильно восстановленный
+   NumLock; Pause/Resume и NumLock также взаимно стирали лампы друг друга. */
+static uint32_t kbd_led_mask(void){
+    return ((halt_src & 3u) ? 0x01u : 0u) | (opt_numjoy ? 0x02u : 0u);
 }
 /* Step 15: keyboard bring-up, the way a PC does it at boot. Our 4k7 pull-ups and the keyboard's +5V
    are permanently powered, independent of the FPGA - so a JTAG/PCAP reconfig restarts the fabric but
@@ -4611,31 +11212,67 @@ static char sc_to_ascii(uint32_t code, int shift){
         default:    return 0;
     }
 }
+/* v0.15.187 ГРОМКОСТЬ РАБОТАЕТ ИЗ ЛЮБОГО ЦИКЛА ВВОДА (владелец: "плюс-минус громкостью не управляют").
+   Настоящая причина, найденная приборно (инжект клавиш + чтение opt_vol): пока открыто меню или
+   диалог, ввод обслуживает НЕ главный цикл, а get_keysym_blocking, и там KP+ был просто символом
+   «+» для текстовых полей - до обработчика громкости кадр не доходил вообще. В браузере же работает
+   главный цикл, и там плюс попадал в ветку Shift. Отсюда две разные жалобы на одну клавишу.
+   Теперь громкость - ОДНА функция, вызываемая из обоих путей; в текстовом поле (`g_keys_text`)
+   плюс/минус по-прежнему печатаются, иначе маску «*.tap» набрать было бы нельзя. */
+static void update_banner(void);
+static int g_keys_text = 0;                 /* 1 = активно текстовое поле: KP+/-/* это символы */
+static void shell_vol_key(uint32_t code){
+    if(code==SC_KPPLUS){       opt_vol+=5; if(opt_vol>100) opt_vol=100; if(g_mute){ g_mute=0; update_banner(); } apply_vol(); }
+    else if(code==SC_KPMINUS){ opt_vol-=5; if(opt_vol<0)   opt_vol=0;   if(g_mute){ g_mute=0; update_banner(); } apply_vol(); }
+    else if(code==SC_KPMUL){   g_mute^=1; apply_vol(); update_banner(); }
+}
+/* v0.15.298: ОДИН ожидатель клавиши на всю оболочку, но живому ПРИБОРУ нужна крайняя отметка -
+   иначе окно с показаниями замрёт на первом кадре. Ноль = прежнее поведение (ждать бесконечно),
+   поэтому все остальные вызовы не меняются вовсе. */
+static XTime g_key_deadline = 0;
 static int get_keysym_blocking(void) {
     while (1) {
+        /* v0.15.348 ГЛОБАЛЬНЫЙ ВЫХОД ПО F12. Ждать нечего: раскручиваем вложенность окнами вниз,
+           отдавая Escape - его понимает каждый диалог, и правок в самих диалогах не требуется. */
+        if (g_ui_abort) {
+            if (++g_ui_abort_n > 64) { g_ui_abort = 0; g_ui_abort_n = 0; }   /* предохранитель */
+            return K_ESC;
+        }
         KBD_HB = 1;                             /* deadman heartbeat: the PS/2 gate must stay up while we own the keyboard */
         player_pump();                          /* keep audio pumped and non-blocking! */
         uint32_t d = KBD_DATA;
         if (d & 0x100u) {                       /* bit8 = FIFO empty (the code bits are then stale garbage - no sentinel exists) */
             bg_pump();
+            if(g_key_deadline){                 /* v298: срок вышел - вернуть управление на перерисовку */
+                XTime _t; XTime_GetTime(&_t);
+                if(_t >= g_key_deadline) return K_NONE;
+            }
             continue;
         }
         uint32_t code = d & 0xFFu;
         int release = (d & 0x200u) != 0;
         int rising = kbd_note(code, release);   /* update the shared key-down table (also seen by the main loop) */
-        if (code == 0xF0u || code == 0xE0u) continue;   /* prefix frames */
+        if(numpad_is_joy(code)) continue;       /* v176: в диалогах цифровой блок тоже принадлежит джойстику */
+        /* v175: префиксы свёрнуты в kbd_data_read */
         kb_alt     = g_kd[0x11];                /* modifiers derived from the one table */
         g_kb_shift = g_kd[0x12] || g_kd[0x59];
         if (release) continue;
 
         /* single-shot keys: fire only on the rising edge (typematic auto-repeat is ignored) */
         if (code == SC_F9)    { if (rising) return K_F9;    continue; }
-        if (code == SC_F12)   { if (rising) return K_F12;   continue; }   /* F12 inside a menu = hide the navigator (no need to Esc out first) */
+        if (code == SC_F12)   { if (rising) { g_ui_abort = 1; g_ui_abort_n = 0; return K_ESC; }
+                                continue; }   /* v348: F12 из ЛЮБОГО окна - см. шапку. Отдаём Escape,
+                                                 чтобы закрылось и то окно, в котором нажали */
         if (code == SC_F11)   { if (rising && g_tape_on) tape_stop(); continue; }   /* F11 wipes the machine -> abort any in-flight tape load, even from a menu */
         if (code == SC_ENTER) { if (rising) return K_ENTER; continue; }
         if (code == SC_ESC)   { if (rising) return K_ESC;   continue; }
         if (code == 0x0Du)    { if (rising) return K_TAB;   continue; }
 
+        /* v0.15.187: громкость/мьют доступны и из меню/диалога - но не когда набирают текст */
+        if(!g_keys_text && (code==SC_KPPLUS || code==SC_KPMINUS || code==SC_KPMUL)){
+            if(rising || code!=SC_KPMUL) shell_vol_key(code);   /* мьют - только по фронту, громкость и тайпматиком */
+            continue;
+        }
         /* navigation + text: fire on every make (typematic repeat is desirable here) */
         switch (code) {
             case SC_UP:    return K_UP;
@@ -4685,7 +11322,7 @@ static int joymap_capture(void){
         if(d & 0x100u){ bg_pump(); continue; }
         uint32_t code = d & 0xFFu; int release = (d & 0x200u)!=0;
         int rising = kbd_note(code, release);
-        if(code==0xF0u || code==0xE0u) continue;      /* префиксы */
+        /* v175: префиксы свёрнуты в kbd_data_read - здесь их уже не бывает */      /* префиксы */
         if(release || !rising) continue;              /* только фронт нажатия */
         if(code==SC_ESC) return -1;
         if(code==SC_F9)  return -2;
@@ -4695,12 +11332,14 @@ static int joymap_capture(void){
 /* Навигируемое окно назначения (владелец: "произвольное назначение на все 8 бит"):
    Up/Dn выбрать бит, Enter -> "< press key >" захват любой клавиши, Space снять, Esc выход.
    Канонический модальный попап (dn_win_draw + диалоговые цвета + render_browser на выходе, как dn_help). */
+static void joy_bg_save(void);      /* v181: fwd - тела рядом с box_backup/box_restore ниже */
+static void joy_bg_restore(void);
 #define JW_L 20
 #define JW_T 5
 #define JW_W 40
 #define JW_H 15
 static void joymap_row(int b, int cur, int capturing){
-    char line[40]; int p=0; const char* nm=JOYBTN[b]; const char* hex="0123456789ABCDEF";
+    char line[40]; int p=0; const char* nm=joybtn_tab()[b]; const char* hex="0123456789ABCDEF";
     for(int i=0;nm[i]&&p<7;i++) line[p++]=nm[i];
     while(p<7) line[p++]=' ';
     line[p++]=' ';line[p++]='=';line[p++]=' ';
@@ -4713,33 +11352,77 @@ static void joymap_row(int b, int cur, int capturing){
     dn_fill(JW_L+2,ry,JW_W-4,1,bg);
     dn_puts(JW_L+3,ry,line,fg,bg);
 }
-static void joymap_wiz_head(void){   /* v146: title + hint for the current player */
-    dn_win_draw(JW_L,JW_T,JW_W,JW_H, g_joyp ? " JOYSTICK MAP  PLAYER 2 " : " JOYSTICK MAP  PLAYER 1 ");
-    dn_puts(JW_L+3,JW_T+11,"Up/Dn pick  <- -> P1/P2  Ent set",DNK_DLG_FG,DNK_DLG_BG);
+/* v0.15.177 (владелец: "на денди два джойстика, нужно свободное назначение на ВСЕХ клавишах").
+   В режиме захвата любая клавиша - ЗНАЧЕНИЕ, а не команда: иначе Esc/Enter/Space/F9 назначить нельзя
+   было в принципе (Enter назначал, Space сбрасывал, Esc выходил). Отмена теперь по ТАЙМАУТУ.
+   Честное ограничение: клавиши, которые декодирует сама фабрика (F11 = hard reset, Ctrl+Alt+Del,
+   Ins = NMI), до ARM в этом виде не доходят и остаются служебными. */
+#define JOYCAP_TIMEOUT_S 4u
+static int joymap_capture_any(void){
+    XTime t0; XTime_GetTime(&t0);
+    for(;;){
+        KBD_HB = 1; player_pump();
+        uint32_t d = KBD_DATA;
+        if(d & 0x100u){
+            XTime now; XTime_GetTime(&now);
+            if((uint64_t)(now - t0) > (uint64_t)COUNTS_PER_SECOND * JOYCAP_TIMEOUT_S) return -1;
+            bg_pump(); continue;
+        }
+        uint32_t code = d & 0xFFu; int release = (d & 0x200u)!=0;
+        int rising = kbd_note(code, release);
+        if(release || !rising) continue;
+        return (int)code;                     /* ЛЮБАЯ клавиша, включая Esc/Enter/Space/F9 */
+    }
+}
+static void joymap_wiz_head(void){   /* v174: заголовок несёт МАШИНУ, а подсказка знает, есть ли 2-й игрок */
+    char t[40]; int p=0; const char* mt=machine_type();
+    t[p++]=' ';
+    for(int i=0;mt[i]&&p<24;i++) t[p++]=mt[i];
+    { const char* w="  JOYSTICK  P"; for(int i=0;w[i];i++) t[p++]=w[i]; }
+    t[p++]=(char)('1'+(g_joyp&1)); t[p++]=' '; t[p]=0;
+    dn_win_draw(JW_L,JW_T,JW_W,JW_H, t);
+    /* v0.15.182 (владелец: "строка пояснения вылазит за рамки окна"). Интерьер окна = столбцы
+       JW_L+1..JW_L+JW_W-2, текст печатается с JW_L+3 -> его предел 36 знаков. Обе подсказки были
+       длиннее (37 и 39) и затирали правую рамку. Держим <=34 с запасом. */
+    dn_puts(JW_L+3,JW_T+11, (joy_players()>1) ? "Up/Dn pick  <>P1/P2  Ent assign"
+                                             : "Up/Dn pick  Ent assign  Spc clr",DNK_DLG_FG,DNK_DLG_BG);
+    dn_puts(JW_L+3,JW_T+12, (opt_defmachine==4) ? "capture: ANY key binds, wait=stop"
+                                                : "capture: NUMPAD only, wait=stop",DNK_DLG_FG,DNK_DLG_BG);
 }
 static void joymap_wizard(void){
     g_joyp = 0;                                           /* v146: two-player editor; <-/-> switches player */
+    /* v0.15.181 АРТЕФАКТЫ ПРИ ВЫХОДЕ (жалоба владельца). Визард был единственным диалогом, который
+       восстанавливал фон полной перерисовкой браузера (render_browser). Пока он жил в меню навигатора,
+       это сходило: под ним был браузер. С v174 он вызывается из подменю МАШИНЫ, то есть поверх открытого
+       выпадающего меню - браузер перерисовывался, а меню под окном не восстанавливал никто, оставались
+       обрывки рамки и пунктов. Теперь штатный идиом остальных диалогов: сохранить область (вместе с полем
+       тени) и вернуть её байт-в-байт, что бы под ней ни было - браузер, меню или другой диалог. */
+    joy_bg_save();                                        /* обёртка: box_backup определён ниже в файле */
     joymap_wiz_head();
     { static const char* const kb[4][2]={{"Ent","Assign"},{"Spc","Clear"},{"<>","P1/P2"},{"Esc","Done"}}; dn_keybar(kb,4); }
+    /* v177: подсказка про захват - любая клавиша назначается, ожидание = отмена */
     int cur=0;
     for(int b=0;b<8;b++) joymap_row(b,cur,0);
     for(;;){
         int k=joymap_capture();
         if(k==-1 || k==-2) break;                         /* Esc / F9 = выход (изменения применялись live) */
-        if(k==SC_LEFT || k==SC_RIGHT){ g_joyp ^= 1; joymap_wiz_head(); for(int b=0;b<8;b++) joymap_row(b,cur,0); continue; } /* switch player */
+        if((k==SC_LEFT || k==SC_RIGHT) && joy_players()>1){    /* v174: у ZX один порт Kempston (joy1|joy2 в RTL) */
+            g_joyp ^= 1; joymap_wiz_head(); for(int b=0;b<8;b++) joymap_row(b,cur,0); continue; }
         if(k==SC_UP)   { int o=cur; cur=(cur+7)&7; joymap_row(o,cur,0); joymap_row(cur,cur,0); continue; }
         if(k==SC_DOWN) { int o=cur; cur=(cur+1)&7; joymap_row(o,cur,0); joymap_row(cur,cur,0); continue; }
-        if(k==SC_SPACE){ g_joymap[g_joyp][cur]=0; g_joy_last=0xFFFFFFFFu; joymap_row(cur,cur,0); continue; }
+        if(k==SC_SPACE){ g_joymap[g_joyp][cur]=0; mp_store(opt_defmachine); g_joy_last=0xFFFFFFFFu; joymap_row(cur,cur,0); continue; }
         if(k==SC_ENTER){                                  /* захват клавиши для выбранного бита текущего игрока */
             joymap_row(cur,cur,1);                         /* показать "< press key >" */
-            int c=joymap_capture();
-            if(c>=0 && c!=SC_ESC && c!=SC_ENTER) g_joymap[g_joyp][cur]=(uint8_t)c;  /* Esc/Enter внутри = отмена */
+            int c=joymap_capture_any();                     /* NES: любая; ZX: только цифровой блок */
+            if(c>=0 && opt_defmachine!=4 && !is_numpad((uint32_t)c)) c=-1;
+            if(c>=0){ g_joymap[g_joyp][cur]=(uint8_t)c; mp_store(opt_defmachine); }
             g_joy_last=0xFFFFFFFFu;                         /* форс-обновить JOY_STATE */
             joymap_row(cur,cur,0); continue;
         }
     }
     g_joyp = 0; g_joy_last=0xFFFFFFFFu;
-    render_browser();                                     /* стереть окно, перерисовать базу (как dn_help) */
+    joy_bg_restore();                                     /* v181: вернуть ровно то, что было под окном */
+    dn_keybar_browser();                                  /* v181: и штатную F-строку вместо визардовой */
 }
 static void act_joymap(void){ joymap_wizard(); }
 
@@ -4782,17 +11465,87 @@ static void menubar_draw(int cur){
     draw_topstatus();
 }
 
+/* 🥇 v0.15.305 ОТЛОЖЕННОЕ ПРИМЕНЕНИЕ (см. поле menu_item.defer). Живёт РОВНО ОДНО ожидающее
+   изменение и ровно на том пункте, где стоит курсор: уход со строки или выход из меню возвращают
+   прежнее значение. Иначе неприменённое значение осталось бы в opt_* и уехало бы в ini при
+   «Save config» - меню показывало бы одно, а машина работала бы по другому. */
+static menu_item* g_pend_it  = 0;      /* пункт с неприменённым значением (0 = такого нет) */
+static int        g_pend_old = 0;      /* что стояло до правки - этим и откатываем */
+static int menuitem_pending(const menu_item* vit){
+    return (vit && vit == g_pend_it && vit->val && *vit->val != g_pend_old) ? 1 : 0;
+}
+static void menu_pend_revert(void){    /* отменить неприменённое: значение возвращается владельцу */
+    if(g_pend_it && g_pend_it->val) *g_pend_it->val = g_pend_old;
+    g_pend_it = 0;
+}
+/* Какие пункты слушают стрелки прямо в строке меню: диапазоны (как было с самого начала) и пункты
+   «по Enter» - им стрелки как раз и нужны, чтобы ВЫБИРАТЬ, ничего не применяя. Остальные выборы
+   по-прежнему крутятся только Enter/Space: у них применение мгновенное и безобидное. */
+/* 🥇 v0.15.398 ОДИНАКОВО ВЕЗДЕ (просьба владельца): любой пункт-ВЫБОР слушает стрелки, помечается
+   звёздочкой и применяется Enter - как RAM size. Раньше это включалось у каждого пункта отдельно
+   полем `defer`, и интерфейс вёл себя по-разному в соседних строках одного меню. Правило переехало
+   в движок, чтобы не править семьдесят восемь позиционных инициализаторов и не забыть половину.
+   ДИАПАЗОНЫ остаются живыми намеренно: геометрию, панораму и обрезку крутят ГЛАЗАМИ по картинке,
+   и отложенное применение сделало бы подстройку невозможной. */
+static int menuitem_deferred(const menu_item* vit){
+    return (vit && vit->kind==ITEM_CHOICE && vit->val && vit->nchoices>1) ? 1 : 0;
+}
+static int menuitem_arrows(const menu_item* vit){
+    if(vit->kind==ITEM_RANGE) return 1;
+    return menuitem_deferred(vit);
+}
 static void menuitem_value_cycle(const MenuItem* it, int dir){
     menu_item* vit = it->value;
     if(!vit) return;
     if(vit->kind==ITEM_CHOICE && vit->val && vit->nchoices>0){
+        int dfr = menuitem_deferred(vit);            /* v0.15.398: отложенно применяются ВСЕ выборы */
+        if(dfr && vit != g_pend_it){ menu_pend_revert(); g_pend_it = vit; g_pend_old = *vit->val; }
         int nv=(*vit->val + dir + vit->nchoices*100) % vit->nchoices;
         *vit->val = nv;
+        if(dfr){                                        /* применит Enter, а пока - только показываем */
+            /* Подсказка в строке состояния, пока значение не применено; вернулись к исходному -
+               возвращаем и строку к её обычному содержимому, а не гасим её пустой строкой. */
+            if(menuitem_pending(vit)) dn_status_msg("ENTER = APPLY   ESC = CANCEL");
+            else { g_pend_it = 0; g_status_force = 1; dn_draw_status(); g_status_force = 0; }
+            return;
+        }
         if(vit->onchange) vit->onchange();
     }
     else if(vit->kind==ITEM_RANGE && vit->val){
-        int step = vit->nchoices>0 ? vit->nchoices : 1;   /* explicit per-item step (nchoices reused for RANGE); 1 for pixel-precise tuners. Hold the arrow to repeat. */
+        /* v0.15.183 АДАПТИВНАЯ СКОРОСТЬ (владелец: "если долго держишь клавишу - пусть шаг растёт").
+           Одиночное нажатие = базовый шаг (пиксельная точность), удержание = тайпматик PS/2 идёт
+           плотной серией, и мы её узнаём по интервалу < 250 мс между шагами В ТУ ЖЕ сторону и по
+           ТОМУ ЖЕ пункту. Смена пункта или направления, а также пауза - сброс разгона в 1x, чтобы
+           точная подстройка никогда не превращалась в скачок. */
+        static const void* acc_it = 0; static int acc_dir = 0, acc_n = 0; static XTime acc_t = 0;
+        XTime now; XTime_GetTime(&now);
+        int mult = 1;
+        int base = vit->nchoices>0 ? vit->nchoices : 1;
+        /* v0.15.184 (владелец: "в меню tap/tzx speed какие-то значения вводятся"). Разгон уместен
+           только там, где базовый шаг МЕЛКИЙ и нужно проехать длинный диапазон (положение экрана,
+           пан, тайминги INT). У пунктов с крупным шагом (MP3 HYS = 128, громкость = 5) умножение
+           давало прыжки вида 128*16 = 2048 - и строка показывала «введённое» невесть что.
+           Правило: разгоняем только base <= 8, и итоговый шаг никогда не крупнее 1/8 диапазона. */
+        if(base <= 8 && vit==acc_it && dir==acc_dir && (now-acc_t) < (XTime)(COUNTS_PER_SECOND/4u)){
+            acc_n++;
+            if(acc_n > 24) mult = 16; else if(acc_n > 14) mult = 8;
+            else if(acc_n > 8) mult = 4; else if(acc_n > 4) mult = 2;
+        } else { acc_it = vit; acc_dir = dir; acc_n = 0; }
+        acc_t = now;
+        int step = base * mult;
+        { int cap = (vit->rmax/8) + 1; if(step > cap) step = cap; }
         int nv=*vit->val + dir*step;
+        /* 🥇 B0127 КРУГОВЫЕ ПУНКТЫ. Pan X / Pan Y задают положение бумаги ВНУТРИ РАСТРА, и это
+           величина круговая по своей природе: у Пентагона строка 448 тактов, кадр 320 строк.
+           Владельцу нужен сдвиг ВЛЕВО, то есть «минус», а он выражается дальним концом диапазона
+           (447 = минус пиксель). С обычным зажимом в ноль до него пришлось бы крутить вправо весь
+           диапазон, поэтому здесь эти два пункта заворачиваются. Остальные пункты (громкость,
+           положение окна, обрезка) по-прежнему упираются: у них края - это настоящие пределы,
+           и заворот там был бы сюрпризом, а не удобством. */
+        if(vit->onchange == apply_paper){
+            if(nv < 0)          nv += vit->rmax + 1;
+            if(nv > vit->rmax)  nv -= vit->rmax + 1;
+        }
         if(nv<0) nv=0; if(nv>vit->rmax) nv=vit->rmax;
         *vit->val = nv;
         if(vit->onchange) vit->onchange();
@@ -4807,14 +11560,26 @@ static void menubox_size(Menu* m, int* W, int* H){
         int L=cstrlen(it->name)+6;
         if(it->sub) L+=3;
         else if(it->param) L+=cstrlen(it->param)+2;
+        /* v0.15.411: состояние может стоять ВМЕСТЕ с треугольником подменю и с подписью клавиши,
+           поэтому его ширина ДОБАВЛЯЕТСЯ, а не выбирается вместо них. */
+        if(it->st_txt){ const char* t=it->st_txt(); if(t) L+=cstrlen(t)+2; }
         else if(it->value){                              /* DYNAMIC: size to the ACTUAL value width (no overlap for "PENTAGON 1024K") */
             menu_item* vit=it->value; int vw=4;
             if(vit->kind==ITEM_CHOICE && vit->choices){ vw=0; for(int j=0;j<vit->nchoices;j++){ int q=cstrlen(vit->choices[j]); if(q>vw)vw=q; } }
             else if(vit->kind==ITEM_RANGE){ vw=6; if(vit->unit) vw+=cstrlen(vit->unit); }
+            /* v0.15.334: пометка «сейчас не действует» - часть значения, и ширину бокса она обязана
+               раздвинуть. Иначе значение, которое рисуется СПРАВА НАЛЕВО, поехало бы поверх названия
+               пункта - ровно тот же перелив текста, от которого мы избавляемся в диалогах. */
+            if(vit->vnote){ const char* nt = vit->vnote(); if(nt) vw += cstrlen(nt); }
             L+=vw+2;
         }
         if(L>w) w=L;
     }
+    /* 🥇 v0.15.384 ВЕРХНИЙ ПРЕДЕЛ ШИРИНЫ. Ширина считается по САМОМУ ДЛИННОМУ значению пункта-выбора, а
+       с v384 в списке наборов ПЗУ может стоять полный путь (набор вне 0:/ROMS/). Без предела W уходил
+       за 80 клеток, `left = DN_COLS-2-W` становился ОТРИЦАТЕЛЬНЫМ, и бокс уезжал за канву. Лучше
+       подрезанное значение, чем поехавшая геометрия. */
+    if(w > DN_COLS-4) w = DN_COLS-4;
     *W=w; *H=2+m->count;
 }
 
@@ -4835,17 +11600,34 @@ static void menubox_draw_row(Menu* m, int cur, int left, int top, int W, int row
     dn_fill(left + 1, ry, W - 2, 1, bg);
     put_cstr(left + 2, ry, it->name, fg, bg, DNK_HOTKEY);
     
+    /* v0.15.411 Правый край делится: своё место сначала занимает треугольник подменю или подпись
+       клавиши, состояние встаёт левее. Раньше это была цепочка «или-или», и у пункта с подменю
+       состояние не показывалось бы вовсе - молча. */
+    int rx = left + W - 2;
     if (it->sub) {
         dn_put_glyph(left + W - 3, ry, GLYPH_TRI_R, DNK_STATUS, bg);   /* solid ► triangle: submenu indicator */
+        rx = left + W - 4;
     } else if (it->param) {
         int plen = cstrlen(it->param);
-        put_cstr(left + W - 2 - plen, ry, it->param, fg, bg, DNK_HOTKEY);
-    } else if (it->value) {
+        put_cstr(rx - plen, ry, it->param, fg, bg, DNK_HOTKEY);
+        rx -= plen + 1;
+    }
+    if (it->st_txt) {
+        const char* t = it->st_txt();
+        if (t) { int tl = cstrlen(t); put_cstr(rx - tl, ry, t, is_cur ? fg : DNK_STATUS, bg, DNK_HOTKEY); }
+    }
+    if (!it->sub && !it->param && it->value) {
         menu_item* vit = it->value;
-        char vb[24]; vb[0] = 0;
+        /* v0.15.302: буфер был 24 байта, а имя файла ПЗУ - до 27 символов (ROMSET_NAMEL), и строка
+           слота молча теряла хвост, хотя ширину бокса menubox_size считает по ПОЛНОЙ длине. */
+        char vb[ROMSET_NAMEL+40]; vb[0] = 0;   /* v0.15.334: +место под пометку vnote */
+        int pend = menuitem_pending(vit);      /* v305: выбрано, но ещё НЕ применено */
         if (vit->kind == ITEM_CHOICE && vit->val && vit->choices) {
             const char* vs = vit->choices[(*vit->val) % vit->nchoices];
-            int q = 0; for (; vs[q] && q < 23; q++) vb[q] = vs[q]; vb[q] = 0;
+            int q = 0;
+            if (pend) vb[q++] = '*';           /* пометка: строка показывает НАМЕРЕНИЕ, а не состояние машины */
+            for (int j = 0; vs[j] && q < (int)sizeof(vb)-1; j++) vb[q++] = vs[j];
+            vb[q] = 0;
         } else if (vit->kind == ITEM_RANGE && vit->val) {
             itoa_u(*vit->val, vb);
             int n = slen(vb);
@@ -4854,8 +11636,22 @@ static void menubox_draw_row(Menu* m, int cur, int left, int top, int W, int row
             }
             vb[n] = 0;
         }
+        /* пометка идёт ХВОСТОМ к значению: «AUTO (ON: 8x)», «ON (core ignores)» */
+        if (vit->vnote) {
+            const char* nt = vit->vnote();
+            if (nt) { int q = slen(vb); for (int j = 0; nt[j] && q < (int)sizeof(vb)-1; j++) vb[q++] = nt[j]; vb[q] = 0; }
+        }
         int vlen = slen(vb);
-        dn_puts(left + W - 2 - vlen, ry, vb, is_cur ? DNK_CUR_FG : DNK_HEADER, bg);
+        /* 🥇 v0.15.334 ЗНАЧЕНИЕ НЕ ЛЕЗЕТ НА НАЗВАНИЕ И НЕ ВЫХОДИТ ИЗ БОКСА. Значение выравнивается
+           по правому краю, то есть растёт ВЛЕВО, а клипа у выпадающих меню нет вовсе: прямоугольник
+           отсечения ставит только каркас диалога (dlg_open), и текст, не поместившийся в строку,
+           уезжал бы прямо на панель под меню. Ширину бокса menubox_size считает НА ОТКРЫТИИ, а
+           пометка может появиться позже (владелец переключил TAP/TZX SPEED, не закрывая меню) -
+           значит одной ширины мало, нужен предел по месту. Что не влезло - режем ВИДИМО. */
+        int vmax = W - 5 - cstrlen(it->name);
+        if (vmax < 1) vmax = 1;
+        if (vlen > vmax) dn_putsn_ell(left + W - 2 - vmax, ry, vb, vmax, is_cur ? DNK_CUR_FG : DNK_HEADER, bg);
+        else             dn_puts(left + W - 2 - vlen, ry, vb, is_cur ? DNK_CUR_FG : DNK_HEADER, bg);
     }
 }
 
@@ -4873,16 +11669,41 @@ typedef struct { Menu* menu; int bar, cur, left, top, W, H; } MenuState;
    full 640x400 redraw (the anti-flicker rule). Two levels: bar dropdown + one nested submenu;
    LIFO restore (child first) keeps overlapping boxes consistent. Sized for the tallest submenu
    (Settings: 18 rows) + the DN shadow. ---- */
-#define BOXSAVE_W (48*8)               /* widest overlay (rename dialog 44 + shadow) */
-#define BOXSAVE_H (22*16)              /* tallest overlay (Settings submenu 18 rows + borders) */
+/* v231: ПОТОЛОК УБРАН КАК КЛАСС. История: сначала 48 колонок (под rename 44), потом 64 - и оба
+   раза приходили артефакты, потому что box_backup обрезает область МОЛЧА, без ошибки и
+   предупреждения. Аудит v231 нашёл третий случай: подменю машин выросло до 21 строки (25 с
+   рамкой и тенью) против предела 22, и нижние три строки фона не сохранялись вовсе.
+   Теперь буфер накрывает ВСЮ канву 640x400. Тогда «окно не влезло в буфер» невозможно
+   по построению: больше канвы окно быть не может. Цена - 1 МБ на слот, три слота = 3 МБ в DDR,
+   что здесь ничто, а класс ошибок закрыт навсегда вместо очередного поднятия числа. */
+#define BOXSAVE_W OSDC_W               /* вся ширина канвы */
+#define BOXSAVE_H OSDC_H               /* вся высота канвы */
 typedef struct { int x, y, w, h, valid; uint32_t px[BOXSAVE_W*BOXSAVE_H]; } BoxSave;
-static BoxSave g_bs[2];
+static unsigned g_box_clip = 0;   /* v229: сколько раз фон окна не поместился в буфер (см. box_backup) */
+/* 🥇 v0.15.401 СТЕК ФОНОВ ВМЕСТО РАСПИСАННЫХ СЛОТОВ.
+   Было: три слота по договорённости - [0] выпадашка, [1] подменю, [2] визард. Но те же номера брали
+   себе диалоги: [1] - выбор машины, набор ПЗУ, редактор чувствительности и ВСЕ окна на каркасе
+   (`dlg_open(&d, 1, ...)`); [0] - окна tv_ui, сообщения, прогресс, сортировка. Окно, открытое ПОВЕРХ
+   подменю, затирало сохранённый фон подменю, и восстанавливать после закрытия было нечего.
+   Это стоило ТРЁХ жалоб владельца одного класса: «подменю не стёрлось, осталось артефактом»;
+   «закрываю настройки контроллера - выпадаю из меню» (обходом было ЗАКРЫТЬ меню, см. снятый
+   `g_menu_close`); обрывки настроек от визарда маппинга (лечили выдачей ему отдельного слота - то
+   есть индивидуально для каждого места, ровно то, чего владелец просил не делать).
+   Стало: порядок задаёт ВЛОЖЕННОСТЬ. Кто открылся позже - закрывается раньше; занять чужой фон
+   невозможно, потому что слот больше не выбирает вызывающая сторона.
+   Глубина 6: выпадашка + подменю + окно + вложенный выбор файла + подтверждение + запас. */
+#define BOXST_MAX 6
+static BoxSave g_bst[BOXST_MAX];
+static int      g_bst_n = 0;
+static unsigned g_bst_over = 0, g_bst_under = 0;   /* диагностика несбалансированности стека */
 static void box_backup(BoxSave* b, int cx, int cy, int cw, int chh){   /* region in cells, incl. the shadow margin */
     b->x = cx*8; b->y = cy*16; b->w = cw*8; b->h = chh*16;
     if (b->x < 0) b->x = 0;
     if (b->y < 0) b->y = 0;
-    if (b->w > BOXSAVE_W) b->w = BOXSAVE_W;
-    if (b->h > BOXSAVE_H) b->h = BOXSAVE_H;
+    /* v229: обрезка тут ТИХАЯ и однажды уже стоила артефактов - помечаем её в диагностике,
+       чтобы следующее слишком широкое окно нашлось сразу, а не по жалобе на мусор на экране. */
+    if (b->w > BOXSAVE_W) { b->w = BOXSAVE_W; g_box_clip++; }
+    if (b->h > BOXSAVE_H) { b->h = BOXSAVE_H; g_box_clip++; }
     if (b->x + b->w > OSDC_W) b->w = OSDC_W - b->x;
     if (b->y + b->h > OSDC_H) b->h = OSDC_H - b->y;
     for (int y = 0; y < b->h; y++)
@@ -4895,20 +11716,70 @@ static void box_restore(BoxSave* b){
         for (int x = 0; x < b->w; x++) g_osdc[(b->y+y)*OSDC_W + b->x + x] = b->px[y*b->w + x];
     b->valid = 0;
 }
+/* v0.15.401 Стек - единственный способ открыть окно поверх чего-либо. */
+static int box_push(int cx, int cy, int cw, int ch){   /* 1 = фон сохранён, 0 = нет (стек полон) */
+    if(g_bst_n >= BOXST_MAX){ g_bst_over++; return 0; }   /* глубже некуда: фон не сохранён, но не падаем */
+    box_backup(&g_bst[g_bst_n], cx, cy, cw, ch);
+    g_bst_n++;
+    return 1;
+}
+static void box_pop(void){
+    if(g_bst_n <= 0){ g_bst_under++; return; }
+    box_restore(&g_bst[--g_bst_n]);
+}
+static int  box_depth(void){ return g_bst_n; }
+static unsigned g_bst_leak = 0;    /* сколько уровней пришлось починить самому (см. главный цикл) */
+/* Свернуть стек БЕЗ восстановления - только когда экран всё равно перерисовывается целиком. */
+static void box_drop_to(int d){
+    while(g_bst_n > d){ g_bst_n--; g_bst[g_bst_n].valid = 0; }
+}
+/* Пересохранить фон УЖЕ открытого уровня: список под меню перерисовали (пересортировка, смена
+   машины), и прежний снимок стал ложным. Восстанавливать при этом нельзя - под окном уже новый фон. */
+static void box_recapture(int idx, int cx, int cy, int cw, int ch){
+    if(idx < 0 || idx >= g_bst_n){ g_bst_under++; return; }
+    box_backup(&g_bst[idx], cx, cy, cw, ch);
+}
+/* v0.15.181: обёртки для визарда маппинга - он объявлен ВЫШЕ box_backup/box_restore, а тащить
+   определения вверх значило бы двигать половину канваса. Область берётся с полем тени (+2/+1). */
+static void joy_bg_save(void){    box_push(JW_L, JW_T, JW_W+2, JW_H+1); }
+static void joy_bg_restore(void){ box_pop(); }
 
+static int g_menu_last_bar = 0;    /* v0.15.398: полоса меню, из которой открыли диалог */
+static int g_menu_last_lvl = 0;    /* v0.15.399: и УРОВЕНЬ - 0 полоса, 1 вложенное подменю */
+static int g_menu_redescend = 0;   /* v0.15.399: раскрыв полосу, сразу войти в подменю под курсором */
 static int menubar_exec(int start); /* fwd */
 
 /* Reusable modal-window frame (TWindow/TFrame-style): translucent shadow, opaque gray body, white
    double frame, centred title in the top border. Every DN dialog draws its chrome through this. */
+/* 🥇 v0.15.399 СКОЛЬКО МОДАЛЬНЫХ ОКОН ПОКАЗАНО. Нужен, чтобы меню возвращалось после ЛЮБОГО окна,
+   а не после перечисленных команд (см. run_menu_system). Точка одна на весь интерфейс: и окна
+   загрузчика, и окна tv_ui рисуются здесь же - tv_ui.c включён в этот файл. Счётчик, а не флаг:
+   флаг пришлось бы сбрасывать, и один забытый сброс тихо ломал бы возврат. */
+static unsigned g_modal_seq = 0;
 static void dn_win_draw(int left,int top,int W,int H,const char* title){
+    g_modal_seq++;
     dn_shadow(left,top,W,H);
     dn_fill(left,top,W,H,DNK_DLG_BG);                          /* opaque body (dn_box paints only the border) */
     dn_box(left,top,W,H,DNK_DLG_FRAME,DNK_DLG_BG,1);           /* white double frame = active window */
-    int tl=slen(title), tx=left+(W-tl-2)/2;                    /* title colour == frame (DN active: 0x7F) */
+    /* 🥇 ЗАГОЛОВОК НЕ ЛОМАЕТ РАМКУ. Раньше длина заголовка ничем не ограничивалась: при tl > W-2
+       позиция tx уходила ЛЕВЕЕ окна и заголовок съедал обе вертикали рамки, а печать шла до края
+       экрана. Теперь длинный заголовок обрезается ВИДИМО, многоточием, и центрируется уже по
+       обрезанной длине - tx гарантированно не левее left+1. */
+    char tbuf[84]; int tl=slen(title);
+    const int tmax = (W >= 8) ? (W - 4) : 4;
+    if(tl > tmax){
+        int i=0; for(; i < tmax-3 && title[i]; i++) tbuf[i]=title[i];
+        tbuf[i++]='.'; tbuf[i++]='.'; tbuf[i++]='.'; tbuf[i]=0;
+        title = tbuf; tl = tmax; g_txt_clip++;
+    }
+    int tx=left+(W-tl-2)/2; if(tx < left+1) tx = left+1;
     dn_putc(tx,top,' ',DNK_DLG_FRAME,DNK_DLG_BG);
     dn_puts(tx+1,top,title,DNK_DLG_FRAME,DNK_DLG_BG);
     dn_putc(tx+1+tl,top,' ',DNK_DLG_FRAME,DNK_DLG_BG);
 }
+
+#include "tv_ui.c"
+
 
 /* ================= modal DN dialog: text input with OK / Cancel =================================
    Buttons live HERE (in modal dialogs), never in menus - per the owner's design. Returns 1=OK (out
@@ -4933,47 +11804,148 @@ static void rn_draw_buttons(int left,int brow,int focus){
     dn_button(bx,               brow, "OK",     focus!=2, bw);   /* OK = default: marked unless Cancel is focused */
     dn_button(bx + bw+1 + gap,  brow, "Cancel", focus==2, bw);
 }
-static int dn_input_dialog(const char* title,const char* prompt,char* buf,int maxlen){
-    int left=(DN_COLS-DLG_W)/2, top=(DN_ROWS-DLG_H)/2;
-    int fx=left+3, fy=top+4, brow=top+6;
-    int len=slen(buf), cur=len, foff=0, focus=0, result=-1;
-    box_backup(&g_bs[0], left, top, DLG_W+2, DLG_H+1);   /* save the backdrop -> restore on close, no full redraw */
-    dn_win_draw(left,top,DLG_W,DLG_H,title);
-    dn_puts(left+3,top+2,prompt,DNK_DLG_FG,DNK_DLG_BG);
-    { static const char* const kb[3][2]={{"Enter","OK"},{"Tab","Next"},{"Esc","Cancel"}}; dn_keybar(kb,3); }  /* dialog's active keys on the bottom status line */
-    while(result<0){
-        if(cur<foff) foff=cur;
-        if(cur>=foff+DLG_FW) foff=cur-DLG_FW+1;
-        if(foff<0) foff=0;
-        rn_draw_field(fx,fy,buf,len,cur,foff,focus==0);
-        rn_draw_buttons(left,brow,focus);
-        int k=get_keysym_blocking();
-        if(k==K_ESC){ result=0; break; }
-        if(k==K_TAB){ focus=(focus+1)%3; continue; }
-        if(k==K_ENTER){ result=(focus==2)?0:1; break; }        /* Enter = OK (default), unless on Cancel */
-        if(focus==0){                                          /* editing the field */
-            if(k==K_LEFT){ if(cur>0) cur--; continue; }
-            if(k==K_RIGHT){ if(cur<len) cur++; continue; }
-            if(k==K_HOME){ cur=0; continue; }
-            if(k==K_END){ cur=len; continue; }
-            if(k==K_DOWN){ focus=1; continue; }
-            if(k==K_BACK){ if(cur>0){ for(int i=cur-1;i<len;i++) buf[i]=buf[i+1]; len--; cur--; } continue; }
-            if(k>=0x20 && k<0x7F && len<maxlen-1){             /* printable: insert at cursor */
-                for(int i=len;i>=cur;i--) buf[i+1]=buf[i];
-                buf[cur]=(char)k; len++; cur++; }
-        } else {                                               /* on a button */
-            if(k==K_UP)    { focus=0; continue; }
-            if(k==K_LEFT)  { focus=1; continue; }
-            if(k==K_RIGHT) { focus=2; continue; }
-            if(k==K_SPACE) { result=(focus==2)?0:1; break; }
-        }
-    }
-    box_restore(&g_bs[0]);       /* restore the backdrop under the dialog */
-    dn_keybar_browser();         /* restore the browser's status line (row 24 is outside the saved box) */
-    return result==1;
+/*=================================================================================================
+  v0.15.232 КАРКАС МОДАЛЬНОГО ОКНА.
+
+  Зачем. Виджеты у нас были (dn_win_draw / dn_box / dn_shadow / dn_button / dn_radio / dn_check /
+  dn_bar), а слоя ОКНА не было: центрирование, сохранение и возврат фона, подмена строки подсказок,
+  ряд кнопок и обход фокуса были переписаны в 18 местах. Следствия видны на практике: инварианты
+  расходились между окнами, а проверки вместимости фона не делал никто - именно так появились
+  артефакты после закрытия окна просмотра образа и подменю машин (см. v229 и v231).
+
+  Что каркас берёт на себя (то есть чего больше нельзя забыть):
+    - центрирование по канве;
+    - ПРОВЕРКУ ВМЕСТИМОСТИ фона: с v231 буфер накрывает всю канву, поэтому не влезть окно может
+      только если оно больше экрана - такое окно каркас честно уменьшает и считает в g_dlg_clip,
+      а не портит экран молча;
+    - сохранение фона в свой слот BoxSave и его возврат при закрытии;
+    - рамку с заголовком и строку подсказок, включая ВОЗВРАТ строки навигатора при закрытии;
+    - единую геометрию ряда кнопок и обход фокуса по Tab / Shift+Tab.
+
+  Чего каркас НЕ делает намеренно: не описывает содержимое окна. Декларативную форму (таблица
+  элементов, как TDialog с потомками) вводим ПОСЛЕ того, как все окна сядут на этот каркас - иначе
+  переписывать пришлось бы дважды.
+=================================================================================================*/
+typedef struct {
+    int left, top, W, H;      /* геометрия в клетках, без тени */
+    int brow;                 /* строка ряда кнопок */
+    int slot;                 /* занятый слот BoxSave */
+    int focus, nfoc;          /* обход фокуса */
+} Dlg;
+static unsigned g_dlg_clip = 0;   /* сколько раз окно не поместилось на канву (диагностика) */
+
+static int dlg_open(Dlg* d, int slot, int W, int H, const char* title){
+    if(slot < 0 || slot > 2) slot = 1;
+    /* окно не может быть больше канвы: рамка+тень должны уместиться вместе с ним */
+    if(W + 2 > DN_COLS){ W = DN_COLS - 2; g_dlg_clip++; }
+    if(H + 1 > DN_ROWS){ H = DN_ROWS - 1; g_dlg_clip++; }
+    (void)slot;                  /* v0.15.401: слот не выбирают - фон живёт в стеке */
+    d->slot = 0; d->W = W; d->H = H;   /* slot переиспользован как признак «фон сохранён» */
+    d->left = (DN_COLS - W) / 2; if(d->left < 0) d->left = 0;
+    d->top  = (DN_ROWS - H) / 2; if(d->top  < 0) d->top  = 0;
+    d->brow = d->top + H - 3;
+    d->focus = 0; d->nfoc = 1;
+    d->slot = box_push(d->left, d->top, W + 2, H + 1);   /* v0.15.401: помним, сохранился ли фон */
+    /* Хром (тень, рамка, заголовок) законно рисуется ПО границе окна и за ней - на время рисования
+       клип полный. Дальше ставим клип ИНТЕРЬЕРА: рамка занимает клетки left и left+W-1, значит
+       содержимому остаются столбцы left+1..left+W-2 и строки top+1..top+H-2. */
+    clip_push_full();
+    dn_win_draw(d->left, d->top, W, H, title);
+    clip_pop();
+    clip_push(d->left + 1, d->top + 1, d->left + W - 2, d->top + H - 2);
+    return 1;
+}
+static void dlg_close(Dlg* d){
+    clip_pop();                          /* снять клип ДО восстановления фона */
+    if(d->slot) box_pop();               /* v0.15.401: не снимать чужой фон, если своего не было */
+    dn_keybar_browser();                 /* строку подсказок возвращает КАРКАС, а не каждое окно */
+}
+/* Ряд кнопок единой геометрии. Возвращает индекс кнопки под фокусом (для удобства вызывающего). */
+/*=================================================================================================
+  🥇 v0.15.346 ШИРИНА КНОПКИ - ПО САМОЙ ДЛИННОЙ ПОДПИСИ, а не константой.
+
+  Жалоба владельца 14.08: «почему кнопки у тебя слипшиеся оказались, я же просил фреймворк
+  интерфейса делать единообразным и правильным всегда». Он прав, и дефект был именно каркасный:
+  ширина кнопки стояла числом 10, а подпись «Restart card» это 12 знаков - она вылезала в соседнюю
+  кнопку, и две кнопки читались как одна. То есть повторилась ровно та болезнь, от которой ниже
+  лечили ШИРИНУ ОКНА (v334): размер назначался на глаз вместо расчёта по содержимому.
+
+  Правило теперь одно на обе величины: считаем по содержимому, а на глаз - только НИЖНЮЮ границу,
+  чтобы там, где всё и так влезало, вид не изменился ни на клетку. Если ряд не помещается в окно,
+  ужимаем сначала промежуток, потом внутренние поля - но подписи НЕ РЕЖЕМ: обрезанная подпись
+  кнопки бесполезна ровно так же, как обрезанное имя файла.
+=================================================================================================*/
+static void dlg_buttons(Dlg* d, const char* const* labels, int n, int focus_btn){
+    if(n <= 0) return;
+    int lmax = 0, i;
+    for(i = 0; i < n; i++){ int q = labels[i] ? slen(labels[i]) : 0; if(q > lmax) lmax = q; }
+    int bwmin = (n >= 3) ? 9 : 10;             /* прежние числа - теперь ТОЛЬКО как нижняя граница */
+    int bw = lmax + 2; if(bw < bwmin) bw = bwmin;
+    int gap = (n >= 3) ? 2 : 4;
+    int room = d->W - 2;
+    while(n * (bw + 1) + (n - 1) * gap > room && gap > 1) gap--;
+    while(n * (bw + 1) + (n - 1) * gap > room && bw > lmax + 1) bw--;
+    int total = n * (bw + 1) + (n - 1) * gap;
+    int bx = d->left + (d->W - total) / 2; if(bx < d->left + 1) bx = d->left + 1;
+    dn_fill(d->left + 1, d->brow, d->W - 2, 2, DNK_DLG_BG);
+    for(i = 0; i < n; i++)
+        dn_button(bx + i * ((bw + 1) + gap), d->brow, labels[i], i == focus_btn, bw);
+}
+/* Обход фокуса. Возвращает 1, если клавиша обработана каркасом. */
+static int dlg_nav(Dlg* d, int key){
+    if(key == K_TAB){ d->focus = (d->focus + (g_kb_shift ? d->nfoc - 1 : 1)) % d->nfoc; return 1; }
+    return 0;
+}
+/*=================================================================================================
+  🥇 v0.15.334 ШИРИНА ОКНА СЧИТАЕТСЯ ПО СОДЕРЖИМОМУ, А НЕ НАЗНАЧАЕТСЯ НА ГЛАЗ.
+
+  Жалоба владельца 12.08: «надпись вылазит за пределы окна диалога, сделай, чтобы этого никогда не
+  происходило, ни в каком диалоговом окне; длинные имена окон не ломают, а либо их растягивают по
+  ширине (до каких-то лимитов), либо мы просто скроллим».
+
+  Стек отсечения (см. dn_putc) закрыл первую половину: за рамку окна текст больше не выходит
+  физически. Но отсечение само по себе - это ОТРЕЗАНИЕ, а отрезанное имя файла владельцу бесполезно.
+  Вторая половина - вот эта: окно РАСТЯГИВАЕТСЯ под своё содержимое, и только то, что не влезло и в
+  предел, режется ВИДИМО (dn_putsn_ell). Молчаливой обрезки не остаётся нигде: она уже дважды
+  рождала ложные диагнозы («файла нет» на обрезанном имени, «не тот образ» на обрезанном пути).
+
+  col - столбец, с которого печатается содержимое (у окон с двумя колонками значения идут не с
+  left+3, а правее). Справа оставляем два поля, чтобы текст не лип к рамке; DLG_FIT_MAXC даёт ровно
+  то число клеток, под которое считалась ширина, - его же и надо передавать в dn_putsn_ell, иначе
+  расчёт и печать разъедутся.
+  Фон под окном сохраняет сам каркас (dlg_open делает box_backup уже по ПОСЧИТАННОЙ ширине), а буфер
+  BoxSave накрывает всю канву - поэтому растянутое окно не оставляет мусора на панели (v231).
+=================================================================================================*/
+static int dlg_fit_width_col(const char* const* lines, int n, int col, int minw, int maxw){
+    int lim = DN_COLS - 4;                     /* окно + тень обязаны остаться на канве */
+    if(maxw <= 0 || maxw > lim) maxw = lim;
+    if(minw < 12) minw = 12;
+    if(minw > maxw) minw = maxw;
+    int L = 0;
+    for(int i = 0; i < n; i++){ if(!lines[i]) continue; int q = slen(lines[i]); if(q > L) L = q; }
+    int w = col + L + 3;                       /* содержимое col..col+L-1, дальше два поля и рамка */
+    if(w < minw) w = minw;
+    if(w > maxw) w = maxw;
+    return w;
+}
+static int dlg_fit_width(const char* const* lines, int n, int minw, int maxw){
+    return dlg_fit_width_col(lines, n, 3, minw, maxw);     /* обычное окно: содержимое с left+3 */
+}
+#define DLG_FIT_MAXC(W,col) ((W) - (col) - 3)  /* сколько клеток есть у содержимого с колонки col */
+static int dn_input_dialog(const char* title, const char* prompt, char* buf, int maxlen){
+    g_keys_text = 1;
+    TV_Dialog d;
+    tv_dialog_init(&d, title, 50, 9);
+    tv_dialog_add_label(&d, 3, 2, prompt, DNK_DLG_FG);
+    tv_dialog_add_input(&d, 3, 4, 42, buf, maxlen);
+    tv_dialog_add_button(&d, "  OK  ", TV_RES_OK);
+    tv_dialog_add_button(&d, "Cancel", TV_RES_CANCEL);
+    int res = tv_dialog_exec(&d);
+    g_keys_text = 0;
+    return (res == TV_RES_OK);
 }
 /* ---- MP3 sens editor: a numeric-entry dialog with an inline explanation (issue: 0..4096 is far too
-   wide to click through). Opened from the Tape menu's "MP3 sens" row (Enter/Space). Uses g_bs[1] -
+   wide to click through). Opened from the Tape menu's "MP3 sens" row (Enter/Space). Фон - в стеке (v0.15.401) -
    free while a bar dropdown is open (this item lives at level 0, no submenu). Digits only. ---- */
 static void mp3_sens_dialog(void){
     const int W=DLG_W, H=13;                                  /* DLG_W wide -> reuse rn_draw_field / rn_draw_buttons verbatim */
@@ -4981,7 +11953,7 @@ static void mp3_sens_dialog(void){
     int fx=left+3, fy=top+8, brow=top+10;
     char buf[8]; itoa_u(tune_hys_mp3, buf);
     int len=slen(buf), cur=len, foff=0, focus=0, result=-1;
-    box_backup(&g_bs[1], left, top, W+2, H+1);
+    box_push(left, top, W+2, H+1);
     dn_win_draw(left,top,W,H,"MP3 tape sensitivity");
     dn_puts(left+3,top+2,"Pilot edge-detect threshold for",DNK_DLG_FG,DNK_DLG_BG);
     dn_puts(left+3,top+3,"reading MP3/WAV tape recordings.",DNK_DLG_FG,DNK_DLG_BG);
@@ -5021,12 +11993,730 @@ static void mp3_sens_dialog(void){
         if(v2<0) v2=0; if(v2>4096) v2=4096;
         tune_hys_mp3=v2;
     }
-    box_restore(&g_bs[1]);
+    box_pop();
     dn_keybar_browser();
 }
 /* Modal MACHINE picker - canonical DN style (radio group + green [OK]/[Cancel] buttons, Tab focus
    ring, cyan default/focus, Space=set/activate, Enter=OK). Selecting a new machine calls
    apply_machine() -> loads that machine's param set + cold-reboots into it. */
+/* v0.15.221 ВЫБОР ПРИВОДА при вставке образа (владелец: «надо модальное окно, чтобы букву
+   выбирать, и внизу выводить, какой образ на какой букве»). В каждой строке сразу видно, что уже
+   вставлено - иначе выбирать букву пришлось бы по памяти. Предвыбор берётся из опции MOUNT TO DRIVE,
+   так что привычный путь «выставил букву в меню и монтируешь» продолжает работать.
+   Возвращает номер привода 0..3 либо -1, если владелец отменил. */
+static int drive_select_dialog(const char* img){
+    enum { FOC_RADIO=0, FOC_WR, FOC_INSERT, FOC_EJECT, FOC_CLOSE, NFOC };   /* v410: +запись */
+    const int manage = (img == 0);           /* v224: режим управления - только смотреть и извлекать */
+    /* v0.15.334: строку-заголовок собираем ДО открытия окна - по ней и считается ширина. Буфер
+       берётся под ПОЛНОЕ имя (NAMELEN = 96): резать его здесь нечем и незачем, за обрезку отвечает
+       ровно одно место - печать через dn_putsn_ell, и она видимая. */
+    char hdr[NAMELEN + 16];
+    {   int k = 0;
+        if(manage){ for(const char* q="E ejects safely: waits for the drive."; *q; q++) hdr[k++]=*q; }
+        else { for(const char* q="Image: "; *q; q++) hdr[k++]=*q;
+               for(const char* q=img; *q && k < (int)sizeof(hdr)-1; q++) hdr[k++]=*q; }
+        hdr[k]=0; }
+    const char* fit[1] = { hdr };
+    /* v0.15.410: +1 строка под галочку разрешения записи. Строка сообщений под списком уже была
+       занята, а рисовать галочку поверх сообщения значит потерять то или другое. */
+    Dlg dg; dlg_open(&dg, 1, dlg_fit_width(fit, 1, 46, 72), NDRV+9,
+                     manage ? "Disk drives" : "Insert disk into drive");
+    const int W = dg.W; const int left = dg.left, top = dg.top, brow = dg.brow;
+    int wtop = top + 4;
+    /* v247: предлагаем СВОБОДНЫЙ привод, а не прошлую букву. TR-DOS всегда начинает с A, и образ,
+       примонтированный в B «по памяти диалога», выглядит как полный отказ записи: контроллер
+       честно отвечает «диска нет», TR-DOS крутит Seek, машина срывается. */
+    int rcur;
+    if(!g_dopen[0])                       rcur = 0;              /* A свободен - предлагаем A */
+    else {
+        rcur = (opt_drvsel>=0 && opt_drvsel<NDRV) ? opt_drvsel : 0;
+        if(g_dopen[rcur]){                                       /* прошлый занят - первый свободный */
+            for(int _i=0;_i<NDRV;_i++) if(!g_dopen[_i]){ rcur = _i; break; }
+        }
+    }
+    int rmode=rcur, focus=manage?FOC_EJECT:FOC_RADIO, result=-1;
+    const char* note = 0;
+    {   /* 🥇 ЖАЛОБА ВЛАДЕЛЬЦА 12.08: имя образа вылезало за правую рамку. Арифметика была такая:
+           окно W=46, left=17, интерьер 18..61, печать с колонки left+3=20 - до рамки ровно W-4 = 42
+           клетки, а строка собиралась до 48 символов. Любое имя длиннее 35 знаков переезжало рамку,
+           а хвост за пределами сохранённого фона оставался мусором на панели после закрытия.
+           v0.15.334: окно теперь РАСТЯГИВАЕТСЯ под имя (до 72 клеток), и только сверхдлинное имя
+           режется - видимо, многоточием. Молчаливой обрезки на 48 символах больше нет. */
+        dn_putsn_ell(left+3,top+2,hdr,DLG_FIT_MAXC(W,3),DNK_DLG_FG,DNK_DLG_BG); }
+    { static const char* const kb[5][2]={{"Tab","Next"},{"Space","Set"},{"W","Write"},{"E","Eject"},{"Esc","Close"}}; dn_keybar(kb,5); }
+    while(result<0){
+        for(int d=0; d<NDRV; d++){
+            char row[40]; int k=0;
+            row[k++]=DRV_LTR[d]; row[k++]=':'; row[k++]=' '; row[k++]=' ';
+            if(g_dopen[d] && g_dnm[d][0]){
+                for(int i=0; g_dnm[d][i] && k<30; i++) row[k++]=g_dnm[d][i];
+                if(g_dscl[d] && k<36){ row[k++]=' '; row[k++]='S'; row[k++]='C'; row[k++]='L'; }
+            } else {
+                for(const char* q="(empty)"; *q && k<38; q++) row[k++]=*q;
+            }
+            /* v257: добить строку пробелами до ширины поля. Без этого «(empty)» после извлечения
+               ложится ПОВЕРХ прежнего имени и оставляет хвост: отрисовка частичная, а новый текст
+               короче старого. Дополняем здесь же - лишней перерисовки и мерцания не будет. */
+            while(k < 34) row[k++] = ' ';
+            row[k]=0;
+            dn_radio(left+4, wtop+d, row, d==rmode, focus==FOC_RADIO && d==rcur, 0);
+        }
+        /* v0.15.410 РАЗРЕШЕНИЕ ЗАПИСИ - настройка ЭТОГО контроллера, поэтому живёт здесь, а не
+           отдельной строкой в меню (решение владельца). Действует сразу: disk_wp_refresh() отдаёт
+           бит защиты записи контроллеру дисковода. */
+        dn_check(left+4, wtop+NDRV, "Allow writes to mounted images", opt_diskwr, focus==FOC_WR, 0);
+        {   /* строка сообщения под списком: результат извлечения */
+            char m[40]; int k=0;
+            for(const char* q = note ? note : "                              "; *q && k<38; q++) m[k++]=*q;
+            m[k]=0; dn_puts(left+4, wtop+NDRV+1, m, DNK_DLG_FG, DNK_DLG_BG); }
+        { int bw=9, gap=2, total=3*(bw+1)+2*gap, bx=left+(W-total)/2; dn_fill(left+1,brow,W-2,2,DNK_DLG_BG);
+          if(!manage) dn_button(bx, brow, "Insert", focus==FOC_INSERT, bw);
+          dn_button(bx+(bw+1)+gap, brow, "Eject", focus==FOC_EJECT, bw);
+          dn_button(bx+2*((bw+1)+gap), brow, "Close", focus==FOC_CLOSE, bw); }
+        int k=get_keysym_blocking();
+        if(k==K_ESC){ result=0; break; }
+        if(k==K_TAB){ focus=(focus+(g_kb_shift?NFOC-1:1))%NFOC;
+                      if(manage && focus==FOC_INSERT) focus=FOC_EJECT; continue; }
+        if(k=='w'||k=='W'){ opt_diskwr = !opt_diskwr; disk_wp_refresh(); continue; }   /* v410 */
+        if(k=='a'||k=='A'){ rcur=0; rmode=0; continue; }
+        if(k=='b'||k=='B'){ rcur=1; rmode=1; continue; }
+        if(k=='c'||k=='C'){ rcur=2; rmode=2; continue; }
+        if(k=='d'||k=='D'){ rcur=3; rmode=3; continue; }
+        /* v224: извлечение - F8 или кнопка Eject. Окно не закрываем, список тут же обновится. */
+        if(k=='e' || k=='E' || (focus==FOC_EJECT && (k==K_SPACE || k==K_ENTER))){
+            if(!g_dopen[rcur])      note = "drive is already empty        ";
+            else if(disk_eject_safe(rcur)) note = "BUSY - not ejected           ";
+            else                    note = "ejected, written back to card";
+            continue;
+        }
+        if(k==K_ENTER){
+            if(manage){ result=0; break; }
+            if(focus==FOC_RADIO) rmode=rcur;
+            result=(focus==FOC_CLOSE)?0:1; break;
+        }
+        switch(focus){
+        case FOC_RADIO:
+            if(k==K_UP){ if(rcur>0) rcur--; }
+            else if(k==K_DOWN){ if(rcur<NDRV-1) rcur++; else focus=FOC_WR; }
+            else if(k==K_SPACE){ rmode=rcur; }
+            break;
+        case FOC_WR:                                  /* v410: пробел переключает, стрелки уводят */
+            if(k==K_SPACE){ opt_diskwr = !opt_diskwr; disk_wp_refresh(); }
+            else if(k==K_UP){ focus=FOC_RADIO; }
+            else if(k==K_DOWN){ focus=manage?FOC_EJECT:FOC_INSERT; }
+            break;
+        case FOC_INSERT:
+            if(k==K_SPACE){ result=1; }
+            else if(k==K_RIGHT){ focus=FOC_EJECT; }
+            else if(k==K_UP){ focus=FOC_RADIO; }
+            break;
+        case FOC_EJECT:
+            if(k==K_RIGHT){ focus=FOC_CLOSE; }
+            else if(k==K_LEFT && !manage){ focus=FOC_INSERT; }
+            else if(k==K_UP){ focus=FOC_RADIO; }
+            break;
+        case FOC_CLOSE:
+            if(k==K_SPACE){ result=0; }
+            else if(k==K_LEFT){ focus=FOC_EJECT; }
+            else if(k==K_UP){ focus=FOC_RADIO; }
+            break;
+        }
+    }
+    dlg_close(&dg);
+    if(manage || result!=1) return -1;
+    opt_drvsel = rmode;                 /* выбранная буква становится предвыбором на следующий раз */
+    return rmode;
+}
+/* v0.15.227 ИНФОРМАЦИЯ О КАРТЕ. В настоящем DOS Navigator это была информационная панель по диску:
+   том, файловая система, всего/занято/свободно. Делаем то же, с двумя честными адаптациями:
+     - метки тома НЕТ: в BSP стоит FF_USE_LABEL=0, то есть f_getlabel не собран вовсе, и лезть в BSP
+       ради одной надписи не стоит;
+     - числа разделяем пробелами по три разряда, как в DN, но считаем 64-битно: карта давно больше 4 ГБ,
+       а в 32 бита такой размер не влезает (классический промах при переносе старой логики).
+   f_getfree на FAT32 при первом вызове может пройти по таблице (секунда на большой карте), поэтому
+   окно рисуется СНАЧАЛА и пишет «reading FAT...», иначе выглядело бы как зависание. */
+static void fmt_u64_sp(uint64_t v, char* out){          /* 12345678 -> "12 345 678" */
+    char d[24]; int n = 0;
+    if(!v) d[n++] = '0';
+    while(v){ d[n++] = (char)('0' + (int)(v % 10u)); v /= 10u; }
+    int k = 0;
+    for(int i = n - 1; i >= 0; i--){
+        out[k++] = d[i];
+        if(i && (i % 3) == 0) out[k++] = ' ';
+    }
+    out[k] = 0;
+}
+static void sd_info_dialog(void){
+    Dlg d; dlg_open(&d, 1, 52, 15, "SD card");        /* v232: геометрия и фон - на каркасе */
+    const int W = d.W; const int left = d.left, top = d.top, brow = d.brow;
+    int y = top + 2;
+    { static const char* const kb[2][2] = {{"Enter","OK"},{"Esc","Close"}}; dn_keybar(kb, 2); }
+    if(!sd_mounted){
+        dn_puts(left + 3, y, "NO CARD / NOT FAT", DNK_HOTKEY, DNK_DLG_BG);
+    } else {
+        dn_puts(left + 3, y, "reading FAT...", DNK_DLG_FG, DNK_DLG_BG);
+        FATFS* fsp = 0; DWORD frecl = 0;
+        int ok = (f_getfree("0:", &frecl, &fsp) == FR_OK) && fsp;
+        dn_fill(left + 1, y, W - 2, 1, DNK_DLG_BG);
+        if(!ok){
+            dn_puts(left + 3, y, "cannot read the card", DNK_HOTKEY, DNK_DLG_BG);
+        } else {
+            uint32_t clb   = (uint32_t)fsp->csize * 512u;
+            uint64_t total = (uint64_t)(fsp->n_fatent - 2u) * clb;
+            uint64_t freeb = (uint64_t)frecl * clb;
+            uint64_t used  = (total > freeb) ? (total - freeb) : 0u;
+            unsigned pct   = total ? (unsigned)((used * 100u) / total) : 0u;
+            const char* fst = (fsp->fs_type == 1) ? "FAT12" : (fsp->fs_type == 2) ? "FAT16"
+                            : (fsp->fs_type == 3) ? "FAT32" : (fsp->fs_type == 4) ? "exFAT" : "?";
+            char b[32];
+            dn_puts(left + 3,  y, "File system", DNK_DLG_FG, DNK_DLG_BG);
+            dn_puts(left + 18, y, fst, DNK_HEADER, DNK_DLG_BG); y++;
+            dn_puts(left + 3,  y, "Cluster", DNK_DLG_FG, DNK_DLG_BG);
+            fmt_u64_sp(clb, b); dn_puts(left + 18, y, b, DNK_HEADER, DNK_DLG_BG);
+            dn_puts(left + 18 + slen(b) + 1, y, "bytes", DNK_DLG_FG, DNK_DLG_BG); y += 2;
+            dn_puts(left + 3,  y, "Total", DNK_DLG_FG, DNK_DLG_BG);
+            fmt_u64_sp(total, b); dn_puts(left + 18, y, b, DNK_STATUS, DNK_DLG_BG); y++;
+            dn_puts(left + 3,  y, "Used",  DNK_DLG_FG, DNK_DLG_BG);
+            fmt_u64_sp(used, b);  dn_puts(left + 18, y, b, DNK_STATUS, DNK_DLG_BG);
+            { char p[14]; p[0] = '('; itoa_u(pct, p + 1); int k = slen(p); p[k++] = '%'; p[k++] = ')'; p[k] = 0;
+              dn_puts(left + 38, y, p, DNK_HEADER, DNK_DLG_BG); } y++;
+            dn_puts(left + 3,  y, "Free",  DNK_DLG_FG, DNK_DLG_BG);
+            fmt_u64_sp(freeb, b); dn_puts(left + 18, y, b, DNK_DIR, DNK_DLG_BG); y += 2;
+            dn_bar(left + 3, y, W - 6, pct * 10u, DNK_STATUS, DNK_DLG_BG); y += 2;
+            { int dirs = 0; for(int i = 0; i < fcount; i++) if(fisdir[i]) dirs++;
+              char s[48]; int k;
+              dn_puts(left + 3, y, "This folder", DNK_DLG_FG, DNK_DLG_BG);
+              itoa_u((unsigned)(fcount - dirs), s); k = slen(s);
+              s[k++] = ' '; for(const char* q = "files,"; *q; q++) s[k++] = *q;
+              s[k++] = ' '; itoa_u((unsigned)dirs, s + k); k = slen(s);
+              s[k++] = ' '; for(const char* q = "dirs"; *q; q++) s[k++] = *q; s[k] = 0;
+              dn_puts(left + 18, y, s, DNK_HEADER, DNK_DLG_BG); }
+        }
+    }
+    { static const char* const b[1] = {"OK"}; dlg_buttons(&d, b, 1, 0); }
+    while(1){
+        int k = get_keysym_blocking();
+        if(k == K_ESC || k == K_ENTER || k == K_SPACE) break;
+    }
+    dlg_close(&d);
+}
+/* v0.15.292 ИНФОРМАЦИЯ О ВИНЧЕСТЕРЕ. Владелец: показать, какой образ примонтирован и его размер.
+   Размер даём В СЕКТОРАХ - ими оперируют и IDENTIFY, и драйвер, и наш ide_geom; мегабайты рядом
+   только для человека. Здесь же извлечение: действие то же, что у выключателя NEMO-IDE, но стоит
+   рядом с именем образа, где его и ищут. Про slave пишем прямо: NONE, а не пустое место - иначе
+   окно выглядело бы как «второй диск есть, просто без имени». */
+static void ide_info_dialog(void){
+    enum { FOC_EJECT = 0, FOC_CLOSE, NFOC };
+    /* v0.15.334: ширина по самым длинным ПЕРЕМЕННЫМ строкам окна - имени образа и пути к нему (путь
+       в профиле машины хранится до 95 символов). Раньше окно было ровно 54 клетки, а путь копировался
+       в буфер с обрезкой на 33 символах МОЛЧА: владелец видел укороченный путь и не мог понять, тот
+       ли это файл. Ширина берётся ОДИН РАЗ, на открытии; вставить или извлечь образ можно и не
+       закрывая окно, поэтому печать всё равно идёт через dn_putsn_ell - окно по ходу дела не растёт,
+       а врать не начинает. */
+    const char* fit[2] = { g_ide_open ? g_ide_name : "(no image)", ide_img_path() };
+    Dlg d; dlg_open(&d, 1, dlg_fit_width_col(fit, 2, 18, 54, 72), 13, "Hard disk (NEMO-IDE)");
+    const int W = d.W; const int left = d.left, top = d.top;
+    int focus = FOC_CLOSE, done = 0;
+    { static const char* const kb[3][2] = {{"Enter","OK"},{"E","Eject"},{"Esc","Close"}}; dn_keybar(kb, 3); }
+    while(!done){
+        int y = top + 2;
+        dn_fill(left + 1, top + 1, W - 2, 9, DNK_DLG_BG);
+        dn_puts(left + 3, y, "Interface", DNK_DLG_FG, DNK_DLG_BG);
+        dn_puts(left + 18, y, opt_ide ? "ON" : "OFF", opt_ide ? DNK_DIR : DNK_HOTKEY, DNK_DLG_BG); y++;
+        dn_puts(left + 3, y, "Master", DNK_DLG_FG, DNK_DLG_BG);
+        dn_putsn_ell(left + 18, y, g_ide_open ? g_ide_name : "(no image)", DLG_FIT_MAXC(W, 18),
+                g_ide_open ? DNK_HEADER : DNK_HOTKEY, DNK_DLG_BG); y++;
+        {   /* v0.15.334: путь печатается ЦЕЛИКОМ (окно под него и растянуто), а не копируется в
+               буфер с обрезкой на 33 символах. Промежуточный буфер убран: он ничего не давал, кроме
+               той самой молчаливой обрезки. */
+          dn_puts(left + 3, y, "Image file", DNK_DLG_FG, DNK_DLG_BG);
+          dn_putsn_ell(left + 18, y, ide_img_path(), DLG_FIT_MAXC(W, 18), DNK_DLG_FG, DNK_DLG_BG); y++; }
+        { char s[48];
+          dn_puts(left + 3, y, "Size", DNK_DLG_FG, DNK_DLG_BG);
+          if(g_ide_open){
+              int k;
+              itoa_u(g_ide_secs, s); k = slen(s);
+              for(const char* q = " sectors ("; *q; q++) s[k++] = *q;
+              itoa_u(g_ide_secs / 2048u, s + k); k = slen(s);   /* 2048 секторов по 512 Б = 1 МБ */
+              for(const char* q = " MB)"; *q; q++) s[k++] = *q;
+              s[k] = 0;
+          } else { s[0] = '-'; s[1] = 0; }
+          dn_puts(left + 18, y, s, DNK_STATUS, DNK_DLG_BG); y++; }
+        dn_puts(left + 3, y, "Sector in file", DNK_DLG_FG, DNK_DLG_BG);
+        dn_puts(left + 18, y, g_ide_8bit ? "256 bytes (8-bit image)" : "512 bytes",
+                DNK_DLG_FG, DNK_DLG_BG); y++;
+        { char s[48]; int k;                       /* геометрию задаёт ХОСТ командой 0x91 INIT PARAMS */
+          dn_puts(left + 3, y, "Host geometry", DNK_DLG_FG, DNK_DLG_BG);
+          itoa_u(g_ide_heads, s); k = slen(s);
+          for(const char* q = " heads, "; *q; q++) s[k++] = *q;
+          itoa_u(g_ide_spt, s + k); k = slen(s);
+          for(const char* q = " sec/track"; *q; q++) s[k++] = *q;
+          s[k] = 0;
+          dn_puts(left + 18, y, s, DNK_DLG_FG, DNK_DLG_BG); y++; }
+        dn_puts(left + 3, y, "Slave", DNK_DLG_FG, DNK_DLG_BG);
+        dn_puts(left + 18, y, ide_slave_present() ? "present" : "NONE (not connected)",
+                DNK_HOTKEY, DNK_DLG_BG); y++;
+        { char s[16];                              /* приборный счётчик: диск реально отвечает машине */
+          /* v0.15.293: ячейка лежит в НЕкэшируемой DDR и до первой вставки образа НИКЕМ не
+             инициализирована - при выключенном диске здесь был бы просто мусор из памяти, а он
+             выглядит как показание прибора. Без образа честно ставим прочерк. */
+          if(g_ide_open) itoa_u(ide_cmds, s); else { s[0] = '-'; s[1] = 0; }
+          dn_puts(left + 3, y, "Commands served", DNK_DLG_FG, DNK_DLG_BG);
+          dn_puts(left + 18, y, s, DNK_HEADER, DNK_DLG_BG); }
+        { static const char* const bt[2] = {"Eject", "Close"}; dlg_buttons(&d, bt, 2, focus); }
+        int k = get_keysym_blocking();
+        if(k == K_ESC) break;
+        if(k == K_TAB || k == K_LEFT || k == K_RIGHT){ focus = (focus + 1) % NFOC; continue; }
+        if(k == 'e' || k == 'E' || (focus == FOC_EJECT && (k == K_ENTER || k == K_SPACE))){
+            opt_ide = 0; apply_ide();              /* ровно то же, что выключатель NEMO-IDE */
+            focus = FOC_CLOSE; continue;
+        }
+        if(k == K_ENTER || k == K_SPACE) done = 1;
+    }
+    dlg_close(&d);
+}
+/* v358 ОКНО Z-ДИСКА. Держим отдельно от окна карты намеренно: у транспорта своё состояние,
+   свои порты и своя совместимость, и владельцу нужно видеть их не вперемешку с DivMMC. */
+static void zdisk_dialog(void){
+    enum { FOC_ONOFF = 0, FOC_USECUR, FOC_EJECT, FOC_CLOSE, NFOC };
+    const char* fit[2] = { g_dm_ready ? g_dm_name : "(nothing)", dm_path() };
+    Dlg d; dlg_open(&d, 1, dlg_fit_width_col(fit, 2, 18, 60, 72), 16, "Z-Disk (Z-Controller #77/#57)");
+    const int W = d.W; const int left = d.left, top = d.top;
+    int focus = FOC_CLOSE, done = 0;
+    { static const char* const kb[4][2] = {{"Enter","OK"},{"Z","On/Off"},{"E","Eject"},{"Esc","Close"}}; dn_keybar(kb, 4); }
+    while(!done){
+        int y = top + 2;
+        dn_fill(left + 1, top + 1, W - 2, 12, DNK_DLG_BG);
+        dn_puts(left + 3, y, "Z-Disk", DNK_DLG_FG, DNK_DLG_BG);
+        dn_puts(left + 18, y, opt_zc ? "ON" : "OFF", opt_zc ? DNK_DIR : DNK_HOTKEY, DNK_DLG_BG); y++;
+        dn_puts(left + 3, y, "Ports", DNK_DLG_FG, DNK_DLG_BG);
+        dn_puts(left + 18, y, "#77 control, #57 data", DNK_HEADER, DNK_DLG_BG); y++;
+        dn_puts(left + 3, y, "Medium", DNK_DLG_FG, DNK_DLG_BG);
+        dn_puts(left + 18, y, opt_dmmode ? "IMAGE" : "FOLDER", DNK_HEADER, DNK_DLG_BG); y++;
+        dn_puts(left + 3, y, "Mounted", DNK_DLG_FG, DNK_DLG_BG);
+        dn_putsn_ell(left + 18, y, g_dm_ready ? g_dm_name : "(nothing)", DLG_FIT_MAXC(W, 18),
+                g_dm_ready ? DNK_HEADER : DNK_HOTKEY, DNK_DLG_BG); y++;
+        dn_puts(left + 3, y, "Path", DNK_DLG_FG, DNK_DLG_BG);
+        dn_putsn_ell(left + 18, y, dm_path(), DLG_FIT_MAXC(W, 18), DNK_DLG_FG, DNK_DLG_BG); y++;
+        /* Две строки, которые обязаны быть видны, а не жить в документации. */
+        dn_puts(left + 3, y, "Card", DNK_DLG_FG, DNK_DLG_BG);
+        dn_puts(left + 18, y, opt_divmmc ? "SHARED WITH DIVMMC (ONE SLOT)" : "THIS TRANSPORT ONLY",
+                DNK_STATUS, DNK_DLG_BG); y++;
+        dn_puts(left + 3, y, "Beta Disk", DNK_DLG_FG, DNK_DLG_BG);
+        dn_puts(left + 18, y, "OK - NO ROM, NO AUTOMAPPER", DNK_DIR, DNK_DLG_BG); y++;
+        { static const char* const bt[4] = {"Z-Disk on/off", "Use path", "Eject", "Close"};
+          dlg_buttons(&d, bt, 4, focus); }
+        int k = get_keysym_blocking();
+        if(k == K_ESC) break;
+        if(k == K_TAB || k == K_LEFT || k == K_RIGHT){ focus = (focus + 1) % NFOC; continue; }
+        if(k == 'z' || k == 'Z' || (focus == FOC_ONOFF && (k == K_ENTER || k == K_SPACE))){
+            opt_zc = !opt_zc; apply_zc(); focus = FOC_CLOSE; continue;
+        }
+        if(k == 'e' || k == 'E' || (focus == FOC_EJECT && (k == K_ENTER || k == K_SPACE))){
+            /* Извлечение из ЭТОГО окна гасит только свой транспорт: DivMMC мог остаться нужен.
+               Полное извлечение карты - в окне карты, там гасятся оба (см. v353). */
+            opt_zc = 0; apply_zc(); focus = FOC_CLOSE; continue;
+        }
+        if(focus == FOC_USECUR && (k == K_ENTER || k == K_SPACE)){
+            char pp[192]; int n = 0;
+            for(const char* q = curpath; *q && n < 180; q++) pp[n++] = *q;
+            pp[n] = 0;
+            if(pp[0]){
+                uint8_t rc = divmmc_mount(pp);
+                if(rc == 0xE2) dn_status_msg("Z-DISK: PATH TOO LONG");
+                else if(rc)    dn_status_msg("Z-DISK: MOUNT FAILED");
+                else           dn_status_msg("Z-DISK MOUNTED (CARD SHARED WITH DIVMMC)");
+            }
+            continue;
+        }
+        if(k == K_ENTER || k == K_SPACE) done = 1;
+    }
+    dlg_close(&d);
+}
+static void divmmc_info_dialog(void){
+    /* v353: карта одна, транспортов два - у каждого свой выключатель в этом же окне. */
+    enum { FOC_MOUNT = 0, FOC_ZC, FOC_USECUR, FOC_EJECT, FOC_CLOSE, NFOC };
+    /* v0.15.334: то же, что у окна винчестера - ширина по имени и пути, а не константа 56. У DivMMC
+       в режиме FOLDER путь особенно длинный (каталог на карте), и обрезка на 36 символах прятала
+       как раз конец пути, то есть саму папку. */
+    const char* fit[2] = { g_dm_ready ? g_dm_name : "(nothing)", dm_path() };
+    Dlg d; dlg_open(&d, 1, dlg_fit_width_col(fit, 2, 18, 56, 72), 16, "SD card: DivMMC / Z-Disk");
+    const int W = d.W; const int left = d.left, top = d.top;
+    int focus = FOC_CLOSE, done = 0;
+    { static const char* const kb[5][2] = {{"Enter","OK"},{"M","Mount"},{"Z","Z-Disk"},{"E","Eject"},{"Esc","Close"}}; dn_keybar(kb, 5); }
+    while(!done){
+        int y = top + 2;
+        dn_fill(left + 1, top + 1, W - 2, 12, DNK_DLG_BG);
+        dn_puts(left + 3, y, "DivMMC", DNK_DLG_FG, DNK_DLG_BG);
+        dn_puts(left + 18, y, opt_divmmc ? "ON" : "OFF", opt_divmmc ? DNK_DIR : DNK_HOTKEY, DNK_DLG_BG); y++;
+        /* v353: второй транспорт к ТОЙ ЖЕ карте - порты #77/#57, без своего ПЗУ и автомаппера */
+        dn_puts(left + 3, y, "Z-Disk (#77/#57)", DNK_DLG_FG, DNK_DLG_BG);
+        dn_puts(left + 18, y, opt_zc ? "ON" : "OFF", opt_zc ? DNK_DIR : DNK_HOTKEY, DNK_DLG_BG); y++;
+        dn_puts(left + 3, y, "Mode", DNK_DLG_FG, DNK_DLG_BG);
+        dn_puts(left + 18, y, opt_dmmode ? "IMAGE" : "FOLDER", DNK_HEADER, DNK_DLG_BG); y++;
+        dn_puts(left + 3, y, "Mounted", DNK_DLG_FG, DNK_DLG_BG);
+        dn_putsn_ell(left + 18, y, g_dm_ready ? g_dm_name : "(nothing)", DLG_FIT_MAXC(W, 18),
+                g_dm_ready ? DNK_HEADER : DNK_HOTKEY, DNK_DLG_BG); y++;
+        {   /* v0.15.334: путь целиком, обрезка (если понадобится) - видимая */
+          dn_puts(left + 3, y, "Path", DNK_DLG_FG, DNK_DLG_BG);
+          dn_putsn_ell(left + 18, y, dm_path(), DLG_FIT_MAXC(W, 18), DNK_DLG_FG, DNK_DLG_BG); y++; }
+        { char s[48];
+          dn_puts(left + 3, y, "Size", DNK_DLG_FG, DNK_DLG_BG);
+          if(g_dm_ready){
+              int k; itoa_u(g_dm_img_secs, s); k = slen(s);
+              for(const char* q=" sectors"; *q; q++) s[k++]=*q; s[k]=0;
+              dn_puts(left + 18, y, s, DNK_STATUS, DNK_DLG_BG);
+          } else dn_puts(left + 18, y, "-", DNK_HOTKEY, DNK_DLG_BG);
+          y++; }
+        if(!opt_dmmode && g_dm_ready && divmmc_fs_ready()){
+            const dmfs_info_t* inf = divmmc_fs_info();
+            char s[48]; int k=0;
+            dn_puts(left + 3, y, "Folder FS", DNK_DLG_FG, DNK_DLG_BG);
+            itoa_u(inf->files, s); k=slen(s);
+            for(const char* q=" files "; *q; q++) s[k++]=*q;
+            itoa_u(inf->dirs, s+k); k=slen(s);
+            for(const char* q=" dirs"; *q; q++) s[k++]=*q;
+            s[k]=0; dn_puts(left + 18, y, s, DNK_DLG_FG, DNK_DLG_BG); y++;
+            dn_puts(left + 3, y, "Status", DNK_DLG_FG, DNK_DLG_BG);
+            dn_puts(left + 18, y, divmmc_fs_msg() ? divmmc_fs_msg() : "-", DNK_DIR, DNK_DLG_BG); y++;
+        } else {
+            dn_puts(left + 3, y, "Note", DNK_DLG_FG, DNK_DLG_BG);
+            dn_puts(left + 18, y, "PL SPI pending (A+B backend)", DNK_HOTKEY, DNK_DLG_BG); y++;
+        }
+        { static const char* const bt[5] = {"Mount", "Z-Disk", "Use path", "Eject", "Close"};
+          dlg_buttons(&d, bt, 5, focus); }
+        int k = get_keysym_blocking();
+        if(k == K_ESC) break;
+        if(k == K_TAB || k == K_LEFT || k == K_RIGHT){ focus = (focus + 1) % NFOC; continue; }
+        if(k == 'e' || k == 'E' || (focus == FOC_EJECT && (k == K_ENTER || k == K_SPACE))){
+            /* v353: извлечение обязано гасить ОБА транспорта. Носитель поднят, пока нужен хоть
+               одному (dm_media_needed), поэтому гашение только DivMMC оставляло карту в машине. */
+            opt_divmmc = 0; opt_zc = 0; apply_divmmc(); apply_zc(); focus = FOC_CLOSE; continue;
+        }
+        if(k == 'z' || k == 'Z' || (focus == FOC_ZC && (k == K_ENTER || k == K_SPACE))){
+            opt_zc = !opt_zc; apply_zc(); focus = FOC_CLOSE; continue;
+        }
+        if(k == 'm' || k == 'M' || (focus == FOC_MOUNT && (k == K_ENTER || k == K_SPACE))){
+            opt_divmmc = 1; apply_divmmc(); focus = FOC_CLOSE; continue;
+        }
+        if(focus == FOC_USECUR && (k == K_ENTER || k == K_SPACE)){
+            char pp[192]; int n=0;
+            for(const char* q=curpath; *q && n<180; q++) pp[n++]=*q;
+            pp[n]=0;
+            if(pp[0]){
+                uint8_t rc = divmmc_mount(pp);
+                if(rc == 0xE2) dn_status_msg("DIVMMC: PATH TOO LONG");
+                else if(rc)    dn_status_msg("DIVMMC: MOUNT FAILED");
+                else           dn_status_msg("DIVMMC MOUNTED");
+            }
+            continue;
+        }
+        if(k == K_ENTER || k == K_SPACE) done = 1;
+    }
+    dlg_close(&d);
+}
+static void gs_speed_dialog(void){
+    Dlg d; dlg_open(&d, 1, 64, 17, "General Sound: speed");
+    const int W = d.W; const int left = d.left, top = d.top;
+    /* v0.15.346 (просьба владельца 14.08): перезапуск карты - НЕ только горячая клавиша, а КНОПКА.
+       Резон простой и правильный: клавишу надо знать, кнопку видно. Буква R оставлена как ускоритель. */
+    enum { FOC_GSRESTART = 0, FOC_GSCLOSE, NFOC_GS };
+    int focus = FOC_GSCLOSE, done = 0;
+    { static const char* const kb[4][2] = {{"R","Restart card"},{"Q","Reply queue"},{"Tab","Button"},{"Esc","Close"}}; dn_keybar(kb, 4); }
+    while(!done){
+        int y = top + 2;
+        dn_fill(left + 1, top + 1, W - 2, 13, DNK_DLG_BG);
+        /* строка «сколько мегагерц» из десятых долей: 119 -> "11.9 MHz" */
+        {   char s[48]; int k = 0;
+            dn_puts(left + 3, y, "Card", DNK_DLG_FG, DNK_DLG_BG);
+            if(!g_gs_live){ dn_puts(left + 26, y, "OFF", DNK_HOTKEY, DNK_DLG_BG); }
+            else {
+                /* v336: номинал берём У КАРТЫ - он теперь опция машины, а не 12 МГц навсегда */
+                uint32_t n10 = gs_nom10();
+                for(const char* q = "ON, nominal "; *q; q++) s[k++] = *q;
+                itoa_u(n10 / 10u, s + k); k = slen(s);
+                s[k++] = '.'; s[k++] = (char)('0' + (n10 % 10u));
+                for(const char* q = " MHz ("; *q; q++) s[k++] = *q;
+                for(const char* q = CH_GSRAM[(opt_gsram >= 0 && opt_gsram <= 3) ? opt_gsram : 1]; *q; q++) s[k++] = *q;
+                s[k++] = ')'; s[k] = 0;
+                dn_puts(left + 26, y, s, DNK_DIR, DNK_DLG_BG);
+            }
+            y++; }
+        {   char s[32]; int k;                       /* средний темп за секунду */
+            uint32_t v = g_gs_live ? gs_m_avg10 : 0u;
+            dn_puts(left + 3, y, "Clock, 1 s average", DNK_DLG_FG, DNK_DLG_BG);
+            itoa_u(v / 10u, s); k = slen(s); s[k++] = '.'; s[k++] = (char)('0' + (v % 10u));
+            for(const char* q = " MHz"; *q; q++) s[k++] = *q;
+            s[k] = 0;
+            dn_puts(left + 26, y, s, DNK_HEADER, DNK_DLG_BG); y++; }
+        {   char s[32]; int k;                       /* худшая восьмушка окна */
+            uint32_t v = g_gs_live ? gs_m_min10 : 0u;
+            dn_puts(left + 3, y, "Worst 1/8 s in window", DNK_DLG_FG, DNK_DLG_BG);
+            itoa_u(v / 10u, s); k = slen(s); s[k++] = '.'; s[k++] = (char)('0' + (v % 10u));
+            for(const char* q = " MHz"; *q; q++) s[k++] = *q;
+            s[k] = 0;
+            dn_puts(left + 26, y, s, (v >= (gs_nom10() * 95u) / 100u) ? DNK_DIR : DNK_STATUS, DNK_DLG_BG); y++; }
+        {   char s[32]; int k;                       /* v299: худшая восьмушка ЗА ВСЁ ВРЕМЯ */
+            uint32_t v = g_gs_live ? gs_m_min10w : 0u;
+            dn_puts(left + 3, y, "Worst since card start", DNK_DLG_FG, DNK_DLG_BG);
+            itoa_u(v / 10u, s); k = slen(s); s[k++] = '.'; s[k++] = (char)('0' + (v % 10u));
+            for(const char* q = " MHz"; *q; q++) s[k++] = *q;
+            s[k] = 0;
+            dn_puts(left + 26, y, s, (v >= (gs_nom10() * 95u) / 100u) ? DNK_DIR : DNK_STATUS, DNK_DLG_BG); y++; }
+        {   char s[40]; int k;                       /* v299: поток опросов состояния - это и есть трекер */
+            dn_puts(left + 3, y, "Status polls, per 1 s", DNK_DLG_FG, DNK_DLG_BG);
+            itoa_u(g_gs_live ? gs_m_poll : 0u, s); k = slen(s);
+            for(const char* q = " (player window)"; *q; q++) s[k++] = *q;
+            s[k] = 0;
+            dn_puts(left + 26, y, s, DNK_DLG_FG, DNK_DLG_BG); y++; }
+        {   char s[40]; int k;                       /* сам измеритель: сэмплы за окно */
+            dn_puts(left + 3, y, "To sound, per window", DNK_DLG_FG, DNK_DLG_BG);
+            itoa_u(g_gs_live ? gs_m_smp : 0u, s); k = slen(s);
+            for(const char* q = " of "; *q; q++) s[k++] = *q;
+            itoa_u(g_gs_live ? gs_m_slots : 0u, s + k); k = slen(s);
+            for(const char* q = " samples"; *q; q++) s[k++] = *q;
+            s[k] = 0;
+            dn_puts(left + 26, y, s, DNK_DLG_FG, DNK_DLG_BG); y++; }
+        {   char s[40]; int k;                       /* замирания: за окно и всего с включения */
+            uint32_t g = g_gs_live ? gs_m_gaps : 0u;
+            dn_puts(left + 3, y, "Dropouts, window/total", DNK_DLG_FG, DNK_DLG_BG);
+            itoa_u(g >> 16, s); k = slen(s); s[k++] = ' '; s[k++] = '/'; s[k++] = ' ';
+            itoa_u(g & 0xFFFFu, s + k); k = slen(s); s[k] = 0;
+            dn_puts(left + 26, y, s, (g >> 16) ? DNK_STATUS : DNK_DLG_FG, DNK_DLG_BG); y++; }
+        {   char s[40]; int k;                       /* невыбранный догон - карта ещё нагоняет время */
+            dn_puts(left + 3, y, "Catch-up left", DNK_DLG_FG, DNK_DLG_BG);
+            itoa_u(g_gs_live ? gs_m_debt : 0u, s); k = slen(s);
+            for(const char* q = " cycles"; *q; q++) s[k++] = *q;
+            s[k] = 0;
+            dn_puts(left + 26, y, s, DNK_DLG_FG, DNK_DLG_BG); y++; }
+        {   char s[40]; int k;                       /* сколько машина ждёт у карты - это НЕ темп */
+            dn_puts(left + 3, y, "Queue from machine", DNK_DLG_FG, DNK_DLG_BG);
+            itoa_u(g_gs_live ? gs_inq_used() : 0u, s); k = slen(s);
+            for(const char* q = " bytes"; *q; q++) s[k++] = *q;
+            s[k] = 0;
+            dn_puts(left + 26, y, s, DNK_DLG_FG, DNK_DLG_BG); y++; }
+        {   char s[40]; int k;                       /* объём карты - он на темп влиять НЕ должен */
+            dn_puts(left + 3, y, "Card RAM", DNK_DLG_FG, DNK_DLG_BG);
+            itoa_u(gs_get_ram_kb(), s); k = slen(s);
+            for(const char* q = " KB, "; *q; q++) s[k++] = *q;
+            itoa_u(gs_pages_get(), s + k); k = slen(s);
+            for(const char* q = " pages"; *q; q++) s[k++] = *q;
+            s[k] = 0;
+            dn_puts(left + 26, y, s, DNK_DLG_FG, DNK_DLG_BG); y++; }
+        {   char s[48]; int k = 0;                   /* v341: очередь ОТВЕТОВ карты - предмет A/B по клавише Q */
+            unsigned dep = gs_outq_get_depth();
+            dn_puts(left + 3, y, "Reply queue (Q)", DNK_DLG_FG, DNK_DLG_BG);
+            if(!dep){ for(const char* q = "OFF (byte-for-byte pre-v339)"; *q; q++) s[k++] = *q; s[k] = 0;
+                      dn_puts(left + 26, y, s, DNK_STATUS, DNK_DLG_BG); }
+            else { for(const char* q = "ON, depth "; *q; q++) s[k++] = *q;
+                   itoa_u(dep, s + k); k = slen(s);
+                   for(const char* q = ", now "; *q; q++) s[k++] = *q;
+                   itoa_u(gs_outq_get_used(), s + k); k = slen(s);
+                   for(const char* q = ", peak "; *q; q++) s[k++] = *q;
+                   itoa_u(gs_outq_get_peak(), s + k); k = slen(s); s[k] = 0;
+                   dn_puts(left + 26, y, s, DNK_DIR, DNK_DLG_BG); } }
+        { static const char* const bt[2] = {"Restart card", "Close"}; dlg_buttons(&d, bt, 2, focus); }
+        /* Живое окно: ждём клавишу не дольше четверти секунды, потом перерисовываем показания.
+           Карту при этом двигает bg_pump внутри ожидания, поэтому прибор меряет РАБОТУ, а не паузу. */
+        {   XTime _t; XTime_GetTime(&_t);
+            g_key_deadline = _t + (XTime)(COUNTS_PER_SECOND / 4u); }
+        {   int k = get_keysym_blocking();
+            g_key_deadline = 0;
+            if(k == K_NONE) continue;
+            if(k == K_TAB || k == K_LEFT || k == K_RIGHT){ focus = (focus + 1) % NFOC_GS; continue; }
+            if(k == 'R' || k == 'r' || (focus == FOC_GSRESTART && (k == K_ENTER || k == K_SPACE))){
+                if(!g_gs_live){ dn_status_msg("GS: CARD IS OFF - ENABLE IT IN MACHINE OPTIONS"); }
+                else {
+                    dn_status_msg("GS: RESTARTING CARD...");
+                    if(gs_boot()){ gs_meter_reset();
+                        dn_status_msg("GS: CARD RESTARTED - RESET THE SPECTRUM IF ITS DRIVER IS STUCK"); }
+                    else dn_status_msg("GS: RESTART FAILED - CHECK 0:/GS/GS105B.ROM");
+                }
+                focus = FOC_GSCLOSE;
+                continue; }
+            if(k == 'Q' || k == 'q'){
+                /* A/B под открытый дефект «плеер сам листает треки»: глубина 0 - это прежнее
+                   поведение байт-в-байт, поэтому переключение туда и обратно ничего не ломает. */
+                unsigned dep = gs_outq_get_depth();
+                gs_outq_set_depth(dep ? 0u : 16u);
+                dn_status_msg(dep ? "GS REPLY QUEUE: OFF (pre-v339 behaviour)"
+                                  : "GS REPLY QUEUE: ON (pattern gaps fixed)");
+                continue; }
+            if(k == K_ESC || k == K_ENTER || k == K_SPACE) done = 1; }
+    }
+    g_key_deadline = 0;
+    dlg_close(&d);
+}
+/* v0.15.228 ПУСТОЙ ОБРАЗ TRD. Владелец: «нужна опция создавать новый пустой trd, не хочу портить
+   существующие». Правильное требование - запись отлаживать на своём образе, а не на коллекции.
+   Пустая дискета TR-DOS это 640 КБ нулей плюс инфо-сектор по смещению 0x8E0: первый свободный
+   сектор 0, первая свободная дорожка 1 (нулевая занята каталогом), тип 0x16 (80 дорожек, две
+   стороны), файлов 0, свободно 2544 сектора, признак 0x10. Те же поля и та же арифметика, что в
+   синтезе каталога для SCL, а она уже сверена байт-в-байт с настоящим образом.
+   Геометрию берём одну, 80/DS - она универсальна, её понимают все версии TR-DOS. */
+static uint8_t trd_create(const char* path){
+    FIL f;
+    FILINFO fi;
+    if(f_stat(path, &fi) == FR_OK) return 0xC1;          /* уже есть - молча не перетираем */
+    if(f_open(&f, path, FA_WRITE | FA_CREATE_NEW) != FR_OK) return 0xC2;
+    static uint8_t blk[512];
+    uint8_t rc = 0;
+    for(uint32_t b = 0; b < TRD_FULL_SZ / 512u; b++){
+        for(int i = 0; i < 512; i++) blk[i] = 0;
+        if(b == 4u){                                     /* 0x8E0 = 2272 -> блок 4, смещение 224 */
+            uint8_t* inf = &blk[224];
+            inf[1] = 0;
+            inf[2] = 1;
+            inf[3] = 0x16u;
+            inf[4] = 0;
+            inf[5] = (uint8_t)(TRD_FREE_MAX & 0xFFu);
+            inf[6] = (uint8_t)(TRD_FREE_MAX >> 8);
+            inf[7] = 0x10u;
+            for(int k = 0; k < 8; k++) inf[0x15 + k] = ' ';
+        }
+        UINT bw = 0;
+        if(f_write(&f, blk, 512u, &bw) != FR_OK || bw != 512u){ rc = 0xC3; break; }
+        if((b & 31u) == 0u) KBD_HB = 1;                  /* 1280 блоков - заметное время, кормим сторож */
+    }
+    f_sync(&f);
+    f_close(&f);
+    if(rc) f_unlink(path);                               /* недописанный образ хуже отсутствующего */
+    return rc;
+}
+static void trd_create_dialog(void){
+    char nm[64]; nm[0] = 0;
+    if(!dn_input_dialog("New disk image", "Name (.trd added):", nm, (int)sizeof(nm))) return;
+    if(!nm[0]) return;
+    int dot = 0; for(int i = 0; nm[i]; i++) if(nm[i] == '.') dot = 1;
+    char pp[220]; int n = 0;
+    for(const char* q = curpath; *q && n < 200; q++) pp[n++] = *q;
+    if(n && pp[n-1] != '/') pp[n++] = '/';
+    for(const char* q = nm; *q && n < 210; q++) pp[n++] = *q;
+    if(!dot){ const char* e = ".TRD"; for(int i = 0; e[i] && n < 218; i++) pp[n++] = e[i]; }
+    pp[n] = 0;
+    uint8_t rc = trd_create(pp);
+    dn_status_msg(rc == 0xC1 ? "ALREADY EXISTS" : rc ? "CREATE FAILED" : "EMPTY IMAGE CREATED");
+    if(!rc){ sd_scan(); render_browser(); }
+}
+/* v0.15.228 ПРОСМОТР КАТАЛОГА ОБРАЗА. Читаем ФАЙЛ, а не смонтированный привод: работает и для образа,
+   который никуда не вставлен. TRD - каталог лежит в начале как есть; SCL - каталога на образе нет
+   вовсе, поэтому собираем его из 14-байтовых записей ровно так же, как при монтировании (иначе
+   просмотр показывал бы одно, а машина видела другое). Удалённые записи (первый байт 1) помечаем. */
+static void image_view_dialog(void){
+    if(fcount == 0 || bcursor >= fcount || fisdir[bcursor]) return;
+    char pp[220]; int n = 0;
+    for(const char* q = curpath; *q && n < 200; q++) pp[n++] = *q;
+    if(n && pp[n-1] != '/') pp[n++] = '/';
+    for(const char* q = flist[bcursor]; *q && n < 218; q++) pp[n++] = *q;
+    pp[n] = 0;
+    FIL f;
+    if(f_open(&f, pp, FA_READ) != FR_OK){ dn_status_msg("OPEN FAILED"); return; }
+    static uint8_t ent[128][16];
+    static uint8_t del[128];
+    int cnt = 0, is_scl = 0, freesec = -1;
+    UINT br = 0;
+    { uint8_t h[9];
+      if(f_read(&f, h, 9, &br) == FR_OK && br == 9 &&
+         h[0]=='S'&&h[1]=='I'&&h[2]=='N'&&h[3]=='C'&&h[4]=='L'&&h[5]=='A'&&h[6]=='I'&&h[7]=='R'){
+          is_scl = 1;
+          uint32_t fn = h[8]; if(fn > 128u) fn = 128u;
+          uint32_t sec = 0, trk = 1, used = 0;
+          for(uint32_t i = 0; i < fn; i++){
+              uint8_t e[14];
+              if(f_lseek(&f, 9u + 14u*i) != FR_OK) break;
+              if(f_read(&f, e, 14, &br) != FR_OK || br != 14) break;
+              for(int k = 0; k < 14; k++) ent[cnt][k] = e[k];
+              ent[cnt][14] = (uint8_t)sec; ent[cnt][15] = (uint8_t)trk; del[cnt] = 0;
+              used += e[13]; sec += e[13]; trk += sec / 16u; sec %= 16u;
+              cnt++;
+          }
+          freesec = (int)(TRD_FREE_MAX - used);
+      } else {
+          if(f_lseek(&f, 0) == FR_OK){
+              for(int i = 0; i < 128; i++){
+                  if(f_read(&f, ent[cnt], 16, &br) != FR_OK || br != 16) break;
+                  if(ent[cnt][0] == 0) break;                  /* конец каталога */
+                  del[cnt] = (ent[cnt][0] == 1) ? 1 : 0;       /* удалённая запись */
+                  cnt++;
+              }
+          }
+          { uint8_t inf[16];
+            if(f_lseek(&f, 0x8E5u) == FR_OK && f_read(&f, inf, 2, &br) == FR_OK && br == 2)
+                freesec = (int)inf[0] | ((int)inf[1] << 8); }
+      }
+    }
+    f_close(&f);
+
+    enum { VROWS = 12 };
+    /* v0.15.334: заголовок собирается ДО окна - по нему считается ширина. Имя образа тут молча
+       резалось на 30 символах, а у TOSEC-имён на этой отметке как раз начинается всё различающее
+       (версия, издатель, год) - два разных образа выглядели в шапке одинаково. */
+    char hd[NAMELEN + 48];
+    { int k = 0;
+      for(const char* q = flist[bcursor]; *q && k < NAMELEN; q++) hd[k++] = *q;
+      hd[k++] = ' '; hd[k++] = ' '; hd[k] = 0;
+      itoa_u((unsigned)cnt, hd + k); k = slen(hd);
+      for(const char* q = " files"; *q; q++) hd[k++] = *q;
+      if(freesec >= 0){ for(const char* q = ", free "; *q; q++) hd[k++] = *q;
+                        itoa_u((unsigned)freesec, hd + k); k = slen(hd);
+                        for(const char* q = " sec"; *q; q++) hd[k++] = *q; }
+      hd[k] = 0; }
+    const char* fit[1] = { hd };
+    Dlg d; dlg_open(&d, 1, dlg_fit_width(fit, 1, 52, 72), VROWS + 8,
+                    is_scl ? "Image catalogue (SCL)" : "Image catalogue (TRD)");
+    const int W = d.W; const int left = d.left, top = d.top, brow = d.brow;
+    int wtop = top + 4;
+    int cur = 0, tp = 0;
+    dn_putsn_ell(left + 3, top + 2, hd, DLG_FIT_MAXC(W, 3), DNK_DLG_FG, DNK_DLG_BG);
+    dn_puts(left + 3, top + 3, "Name     E Start   Len Sec Trk/Sec", DNK_HEADER, DNK_DLG_BG);
+    { static const char* const kb[2][2] = {{"Enter","OK"},{"Esc","Close"}}; dn_keybar(kb, 2); }
+    while(1){
+        for(int r = 0; r < VROWS; r++){
+            int i = tp + r;
+            dn_fill(left + 1, wtop + r, W - 2, 1, DNK_DLG_BG);
+            if(i >= cnt) continue;
+            char s[64]; int k = 0;
+            for(int j = 0; j < 8; j++) s[k++] = (char)(ent[i][j] ? ent[i][j] : ' ');
+            s[k++] = ' ';
+            s[k++] = (char)ent[i][8]; s[k++] = ' ';
+            { unsigned st = (unsigned)ent[i][9] | ((unsigned)ent[i][10] << 8);
+              const char* hx = "0123456789ABCDEF";
+              s[k++] = '#'; s[k++] = hx[(st>>12)&15]; s[k++] = hx[(st>>8)&15];
+              s[k++] = hx[(st>>4)&15]; s[k++] = hx[st&15]; s[k++] = ' '; }
+            { unsigned ln = (unsigned)ent[i][11] | ((unsigned)ent[i][12] << 8);
+              char b[8]; itoa_u(ln, b); int p = slen(b);
+              for(int q = p; q < 5; q++) s[k++] = ' ';
+              for(int q = 0; q < p; q++) s[k++] = b[q]; s[k++] = ' '; }
+            { char b[8]; itoa_u(ent[i][13], b); int p = slen(b);
+              for(int q = p; q < 3; q++) s[k++] = ' ';
+              for(int q = 0; q < p; q++) s[k++] = b[q]; s[k++] = ' '; }
+            { char b[8]; itoa_u(ent[i][15], b); int p = slen(b);
+              for(int q = p; q < 3; q++) s[k++] = ' ';
+              for(int q = 0; q < p; q++) s[k++] = b[q];
+              s[k++] = '/'; itoa_u(ent[i][14], b); p = slen(b);
+              for(int q = 0; q < p; q++) s[k++] = b[q]; }
+            if(del[i]){ for(const char* q = " DEL"; *q; q++) s[k++] = *q; }
+            s[k] = 0;
+            dn_puts(left + 3, wtop + r, s,
+                    del[i] ? DNK_FILE : (i == cur ? DNK_CUR_FG : DNK_DLG_FG),
+                    (i == cur) ? DNK_CUR_BG : DNK_DLG_BG);
+        }
+        { static const char* const b[1] = {"OK"}; dlg_buttons(&d, b, 1, 0); }
+        int k = get_keysym_blocking();
+        if(k == K_ESC || k == K_ENTER) break;
+        if(k == K_UP   && cur > 0)        cur--;
+        if(k == K_DOWN && cur < cnt - 1)  cur++;
+        if(k == K_PGUP){ cur -= VROWS; if(cur < 0) cur = 0; }
+        if(k == K_PGDN){ cur += VROWS; if(cur > cnt - 1) cur = (cnt > 0) ? cnt - 1 : 0; }
+        if(k == K_HOME) cur = 0;
+        if(k == K_END)  cur = (cnt > 0) ? cnt - 1 : 0;
+        if(cur < tp) tp = cur;
+        if(cur >= tp + VROWS) tp = cur - (VROWS - 1);
+    }
+    dlg_close(&d);
+}
+/* v224: то же окно в режиме управления - вызывается из меню, ничего не вставляет. */
+static void drive_manage_dialog(void){ (void)drive_select_dialog(0); }
 static void machine_select_dialog(void){
     enum { FOC_RADIO=0, FOC_OK, FOC_CANCEL, NFOC };
     const int W=44, H=N_MACHINES+8;
@@ -5034,7 +12724,7 @@ static void machine_select_dialog(void){
     int wtop=top+4, brow=top+H-3;
     int rcur=(opt_defmachine>=0&&opt_defmachine<N_MACHINES)?opt_defmachine:0;
     int rmode=rcur, focus=FOC_RADIO, result=-1;
-    box_backup(&g_bs[1], left, top, W+2, H+1);
+    box_push(left, top, W+2, H+1);
     dn_win_draw(left,top,W,H,"Select machine");
     dn_puts(left+3,top+2,"Selecting reboots into the machine.",DNK_DLG_FG,DNK_DLG_BG);
     { static const char* const kb[4][2]={{"Enter","OK"},{"Tab","Next"},{"Space","Set"},{"Esc","Cancel"}}; dn_keybar(kb,4); }
@@ -5064,11 +12754,232 @@ static void machine_select_dialog(void){
             break;
         }
     }
-    box_restore(&g_bs[1]);
+    box_pop();
     dn_keybar_browser();
     g_menu_close = 1;   /* selecting (OK) closes the whole menu -> user lands back in the navigator to pick a file */
     if(result==1 && rmode!=opt_defmachine){ opt_defmachine=rmode; apply_machine(); }
 }
+/* Modal ROM picker. The old ITEM_CHOICE behaviour changed ROM immediately on every Enter, so the
+   owner could neither see the card contents nor choose a distant item without rebooting the Z80
+   repeatedly. Scan the card on every open, show a scrollable filename list, and apply exactly once
+   after Load/Enter. The remembered per-machine filename is the source of truth across a re-scan. */
+/* v0.15.305 ВТОРАЯ КОЛОНКА СПИСКА: ЧТО ЭТО ЗА ФАЙЛ. Имя файла о содержимом не говорит ничего
+   (владелец волен назвать его как угодно), поэтому рядом с именем стоит тип, определённый пробой:
+   для одностраничного файла - тип его страницы, для набора - сколько в нём страниц. */
+static const char* romset_kind_col(int i){
+    static char b[12];
+    if(i<=0 || i>=g_rs_n) return "";
+    if(g_rs_pages[i] > 1){
+        int p=0; const char* s="SET ";
+        for(int j=0; s[j]; j++) b[p++]=s[j];
+        itoa_u((unsigned)g_rs_pages[i], b+p); p=slen(b);
+        b[p++]='P'; b[p]=0;
+        return b;
+    }
+    return rom_kind_label(g_rs_kind[i]);
+}
+#define ROMDLG_KINDX 38                    /* колонка типа: имя (до 27 знаков с левого края +8) не достаёт */
+static void romset_select_dialog(void){
+    enum { FOC_LIST=0, FOC_LOAD, FOC_CANCEL, NFOC };
+    enum { VROWS=12 };
+    const int W=56, H=20;
+    int left=(DN_COLS-W)/2, top=(DN_ROWS-H)/2;
+    int wtop=top+4, brow=top+H-3;
+
+    if(!rom_port_ok()) return;                          /* v303: ядро без порта - выбирать нечего */
+    romset_rescan_sync();                               /* v303: скан + список пункта [50] + индекс набора */
+    int current=opt_romset;                             /* карта могла измениться: индекс даёт скан, а не память */
+
+    int rcur=current, rmode=current, first=0, focus=FOC_LIST, result=-1;
+    box_push(left, top, W+2, H+1);
+    dn_win_draw(left,top,W,H,"Select ROM set");
+    dn_puts(left+3,top+2,"Files from 0:/ROMS/   Enter=load",DNK_DLG_FG,DNK_DLG_BG);
+    { static const char* const kb[5][2]={
+        {"Enter","Load"},{"Space","Select"},{"PgUp/Dn","Page"},{"Home/End","First/last"},{"Esc","Cancel"}
+      }; dn_keybar(kb,5); }
+
+    while(result<0){
+        if(rcur<first) first=rcur;
+        if(rcur>=first+VROWS) first=rcur-VROWS+1;
+        if(first>g_rs_n-VROWS) first=g_rs_n-VROWS;
+        if(first<0) first=0;
+
+        dn_fill(left+2,wtop,W-4,VROWS,DNK_DLG_BG);
+        for(int row=0;row<VROWS;row++){
+            int i=first+row;
+            if(i>=g_rs_n) break;
+            dn_radio(left+4,wtop+row,g_rs_name[i],i==rmode,focus==FOC_LIST&&i==rcur,0);
+            dn_puts(left+ROMDLG_KINDX,wtop+row,romset_kind_col(i),DNK_HEADER,DNK_DLG_BG);   /* v305: тип файла */
+        }
+        { char a[12],b[12]; itoa_u((unsigned)(rcur+1),a); itoa_u((unsigned)g_rs_n,b);
+          int x=left+W-12; dn_fill(x,top+2,9,1,DNK_DLG_BG);
+          dn_puts(x,top+2,a,DNK_DLG_FG,DNK_DLG_BG); x+=slen(a);
+          dn_putc(x++,top+2,'/',DNK_DLG_FG,DNK_DLG_BG);
+          dn_puts(x,top+2,b,DNK_DLG_FG,DNK_DLG_BG); }
+        { int bw=12,gap=4,total=(bw+1)+gap+(bw+1),bx=left+(W-total)/2;
+          dn_fill(left+1,brow,W-2,2,DNK_DLG_BG);
+          dn_button(bx,brow,"Load",focus!=FOC_CANCEL,bw);
+          dn_button(bx+bw+1+gap,brow,"Cancel",focus==FOC_CANCEL,bw); }
+
+        int k=get_keysym_blocking();
+        if(k==K_ESC){ result=0; break; }
+        if(k==K_TAB){ focus=(focus+(g_kb_shift?NFOC-1:1))%NFOC; continue; }
+        if(k==K_ENTER){
+            if(focus==FOC_LIST) rmode=rcur;
+            result=(focus==FOC_CANCEL)?0:1;
+            break;
+        }
+        switch(focus){
+        case FOC_LIST:
+            if(k==K_UP){ if(rcur>0) rcur--; }
+            else if(k==K_DOWN){ if(rcur<g_rs_n-1) rcur++; else focus=FOC_LOAD; }
+            else if(k==K_PGUP){ rcur-=VROWS; if(rcur<0) rcur=0; }
+            else if(k==K_PGDN){ rcur+=VROWS; if(rcur>=g_rs_n) rcur=g_rs_n-1; }
+            else if(k==K_HOME){ rcur=0; }
+            else if(k==K_END){ rcur=g_rs_n-1; }
+            else if(k==K_SPACE){ rmode=rcur; }
+            else if(k==K_RIGHT){ focus=FOC_LOAD; }
+            rmode=rcur;                                  /* cursor is the pending selection; no Z80 reset yet */
+            break;
+        case FOC_LOAD:
+            if(k==K_SPACE){ result=1; }
+            else if(k==K_RIGHT){ focus=FOC_CANCEL; }
+            else if(k==K_LEFT||k==K_UP){ focus=FOC_LIST; }
+            break;
+        case FOC_CANCEL:
+            if(k==K_SPACE){ result=0; }
+            else if(k==K_LEFT){ focus=FOC_LOAD; }
+            else if(k==K_UP){ focus=FOC_LIST; }
+            break;
+        }
+    }
+    box_pop();
+    dn_keybar_browser();
+    /* v0.15.401: меню больше НЕ закрываем - фон подменю лежит в стеке и цел (прежде здесь
+       стояло g_menu_close=1, потому что окно занимало слот подменю). */
+    if(result==1 && rmode!=current){ opt_romset=rmode; apply_romset(); }
+}
+/* v0.15.302 ВЫБОР ФАЙЛА В ОДИН СЛОТ. Тот же радио-список, что у набора, но с двумя отличиями,
+   и оба принципиальные:
+     - показываем ТОЛЬКО одностраничные файлы (16 КБ). Слот - это ровно одна страница; предложить
+       туда набор на 64 КБ значило бы обещать раскладку, которой у слота нет;
+     - первый пункт «(FROM SET)» = снять назначение. Тогда страницу снова задаёт набор (или
+       заводское ПЗУ битстрима) - без этого пункта назначение было бы необратимым.
+   Карту пересканируем при каждом открытии: файлы могли появиться без перезапуска ARM. */
+static void rom_slot_dialog(int slot){
+    enum { FOC_LIST=0, FOC_LOAD, FOC_CANCEL, NFOC };
+    enum { VROWS=12 };
+    static const char* const TITLE[ROM_PG_N] = {
+        "ROM slot 0  (128 menu)", "ROM slot 1  (48 BASIC)",
+        "ROM slot 2  (TR-DOS)",   "ROM slot 3  (service)" };
+    const int W=56, H=20;
+    int left=(DN_COLS-W)/2, top=(DN_ROWS-H)/2;
+    int wtop=top+4, brow=top+H-3;
+    int m=(opt_defmachine>=0&&opt_defmachine<N_MACHINES)?opt_defmachine:0;
+    if(slot<0 || slot>=(int)ROM_PG_N) return;
+    if(!rom_port_ok()) return;             /* v303: та же охрана и то же сообщение, что у всех правок ПЗУ */
+
+    romset_rescan_sync();                            /* v303: пересканировали - обновили и список пункта [50] */
+    /* Список этого диалога = «(FROM SET)» + одностраничные файлы. Строим отдельно от g_rs_name,
+       чтобы не портить список набора, который живёт в пункте [50]. */
+    const char* lst[ROMSET_MAX+1]; const char* lkind[ROMSET_MAX+1]; int ln=0;
+    lst[ln] = "(FROM SET)"; lkind[ln] = ""; ln++;
+    /* v305: рядом с именем - ТИП СТРАНИЦЫ по её содержимому. Слот подписан смыслом («ROM slot 2
+       (TR-DOS)»), и владелец должен видеть, кладёт он туда то, что слот ждёт, или что-то другое. */
+    for(int i=1;i<g_rs_n && ln<=ROMSET_MAX;i++) if(g_rs_pages[i]==1){
+        lkind[ln] = rom_kind_label(g_rs_kind[i]); lst[ln] = g_rs_name[i]; ln++;
+    }
+
+    int current=0;
+    if(g_mp[m].rom[slot][0]) for(int i=1;i<ln;i++) if(!cicmp(lst[i], g_mp[m].rom[slot])){ current=i; break; }
+    /* v0.15.303 МЁРТВОЕ НАЗНАЧЕНИЕ. Назначенный файл могли удалить с карты - тогда его нет и в
+       списке, current остаётся 0, и условие «выбор отличается от текущего» не срабатывало: пункт
+       «(FROM SET)» не делал НИЧЕГО. Слот навсегда показывал мёртвое имя и ругался при каждой
+       перезаливке. Снятие назначения обязано работать безусловно. */
+    int dead = (g_mp[m].rom[slot][0] && current==0) ? 1 : 0;
+
+    int rcur=current, rmode=current, first=0, focus=FOC_LIST, result=-1;
+    box_push(left, top, W+2, H+1);
+    dn_win_draw(left,top,W,H,TITLE[slot]);
+    dn_puts(left+3,top+2,"16K files from 0:/ROMS/   Enter=load",DNK_DLG_FG,DNK_DLG_BG);
+    { static const char* const kb[5][2]={
+        {"Enter","Load"},{"Space","Select"},{"PgUp/Dn","Page"},{"Home/End","First/last"},{"Esc","Cancel"}
+      }; dn_keybar(kb,5); }
+
+    while(result<0){
+        if(rcur<first) first=rcur;
+        if(rcur>=first+VROWS) first=rcur-VROWS+1;
+        if(first>ln-VROWS) first=ln-VROWS;
+        if(first<0) first=0;
+
+        dn_fill(left+2,wtop,W-4,VROWS,DNK_DLG_BG);
+        for(int row=0;row<VROWS;row++){
+            int i=first+row;
+            if(i>=ln) break;
+            dn_radio(left+4,wtop+row,lst[i],i==rmode,focus==FOC_LIST&&i==rcur,0);
+            dn_puts(left+ROMDLG_KINDX,wtop+row,lkind[i],DNK_HEADER,DNK_DLG_BG);   /* v305: тип страницы */
+        }
+        { char a[12],b[12]; itoa_u((unsigned)(rcur+1),a); itoa_u((unsigned)ln,b);
+          int x=left+W-12; dn_fill(x,top+2,9,1,DNK_DLG_BG);
+          dn_puts(x,top+2,a,DNK_DLG_FG,DNK_DLG_BG); x+=slen(a);
+          dn_putc(x++,top+2,'/',DNK_DLG_FG,DNK_DLG_BG);
+          dn_puts(x,top+2,b,DNK_DLG_FG,DNK_DLG_BG); }
+        { int bw=12,gap=4,total=(bw+1)+gap+(bw+1),bx=left+(W-total)/2;
+          dn_fill(left+1,brow,W-2,2,DNK_DLG_BG);
+          dn_button(bx,brow,"Load",focus!=FOC_CANCEL,bw);
+          dn_button(bx+bw+1+gap,brow,"Cancel",focus==FOC_CANCEL,bw); }
+
+        int k=get_keysym_blocking();
+        if(k==K_ESC){ result=0; break; }
+        if(k==K_TAB){ focus=(focus+(g_kb_shift?NFOC-1:1))%NFOC; continue; }
+        if(k==K_ENTER){
+            if(focus==FOC_LIST) rmode=rcur;
+            result=(focus==FOC_CANCEL)?0:1;
+            break;
+        }
+        switch(focus){
+        case FOC_LIST:
+            if(k==K_UP){ if(rcur>0) rcur--; }
+            else if(k==K_DOWN){ if(rcur<ln-1) rcur++; else focus=FOC_LOAD; }
+            else if(k==K_PGUP){ rcur-=VROWS; if(rcur<0) rcur=0; }
+            else if(k==K_PGDN){ rcur+=VROWS; if(rcur>=ln) rcur=ln-1; }
+            else if(k==K_HOME){ rcur=0; }
+            else if(k==K_END){ rcur=ln-1; }
+            else if(k==K_RIGHT){ focus=FOC_LOAD; }
+            rmode=rcur;                                  /* курсор = отложенный выбор, машину пока не трогаем */
+            break;
+        case FOC_LOAD:
+            if(k==K_SPACE){ result=1; }
+            else if(k==K_RIGHT){ focus=FOC_CANCEL; }
+            else if(k==K_LEFT||k==K_UP){ focus=FOC_LIST; }
+            break;
+        case FOC_CANCEL:
+            if(k==K_SPACE){ result=0; }
+            else if(k==K_LEFT){ focus=FOC_LOAD; }
+            else if(k==K_UP){ focus=FOC_LIST; }
+            break;
+        }
+    }
+    box_pop();
+    dn_keybar_browser();
+    /* v0.15.401: меню больше НЕ закрываем - фон подменю лежит в стеке и цел (прежде здесь
+       стояло g_menu_close=1, потому что окно занимало слот подменю). */
+    if(result==1 && (rmode!=current || (rmode==0 && dead))){
+        { int i=0; const char* s = (rmode>0) ? lst[rmode] : "";      /* пункт 0 = снять назначение */
+          for(; s[i] && i<ROMSET_NAMEL-1; i++) g_mp[m].rom[slot][i]=s[i];
+          g_mp[m].rom[slot][i]=0; }
+        /* Снятое назначение обязано стереть и «что лежало»: страницу сейчас перезальёт набор, а
+           если набора нет - там останется прежнее содержимое, и старое имя в строке было бы враньём.
+           Что реально ляжет, впишет обратно сама заливка. */
+        g_pg_file[slot][0]=0;
+        if(g_tape_on) tape_stop();                       /* смена ПЗУ = сброс машины (как в apply_romset) */
+        rom_reapply_and_reset();
+    }
+}
+static void rom_slot0_dialog(void){ rom_slot_dialog(0); }
+static void rom_slot1_dialog(void){ rom_slot_dialog(1); }
+static void rom_slot2_dialog(void){ rom_slot_dialog(2); }
+static void rom_slot3_dialog(void){ rom_slot_dialog(3); }
 /* Build "0:/dir/name" into out from curpath + a leaf name. */
 static int path_of(char* out,const char* nm){
     int p=0; for(int i=0;curpath[i]&&p<190;i++) out[p++]=curpath[i];
@@ -5105,6 +13016,7 @@ static void copy_resolve(const char* typed, int group, char* destdir, int ddsz, 
     }
 }
 static void rename_selected(void){
+    tv_fs_touch();
     if(fcount==0 || bcursor<0 || bcursor>=fcount) return;
     if(selcount()>1){ group_copy_move(1, "Rename/Move"); return; }   /* multiple tagged -> group move via the shared dialog */
     const char* nm=flist[bcursor];
@@ -5168,7 +13080,7 @@ static void rename_selected(void){
 static int dn_confirm(const char* title, const char* msg){
     int W=DLG_W, H=8, left=(DN_COLS-W)/2, top=(DN_ROWS-H)/2, brow=top+5;
     int focus=0, result=-1;                        /* focus: 0=No, 1=Yes */
-    box_backup(&g_bs[0], left, top, W+2, H+1);
+    box_push(left, top, W+2, H+1);
     dn_win_draw(left,top,W,H,title);
     { static const char* const kb[2][2]={{"Enter","OK"},{"Esc","Cancel"}}; dn_keybar(kb,2); }
     int bw=8, gap=4, total=(bw+1)+gap+(bw+1), bx=left+(W-total)/2;
@@ -5191,54 +13103,26 @@ static int dn_confirm(const char* title, const char* msg){
             continue;
         }
         uint32_t code=d&0xFFu; int rel=(d&0x200u)!=0; int rising=kbd_note(code,rel);
-        if(code==0xF0u||code==0xE0u || rel) continue;
+        if(rel) continue;   /* v175: префиксы свёрнуты в kbd_data_read */
         if(code==SC_ESC){ if(rising) result=0; continue; }
         if(code==SC_ENTER||code==SC_SPACE){ if(rising) result=focus; continue; }
         if(code==SC_LEFT||code==SC_RIGHT||code==0x0Du){            /* Left/Right/Tab: toggle Yes/No */
             focus^=1; dn_button(bx,brow,"Yes",focus==1,bw); dn_button(bx+bw+1+gap,brow,"No",focus==0,bw); continue; }
         { char ch=sc_to_ascii(code, g_kb_shift); if(ch=='y'){ result=1; } else if(ch=='n'){ result=0; } }
     }
-    box_restore(&g_bs[0]);
+    box_pop();
     dn_keybar_browser();
     return result==1;
 }
 static int dn_confirm_delete(const char* title, const char* prefix, const char* filename){
-    int W=DLG_W, H=9, left=(DN_COLS-W)/2, top=(DN_ROWS-H)/2, brow=top+6;
-    int focus=0, result=-1;                        /* focus: 0=No, 1=Yes */
-    box_backup(&g_bs[0], left, top, W+2, H+1);
-    dn_win_draw(left,top,W,H,title);
-    { static const char* const kb[2][2]={{"Enter","OK"},{"Esc","Cancel"}}; dn_keybar(kb,2); }
-    int bw=8, gap=4, total=(bw+1)+gap+(bw+1), bx=left+(W-total)/2;
-    dn_button(bx,          brow, "Yes", focus==1, bw);
-    dn_button(bx+bw+1+gap, brow, "No",  focus==0, bw);
-    int pre_len=slen(prefix), fn_len=slen(filename), innerW=W-4, mx=left+2, scroll=(fn_len>innerW), off=0, drawn=-999;
-    XTime last=0;
-    dn_puts(left+(W-pre_len)/2, top+2, prefix, DNK_DLG_FG, DNK_DLG_BG);
-    while(result<0){
-        if(off!=drawn){
-            drawn=off;
-            dn_fill(left+1, top+4, W-2, 1, DNK_DLG_BG);
-            if(scroll){ int show=off; if(show>fn_len-innerW) show=fn_len-innerW; dn_putsn(mx, top+4, filename+show, innerW, DNK_DLG_FG, DNK_DLG_BG); }
-            else        dn_puts(left+(W-fn_len)/2, top+4, filename, DNK_DLG_FG, DNK_DLG_BG);
-        }
-        KBD_HB=1; player_pump(); pump_autoadvance();               /* keep audio going while the box is up */
-        uint32_t d=KBD_DATA;
-        if(d&0x100u){                                              /* idle: advance the marquee on a timer */
-            if(scroll){ XTime now; XTime_GetTime(&now); if(last==0) last=now;
-                if((uint64_t)(now-last) > (uint64_t)COUNTS_PER_SECOND/4){ last=now; off++; if(off > fn_len-innerW+4) off=0; } }
-            continue;
-        }
-        uint32_t code=d&0xFFu; int rel=(d&0x200u)!=0; int rising=kbd_note(code,rel);
-        if(code==0xF0u||code==0xE0u || rel) continue;
-        if(code==SC_ESC){ if(rising) result=0; continue; }
-        if(code==SC_ENTER||code==SC_SPACE){ if(rising) result=focus; continue; }
-        if(code==SC_LEFT||code==SC_RIGHT||code==0x0Du){            /* Left/Right/Tab: toggle Yes/No */
-            focus^=1; dn_button(bx,brow,"Yes",focus==1,bw); dn_button(bx+bw+1+gap,brow,"No",focus==0,bw); continue; }
-        { char ch=sc_to_ascii(code, g_kb_shift); if(ch=='y'){ result=1; } else if(ch=='n'){ result=0; } }
-    }
-    box_restore(&g_bs[0]);
-    dn_keybar_browser();
-    return result==1;
+    TV_Dialog d;
+    tv_dialog_init(&d, title, 52, 9);
+    tv_dialog_add_label(&d, 3, 2, prefix, DNK_DLG_FG);
+    tv_dialog_add_label(&d, 3, 4, filename, DNK_HOTKEY);
+    tv_dialog_add_button(&d, " Yes ", TV_RES_YES);
+    tv_dialog_add_button(&d, " No  ", TV_RES_NO);
+    int res = tv_dialog_exec(&d);
+    return (res == TV_RES_YES);
 }
 /* Append a leaf name to a "0:/dir" buffer in place -> "0:/dir/leaf" (returns new length). */
 static int path_join(char* buf, int len, const char* leaf){
@@ -5271,12 +13155,12 @@ static void pg_set_item(const char* name){
 static void pg_open(const char* title){
     g_pg_left=(DN_COLS-PG_W)/2; g_pg_top=(DN_ROWS-PG_H)/2;
     g_pg_pct=-1; g_pg_abort=0; g_pg_paused=0;
-    box_backup(&g_bs[0], g_pg_left, g_pg_top, PG_W+2, PG_H+1);
+    box_push(g_pg_left, g_pg_top, PG_W+2, PG_H+1);
     dn_win_draw(g_pg_left,g_pg_top,PG_W,PG_H,title);
     pg_draw_bar(); pg_draw_buttons();
     { static const char* const kb[2][2]={{"P","Pause"},{"Esc","Cancel"}}; dn_keybar(kb,2); }
 }
-static void pg_close(void){ box_restore(&g_bs[0]); dn_keybar_browser(); }
+static void pg_close(void){ box_pop(); dn_keybar_browser(); }
 static void pg_tick(void){
     int pct = g_pg_total ? (int)((g_pg_done*100u)/g_pg_total) : 100; if(pct>100)pct=100;
     if(pct!=g_pg_pct){ g_pg_pct=pct; pg_draw_bar(); }
@@ -5332,34 +13216,17 @@ static int copy_verify(const char* src, const char* dst){
    CPM_SKIP (the action), or -1 to cancel the whole operation. "For all" latches g_copy_askall.
    46 cells wide so box_backup/restore covers it (it sits over the progress dialog). */
 static int copy_ask_conflict(const char* dst){
-    const int W=46, H=9, left=(DN_COLS-W)/2, top=(DN_ROWS-H)/2;
-    const char* names[3]={"Overwrite","Skip","Cancel"};
-    const int  bwid[3]={13,8,10};   /* = label+4 -> face==bwid, so advancing by bwid+1 keeps the gaps equal */
-    int focus=0, forall=0, result=-2;
-    box_backup(&g_bs[1], left, top, W+2, H+1);
-    dn_win_draw(left,top,W,H,"File exists");
-    dn_putsn(left+3,top+2, base_name(dst), W-6, DNK_DLG_FG, DNK_DLG_BG);
-    { static const char* const kb[3][2]={{"Enter","Choose"},{"Tab","Next"},{"Esc","Cancel"}}; dn_keybar(kb,3); }
-    while(result==-2){
-        dn_check(left+3, top+4, "Apply to all remaining", forall, focus==3, 0);
-        { int gap=3, total=(bwid[0]+1)+gap+(bwid[1]+1)+gap+(bwid[2]+1), bx=left+(W-total)/2;
-          dn_fill(left+1, top+6, W-2, 2, DNK_DLG_BG);
-          dn_button(bx, top+6, names[0], focus==0, bwid[0]); bx+=bwid[0]+1+gap;
-          dn_button(bx, top+6, names[1], focus==1, bwid[1]); bx+=bwid[1]+1+gap;
-          dn_button(bx, top+6, names[2], focus==2, bwid[2]); }
-        int k=get_keysym_blocking();
-        if(k==K_ESC){ result=-1; break; }
-        if(k==K_TAB){ focus=(focus+(g_kb_shift?3:1))%4; continue; }
-        if(k==K_LEFT){ if(focus>0 && focus<=2) focus--; continue; }
-        if(k==K_RIGHT){ if(focus<2) focus++; continue; }
-        if(k==K_UP){ if(focus==3) focus=0; continue; }
-        if(k==K_DOWN){ if(focus<3) focus=3; continue; }
-        if(k==K_SPACE && focus==3){ forall=!forall; continue; }
-        if(k==K_ENTER || k==K_SPACE){ result=(focus==0)?CPM_OVERWRITE:(focus==1)?CPM_SKIP:-1; break; }
-    }
-    box_restore(&g_bs[1]);
-    if(result>=0 && forall) g_copy_askall=result;
-    return result;
+    static int forall = 0;
+    TV_Dialog d;
+    tv_dialog_init(&d, "File exists", 52, 10);
+    tv_dialog_add_label(&d, 3, 2, base_name(dst), DNK_HEADER);
+    tv_dialog_add_check(&d, 3, 4, "Apply to all remaining", &forall);
+    tv_dialog_add_button(&d, "Overwrite", CPM_OVERWRITE);
+    tv_dialog_add_button(&d, " Skip ",    CPM_SKIP);
+    tv_dialog_add_button(&d, "Cancel",    -1);
+    int res = tv_dialog_exec(&d);
+    if(res >= 0 && forall) g_copy_askall = res;
+    return res;
 }
 
 static int copy_file_pg(const char* src, const char* dst){   /* 1=copied, 2=skipped, 0=fail, -1=abort; honours g_copy_mode */
@@ -5490,22 +13357,28 @@ static void stop_if_playing_snapshot(void){
     for(int i=0;i<g_snc;i++) if(cicmp(g_snm[i], pn)==0 && cicmp(curpath, play_dir)==0){
         player_stop(); playing_idx=-1; g_music_path[0]=0; apply_music_halt(); return; }
 }
-/* DN Copy/Move dialog (issue #19): 78x15 modal - target path + 6 conflict-mode radios + 3 option
+/* DN Copy/Move dialog (issue #19): 74x16 modal - target path + 6 conflict-mode radios + 3 option
    checkboxes + OK/Cancel, one linear Tab focus ring. Fills dst plus *removesrc and *checkfree and
-   sets g_copy_mode / g_copy_verify; returns 1=OK, 0=Cancel. Repaints the navigator on close (a full
-   redraw is allowed for a closing modal), since 78 cells exceed the BoxSave width. */
+   sets g_copy_mode / g_copy_verify; returns 1=OK, 0=Cancel.
+   🥇 v0.15.404: окно живёт по ОБЩЕМУ правилу каркаса - фон в стеке (`box_push`/`box_pop`). Раньше
+   оно было единственным исключением: фон не сохранялся, а закрытие делало полную перерисовку канвы
+   («78 клеток шире буфера BoxSave» - причина устарела, с v0.15.231 буфер накрывает всю канву).
+   Из-за исключения между стиранием этого окна и открытием окна прогресса лежала перерисовка всего
+   списка, и в этот промежуток экран был без обоих окон - владелец видел «окно исчезло, а прогресс
+   бежал», причём через раз, потому что это вопрос момента. */
 static int copy_move_dialog(char* dst, int dstsz, int* removesrc, int* checkfree, const char* deftitle){
-    enum { FOC_FIELD=0, FOC_RADIO, FOC_CHECK, FOC_OK, FOC_CANCEL, NFOC };
+    enum { FOC_FIELD=0, FOC_TREE, FOC_RADIO, FOC_CHECK, FOC_OK, FOC_CANCEL, NFOC };
     enum { CFL_CHECKFREE=1, CFL_REMOVE=2, CFL_VERIFY=4 };
-    const int W=78, H=15, left=(DN_COLS-W)/2, top=(DN_ROWS-H)/2;
-    const int fx=left+2, fy=top+2, fw=W-4;               /* target-path field spans the window width */
+    const int W=74, H=16, left=(DN_COLS-W)/2, top=(DN_ROWS-H)/2;
+    const int fx=left+2, fy=top+2, fw=W-8;              /* leave room for [Tree] button */
     const char* rlab[6]={"Overwrite","Append","Resume","Skip","Refresh","Ask"};
     const char* clab[3]={"Check free space","Remove source (Move)","Verify writes"};
-    int rcol=left+3, ccol=left+42, wtop=top+6, brow=top+12;   /* two columns: radios | checkboxes */
+    int rcol=left+3, ccol=left+42, wtop=top+6, brow=top+13;   /* two columns: radios | checkboxes */
     int len=slen(dst), cur=len, foff=0;
     int focus=FOC_FIELD, rcur=g_copy_defmode, rmode=g_copy_defmode, ccur=0;
     int cflags=(*removesrc)?CFL_REMOVE:0;
     int result=-1;
+    box_push(left, top, W+2, H+1);               /* v0.15.404: как все окна - фон в стеке */
     dn_win_draw(left,top,W,H,deftitle);          /* caller's caption: "Copy" (F5) or "Rename/Move" (F6) */
     dn_puts(left+2,top+1,"Target folder:",DNK_DLG_FG,DNK_DLG_BG);
     dn_puts(rcol,top+4,"On name clash:",DNK_DLG_FG,DNK_DLG_BG);
@@ -5515,6 +13388,7 @@ static int copy_move_dialog(char* dst, int dstsz, int* removesrc, int* checkfree
         if(cur<foff) foff=cur; if(cur>=foff+fw) foff=cur-fw+1; if(foff<0) foff=0;
         for(int i=0;i<fw;i++){ int idx=foff+i; unsigned ch=(idx<len)?(unsigned char)dst[idx]:' ';
             int isc=(focus==FOC_FIELD)&&idx==cur; dn_putc(fx+i,fy,ch, isc?DNK_FLD_BG:DNK_FLD_FG, isc?DNK_FLD_FG:DNK_FLD_BG); }
+        dn_picker_btn(fx+fw+1, fy, focus==FOC_TREE);
         for(int i=0;i<6;i++) dn_radio(rcol, wtop+i, rlab[i], i==rmode, focus==FOC_RADIO && i==rcur, 0);
         for(int i=0;i<3;i++) dn_check(ccol, wtop+i, clab[i], (cflags>>i)&1, focus==FOC_CHECK && i==ccur, 0);
         { int bw=10, gap=4, total=(bw+1)+gap+(bw+1), bx=left+(W-total)/2; dn_fill(left+1,brow,W-2,2,DNK_DLG_BG);
@@ -5522,16 +13396,29 @@ static int copy_move_dialog(char* dst, int dstsz, int* removesrc, int* checkfree
         int k=get_keysym_blocking();
         if(k==K_ESC){ result=0; break; }
         if(k==K_TAB){ focus=(focus+(g_kb_shift?NFOC-1:1))%NFOC; continue; }
-        if(k==K_ENTER){ if(focus==FOC_RADIO) rmode=rcur; result=(focus==FOC_CANCEL)?0:1; break; }
+        if(k==K_ENTER && focus!=FOC_TREE){ if(focus==FOC_RADIO) rmode=rcur; result=(focus==FOC_CANCEL)?0:1; break; }
         switch(focus){
         case FOC_FIELD:
             if(k==K_LEFT){ if(cur>0) cur--; }
-            else if(k==K_RIGHT){ if(cur<len) cur++; }
+            else if(k==K_RIGHT){ if(cur<len) cur++; else focus=FOC_TREE; }
             else if(k==K_HOME){ cur=0; }
             else if(k==K_END){ cur=len; }
             else if(k==K_DOWN){ focus=FOC_RADIO; }
             else if(k==K_BACK){ if(cur>0){ for(int i=cur-1;i<len;i++) dst[i]=dst[i+1]; len--; cur--; } }
             else if(k>=0x20 && k<0x7F && len<dstsz-1){ for(int i=len;i>=cur;i--) dst[i+1]=dst[i]; dst[cur]=(char)k; len++; cur++; }
+            break;
+        case FOC_TREE:
+            if(k==K_SPACE || k==K_ENTER){
+                if(tv_browse_dialog(dst, dstsz, TV_BROWSE_DIR, NULL)){
+                    len = slen(dst); cur = len;
+                }
+                dn_win_draw(left,top,W,H,deftitle);
+                dn_puts(left+2,top+1,"Target folder:",DNK_DLG_FG,DNK_DLG_BG);
+                dn_puts(rcol,top+4,"On name clash:",DNK_DLG_FG,DNK_DLG_BG);
+                dn_puts(ccol,top+4,"Options:",DNK_DLG_FG,DNK_DLG_BG);
+            }
+            else if(k==K_LEFT){ focus=FOC_FIELD; }
+            else if(k==K_DOWN){ focus=FOC_RADIO; }
             break;
         case FOC_RADIO:                                      /* cursor moves the highlight; (*) is set only by Space */
             if(k==K_UP){ if(rcur>0) rcur--; else focus=FOC_FIELD; }
@@ -5559,7 +13446,7 @@ static int copy_move_dialog(char* dst, int dstsz, int* removesrc, int* checkfree
     }
     if(result==1){ g_copy_mode=rmode; g_copy_defmode=rmode; g_copy_verify=(cflags&CFL_VERIFY)?1:0;
                    *removesrc=(cflags&CFL_REMOVE)?1:0; *checkfree=(cflags&CFL_CHECKFREE)?1:0; }
-    render_browser();     /* full repaint clears the 78-cell modal (wider than a BoxSave) */
+    box_pop();            /* v0.15.404: вернуть ровно то, что было под окном - без пустого экрана */
     return result==1;
 }
 /* Group copy (removesrc=0) or move (removesrc=1) of the snapshot to a destination folder, one bar for all. */
@@ -5881,7 +13768,7 @@ static void choose_play_mode(void){
     int choice=opt_playmode;        /* choice: the currently focused row (where the cursor bar is) */
     int temp_mode=opt_playmode;     /* temp_mode: the currently checked radio button (where the (*) is) */
     int focus=0, result=-1;         /* focus: 0=RadioGroup, 1=OK, 2=Cancel */
-    box_backup(&g_bs[0], left, top, W+2, H+1);
+    box_push(left, top, W+2, H+1);
     dn_win_draw(left,top,W,H,"Play Mode");
     { static const char* const kb[3][2]={{"Enter","OK"},{"Tab","Next"},{"Esc","Cancel"}}; dn_keybar(kb,3); }
     static const char* const modes[5][2] = {
@@ -5915,7 +13802,7 @@ static void choose_play_mode(void){
             continue;
         }
         uint32_t code=d&0xFFu; int rel=(d&0x200u)!=0; int rising=kbd_note(code,rel);
-        if(code==0xF0u||code==0xE0u || rel) continue;
+        if(rel) continue;   /* v175: префиксы свёрнуты в kbd_data_read */
         if(code==SC_ESC){ if(rising) result=0; continue; }
         if(code==SC_ENTER){
             if(rising){
@@ -5977,7 +13864,7 @@ static void choose_play_mode(void){
             continue;
         }
     }
-    box_restore(&g_bs[0]);
+    box_pop();
     dn_keybar_browser();
     if(result==1){
         g_music_last_pct=0xFFFFFFFFu; g_music_last_sec=0xFFFFFFFFu;
@@ -5996,7 +13883,7 @@ static void choose_sort_mode(void){
     static const int idx2mode[4] = {0,3,2,1};              /* radio row -> sortmode code (NAME=0 EXT=3 SIZE=2 DATE=1) */
     int cur=0; for(int i=0;i<4;i++) if(idx2mode[i]==sortmode) cur=i;   /* start on the current field */
     int mark=cur, desc=g_sort_desc, focus=0, result=-1;    /* focus: 0=radio 1=Descending 2=OK 3=Cancel */
-    box_backup(&g_bs[0], left, top, W+2, H+1);
+    box_push(left, top, W+2, H+1);
     dn_win_draw(left,top,W,H,"Sort files");
     { static const char* const kb[4][2]={{"Enter","OK"},{"Tab","Next"},{"Space","Set"},{"Esc","Cancel"}}; dn_keybar(kb,4); }
     while(result<0){
@@ -6027,7 +13914,7 @@ static void choose_sort_mode(void){
         bcursor=0; btop=0; sel_scroll=0; last_scroll=0;
         render_browser();                                  /* new order + clears the dialog */
     } else {
-        box_restore(&g_bs[0]);
+        box_pop();
     }
     dn_keybar_browser();
 }
@@ -6052,6 +13939,13 @@ static void app_dispatch(int cmd){
         case cmFileMkdir:
             mkdir_selected();
             break;
+        case cmFileSdInfo: sd_info_dialog(); break;
+        case cmFileNemoIde:     tv_nemo_ide_dialog(); break;
+        case cmFileZController: tv_zcontroller_dialog(); break;
+        case cmFileDivMMC:      tv_divmmc_dialog(); break;              /* v227: Files -> Info about card */
+        case cmOptRomBanks:     tv_rom_set_dialog(); break;      /* v384: файл ПЗУ, его банки, раскладка */
+        case cmFileViewImg: image_view_dialog(); break;          /* v228: каталог образа */
+        case cmFileNewTrd:  trd_create_dialog(); break;          /* v228: пустой образ */
         case cmFileSort:                                         /* Files -> Sort: field + direction dialog */
             choose_sort_mode();
             break;
@@ -6060,7 +13954,7 @@ static void app_dispatch(int cmd){
                 g_sort_desc = !g_sort_desc;
                 sort_entries(); remap_playing_idx();
                 bcursor=0; btop=0; sel_scroll=0; last_scroll=0; scroll_started=0;
-                if(browser_on) dn_draw_list();
+                if(browser_on){ dn_draw_list(); dn_sort_ind(); }   /* v250: и букву в рамке */
             }
             break;
         case cmOptSave:
@@ -6110,24 +14004,27 @@ static void menu_open_sub(MenuState* st, int* lvl){
     if (c->left + c->W > DN_COLS - 2) c->left = DN_COLS - 2 - c->W;
     if (c->top + c->H > DN_ROWS - 1)  c->top  = DN_ROWS - 1 - c->H;
     if (c->top < 1) c->top = 1;
-    box_backup(&g_bs[1], c->left, c->top, c->W + 2, c->H + 1);
+    box_push(c->left, c->top, c->W + 2, c->H + 1);
     menubox_render(c->menu, c->cur, c->left, c->top, c->W, c->H);
     *lvl = 1;
 }
 /* A value-item changed: if it re-sorted the list (SORT), show the new order live UNDER the open
    boxes - invalidate the stale snapshots, redraw the list, re-capture + re-render every level.
    Otherwise repaint just the changed row. */
+/* v0.15.401: глубина стека, на которой стоит выпадашка меню. Нужна пересохранению уровней:
+   уровень L меню живёт на g_menu_box_base + L, а не в слоте номер L. */
+static int g_menu_box_base = 0;
 static void menu_value_changed(MenuState* st, int lvl){
     if (g_menu_restructure) {                /* machine switch changed the Machine submenu item set: recompute geometry + full re-render */
         g_menu_restructure = 0; g_list_dirty = 0; g_alpha_dirty = 0;
-        g_bs[0].valid = 0; g_bs[1].valid = 0; render_browser();
+        render_browser();
         for (int L = 0; L <= lvl; L++) {
             menubox_size(st[L].menu, &st[L].W, &st[L].H);
             if (st[L].cur >= st[L].menu->count) st[L].cur = st[L].menu->count - 1;
             if (st[L].left + st[L].W > DN_COLS - 2) st[L].left = DN_COLS - 2 - st[L].W;
             if (st[L].top + st[L].H > DN_ROWS - 1) st[L].top = DN_ROWS - 1 - st[L].H;
             if (st[L].top < 1) st[L].top = 1;
-            box_backup(&g_bs[L], st[L].left, st[L].top, st[L].W + 2, st[L].H + 1);
+            box_recapture(g_menu_box_base + L, st[L].left, st[L].top, st[L].W + 2, st[L].H + 1);
             menubox_render(st[L].menu, st[L].cur, st[L].left, st[L].top, st[L].W, st[L].H);
         }
         return;
@@ -6135,10 +14032,9 @@ static void menu_value_changed(MenuState* st, int lvl){
     if (g_list_dirty || g_alpha_dirty) {
         int full = g_alpha_dirty;                /* alpha touches EVERY background cell -> full browser repaint */
         g_list_dirty = 0; g_alpha_dirty = 0;
-        g_bs[0].valid = 0; g_bs[1].valid = 0;
         if (full) render_browser(); else dn_draw_list();
         for (int L = 0; L <= lvl; L++) {
-            box_backup(&g_bs[L], st[L].left, st[L].top, st[L].W + 2, st[L].H + 1);
+            box_recapture(g_menu_box_base + L, st[L].left, st[L].top, st[L].W + 2, st[L].H + 1);
             menubox_render(st[L].menu, st[L].cur, st[L].left, st[L].top, st[L].W, st[L].H);
         }
     } else {
@@ -6149,9 +14045,33 @@ static void menu_value_changed(MenuState* st, int lvl){
 
 static void menuitem_enter(const MenuItem* it, MenuState* st, int lvl){
     menu_item* vit = it->value;
-    if (vit && vit->action) vit->action();     /* any value-item with an action -> open its modal dialog (MP3 sens, machine select) */
+    /* v0.15.305: у пункта «по Enter» сначала ПРИМЕНЯЕМ то, что владелец уже выбрал стрелками.
+       Порядок именно такой: у части таких пунктов есть ещё и модальный диалог (набор ПЗУ, выбор
+       машины), и открыть его поверх неприменённого выбора значило бы молча этот выбор потерять. */
+    if (vit && menuitem_deferred(vit) && menuitem_pending(vit)) {
+        g_pend_it = 0;                          /* применяем - откатывать больше нечего */
+        if (vit->onchange) vit->onchange();
+    }
+    else if (vit && vit->action) vit->action();/* any value-item with an action -> open its modal dialog (MP3 sens, machine select) */
     else if (vit) menuitem_value_cycle(it, +1);
     menu_value_changed(st, lvl);
+}
+
+/* v0.15.334 ПОДСКАЗКА К СТРОКЕ МЕНЮ. Собственной строки подсказок у движка меню нет: нижняя строка
+   занята ключами F1..F10 (dn_keybar), и отдавать её под пояснения нельзя. Поэтому объяснение идёт в
+   строку СОСТОЯНИЯ - ту же, где движок уже пишет «ENTER = APPLY   ESC = CANCEL».
+   Строку трогаем только тогда, когда есть что сказать, и обязательно возвращаем ей обычное
+   содержимое, уходя с пункта: подсказка от соседней строки, оставшаяся висеть, врёт ровно так же,
+   как молчание, от которого мы уходим. Флаг нужен, чтобы не перерисовывать строку на каждом нажатии
+   стрелки там, где подсказок нет вовсе. */
+static int g_menu_hint = 0;
+static void menu_row_hint(const MenuState* s){
+    if(!s || !s->menu) return;
+    const MenuItem* it = &s->menu->items[s->cur];
+    const menu_item* vit = (it->name && !it->disabled) ? it->value : 0;
+    const char* w = (vit && vit->vwhy) ? vit->vwhy() : 0;
+    if(w){ dn_status_msg(w); g_menu_hint = 1; }
+    else if(g_menu_hint){ g_status_force = 1; dn_draw_status(); g_status_force = 0; g_menu_hint = 0; }
 }
 
 static int menubar_exec(int start){
@@ -6161,6 +14081,7 @@ static int menubar_exec(int start){
     int ret = 0;
 
     g_menu_open = 1;                       /* suppress marquee/list redraws beneath the dropdowns */
+    g_menu_box_base = box_depth();         /* v0.15.401: с какой глубины стека начинается наше меню */
 
     while (!done) {
         MenuState st[2];                   /* level 0 = bar dropdown, level 1 = nested submenu */
@@ -6176,8 +14097,15 @@ static int menubar_exec(int start){
             st[0].top = 1;
             if (st[0].left + st[0].W > DN_COLS - 2) st[0].left = DN_COLS - 2 - st[0].W;   /* keep box + shadow on-canvas */
             if (st[0].left < 0) st[0].left = 0;
-            box_backup(&g_bs[0], st[0].left, st[0].top, st[0].W + 2, st[0].H + 1);
+            box_push(st[0].left, st[0].top, st[0].W + 2, st[0].H + 1);
             menubox_render(st[0].menu, st[0].cur, st[0].left, st[0].top, st[0].W, st[0].H);
+            /* v0.15.399: вернуться на ТОТ ЖЕ уровень, а не только на полосу. Флаг снимаем сразу -
+               спуск нужен один раз, при возврате из окна, а не на каждом переходе по полосам. */
+            if (g_menu_redescend) {
+                const MenuItem* rit = &st[0].menu->items[st[0].cur];
+                g_menu_redescend = 0;
+                if (rit->name && rit->sub && !rit->disabled) menu_open_sub(st, &lvl);
+            }
         }
 
         int in_menu = 1;
@@ -6189,12 +14117,12 @@ static int menubar_exec(int start){
                     if (dropped) {
                         const MenuItem* it = &s->menu->items[s->cur];
                         menu_item* vit = (it->name && !it->disabled) ? it->value : 0;
-                        if (vit && vit->kind==ITEM_RANGE) {
+                        if (vit && menuitem_arrows(vit)) {
                             menuitem_value_cycle(it, -1);
                             menu_value_changed(st, lvl);
                             break;
                         } else if (lvl > 0) {
-                            box_restore(&g_bs[1]); lvl = 0;
+                            box_pop(); lvl = 0;
                             break;
                         }
                     }
@@ -6206,7 +14134,7 @@ static int menubar_exec(int start){
                     if (dropped) {
                         const MenuItem* it = &s->menu->items[s->cur];
                         menu_item* vit = (it->name && !it->disabled) ? it->value : 0;
-                        if (vit && vit->kind==ITEM_RANGE) {
+                        if (vit && menuitem_arrows(vit)) {
                             menuitem_value_cycle(it, +1);
                             menu_value_changed(st, lvl);
                             break;
@@ -6231,10 +14159,12 @@ static int menubar_exec(int start){
                     do {
                         next = (next + (k == K_DOWN ? 1 : s->menu->count - 1)) % s->menu->count;
                     } while (!s->menu->items[next].name && next != s->cur);
+                    menu_pend_revert();          /* v305: ушли со строки - неприменённый выбор отменён */
                     s->cur = next;
                     s->menu->deflt = next;
                     menubox_draw_row(s->menu, s->cur, s->left, s->top, s->W, old_cur);
                     menubox_draw_row(s->menu, s->cur, s->left, s->top, s->W, s->cur);
+                    menu_row_hint(s);            /* v0.15.334: пояснение к пункту, если оно у него есть */
                     break;
                 }
                 case K_SPACE: {
@@ -6257,8 +14187,8 @@ static int menubar_exec(int start){
                 }
                 case K_ESC:
                     if (dropped) {
-                        if (lvl > 0) { box_restore(&g_bs[1]); lvl = 0; }
-                        else { box_restore(&g_bs[0]); dropped = 0; in_menu = 0; }
+                        if (lvl > 0) { box_pop(); lvl = 0; }
+                        else { box_pop(); dropped = 0; in_menu = 0; }
                     } else {
                         ret = 0; done = 1; in_menu = 0;
                     }
@@ -6290,9 +14220,11 @@ static int menubar_exec(int start){
                                 if (h >= 'a' && h <= 'z') h -= 32;
                                 if (h != (char)uk) continue;
                                 int old_cur = s->cur;
+                                menu_pend_revert();   /* v305: прыжок по горячей букве - тот же уход со строки */
                                 s->cur = i; s->menu->deflt = i;
                                 menubox_draw_row(s->menu, s->cur, s->left, s->top, s->W, old_cur);
                                 menubox_draw_row(s->menu, s->cur, s->left, s->top, s->W, s->cur);
+                                menu_row_hint(s);    /* v0.15.334: прыжок по горячей букве - тот же приход на строку */
                                 if (it->sub && lvl == 0) menu_open_sub(st, &lvl);
                                 else if (it->value) { menuitem_enter(it, st, lvl); }
                                 else if (it->cmd) { ret = it->cmd; done = 1; in_menu = 0; }
@@ -6303,13 +14235,29 @@ static int menubar_exec(int start){
                     break;
                 }
             }
+            /* v0.15.399 ОДНА ТОЧКА ЗАПИСИ: откуда ушли за диалогом. Команду возвращают несколько
+               ветвей (Enter, горячая буква, и может добавиться ещё) - запись в каждой из них
+               гарантированно однажды будет пропущена: на плате это уже случилось, меню вернулось
+               на чужую полосу. Здесь путь один для всех. */
+            if (ret) { g_menu_last_bar = bar; g_menu_last_lvl = lvl; }
             if (g_menu_close) { g_menu_close = 0; done = 1; in_menu = 0; }
         }
-        if (dropped) { box_restore(&g_bs[1]); box_restore(&g_bs[0]); }
+        /* v305: выход из выпадашки (Esc, F9/F12, переход на соседний пункт бара, закрытие модалкой) -
+           последняя точка, где можно отменить неприменённое. Пропустить её значит оставить в opt_*
+           значение, которого нет в машине, и записать его в ini первым же «Save config». */
+        menu_pend_revert();
+        /* v0.15.401: свернуть РОВНО то, что открыли сами (раньше было два безусловных
+           восстановления по номерам слотов). */
+        while (box_depth() > g_menu_box_base) box_pop();
     }
     g_list_dirty = 0; g_alpha_dirty = 0;
     g_menu_open = 0;
-    if (g_menu_f12) { g_menu_f12 = 0; close_osd(); return ret; }
+    g_menu_hint = 0;                       /* v0.15.334: меню закрыто - подсказки больше нет, строку
+                                              состояния возвращает общий перерисовщик ниже */
+    if (g_menu_f12 || g_ui_abort) {          /* v348: сюда же приходит и глобальный выход по F12 */
+        g_menu_f12 = 0; g_ui_abort = 0; g_ui_abort_n = 0;
+        close_osd(); return ret;
+    }
     if (browser_on) render_browser();      /* full repaint on menu close: guarantees no dropdown/shadow residue on the frame */
     return ret;
 }
@@ -6318,9 +14266,27 @@ static void run_menu_system(void) {
     if (!osd_on || !browser_on) {
         return;                         /* "ф9 при скрытом навигаторе пусть ничего не вызывает" */
     }
+    /* 🥇 v0.15.399 ESCAPE ИЗ ЛЮБОГО ОКНА = НА ОДИН УРОВЕНЬ НАЗАД, А НЕ ИЗ ВСЕГО МЕНЮ (просьба
+       владельца: «закрыл настройки одного дискового контроллера - и чтобы открыть соседний, надо
+       проходить весь путь заново»). Пункт-команда закрывает меню по построению - иначе окно
+       рисовалось бы поверх выпадающего списка, - поэтому меню открывается СНОВА, на той же полосе;
+       курсор внутри помнит сама таблица (Menu.deflt), так что возвращаемся ровно туда, откуда ушли.
+       Условие возврата - ДВА ПРИЗНАКА, и оба про каркас, а не про конкретную команду: показалось
+       ли модальное окно (`g_modal_seq`) и остался ли навигатор на экране. Никаких списков команд:
+       список устаревает молча, и первый же новый диалог опять начал бы выбрасывать из меню - в
+       v398 именно так и получилось, а в v399 остался перечень команд-действий, который владелец
+       законно назвал тем же «индивидуальным кодом на каждое место». */
     int cmd = menubar_exec(-1);         /* -1 = highlight bar, but do not drop down automatically */
 
-    if (cmd > 0) app_dispatch(cmd);     /* dispatch onto the VISIBLE browser (never onto a hidden canvas) */
+    while (cmd > 0) {
+        int      bar  = g_menu_last_bar;        /* полоса, из которой ушли: туда и вернёмся */
+        unsigned seq0 = g_modal_seq;
+        app_dispatch(cmd);              /* dispatch onto the VISIBLE browser (never onto a hidden canvas) */
+        if (g_modal_seq == seq0) break;         /* окна не было - и возвращаться не из чего */
+        if (!osd_on || !browser_on) break;      /* окно увело с навигатора (запуск машины, справка) */
+        g_menu_redescend = (g_menu_last_lvl > 0);
+        cmd = menubar_exec(bar);
+    }
     /* cancelled (Esc / repeated F9): the NAVIGATOR STAYS on screen (owner 2026-07-06) -
        only the menu goes away; Esc from the browser is what returns to the machine. */
 }
@@ -6328,7 +14294,10 @@ static void run_menu_system(void) {
 /* (the legacy modal Options dialog is gone: settings live in the Options > Settings nested dropdown) */
 static void open_help(void){ browser_on=0; opt_on=0; show_help(); OSD_CTRL=(OSD_CTRL|1u)&~2u; osd_on=1; osd_view=2; render_pause_sign(); }
 static void open_view(int v){ if(v==1) open_osd(); else if(v==2) open_help(); else if(v==3) open_browser(); }
-static void toggle_view(int v){ if(osd_view==v) close_osd(); else open_view(v); }
+static void toggle_view(int v){
+    kbd_state_clear();                    /* v0.15.191: граница фокуса - «зажатое» больше не переживает вход/выход из оверлея */
+    if(osd_view==v) close_osd(); else open_view(v);
+}
 
 /* ---- Step 13.1: full pause -------------------------------------------------------------------
    Pause asserts HALT (CONTROL bit0). HALT gates pe3M5_core, which freezes the Z80 AND the AY /
@@ -6343,26 +14312,78 @@ static void apply_halt(void){            /* single owner of IJ_CTRL bit0 (HALT) 
     else IJ_CTRL = 0;                                       /* release only when no source remains */
 }
 static void fabric_reinit_after_reload(void){
+    /* 🥇 v343 ПОСЛЕ PCAP КАРТА DivMMC ПУСТАЯ. Проверено приборно 14.08: сразу после `fs cmd 9`
+       регистры карты читаются нулями (DMMC_CTL = 0, DMMC_CAP = 0) - карта НЕ ВСТАВЛЕНА, и машина
+       получает 0xFF на любую команду. Прошивка при этом считала её запрограммированной
+       (`g_dm_prog` пережил перезагрузку ядра) и молча ничего не делала. На глаз это «esxDOS не
+       видит карту после смены ядра», причём приборы оболочки показывают том смонтированным.
+       Признак наличия карты в ядре тоже кэшируется - у нового ядра он другой, сбрасываем. */
+    g_dm_prog = 0;
+    g_dm_cap_ok = -1;
     /* The PL just came up blank after a PCAP core-reload (cmd 9): every GP0 register is at reset
        default. Cold-boot the current machine (HALT -> latch MACHINE_CFG -> reset+wipe -> release),
        then re-push every live register the fabric lost. Mirrors apply_machine()'s first-apply path
        but is self-contained (apply_machine's `applied` static would treat this as a no-wipe reapply). */
+    /* v0.15.200: возможности фабрики у РАЗНЫХ ядер разные (CE28 собирает кадр клавиатуры сам, старый
+       ZX B0064 - нет). Кэш признаков обязан умереть вместе со старым битстримом, иначе после смены
+       машины ARM будет читать бит10 у ядра, которое его не выставляет. */
+    g_kbd_cooked = -1;  g_joy_cap = -1;  g_km_cap = -1;   /* v304: и порты мыши - тоже свойство ЯДРА */
+    /* v211: JOY_STATE is a fabric register and was just reset to zero.  Invalidate the ARM-side
+       write cache too, otherwise an unchanged NumLock/Kempston state is never re-pushed after PCAP
+       (the keypad appears dead until the next key or option change). */
+    g_joy_last = 0xFFFFFFFFu;
+    g_km_last  = 0xFFFFFFFFu;   /* v304: слово мыши фабрика тоже потеряла - перезаписать целиком */
     IJ_CTRL = 1;                                                     /* HALT before latching mode */
     for(volatile uint32_t t=0; t<8000000u && !(IJ_STAT & 1u); t++){}
+    /* v0.15.207: битстрим только что поднялся, значит в ПЗУ фабрики снова ЗАВОДСКОЕ содержимое
+       ($readmemh из битстрима) - залитый набор PCAP-ом потерян. Признаки сбрасываем и перезаливаем
+       набор этой машины, иначе после смены ядра машина молча уедет на ПЗУ Sinclair, а прошивка будет
+       считать, что стоит пентагоновское (и держать поднятым бит5 трапа в пустую страницу). */
+    g_rom_loaded = 0; g_trdos_ok = 0; g_svc_ok = 0; g_svc_entry = 0;   /* v388 */
+    rom_pg_forget();                                                 /* v302: в страницах снова заводское - слоты пусты */
     MACHINE_CFG = machine_cfg_word();                                /* latch model + 48K ULA phase while frozen */
     machine_reset();                                                 /* reset+wipe with the mode already latched */
+    { int m=(opt_defmachine>=0&&opt_defmachine<N_MACHINES)?opt_defmachine:0;
+      if((g_mp[m].romset[0] || rom_slots_any(m)) && (LOAD_CAPS_R & LOADCAP_ROM)){
+          rom_load_set(g_mp[m].romset);                              /* не romset_apply(): тот умеет pl_reload -> рекурсия.
+                                                                        Слоты этой машины rom_load_set накладывает сам. */
+          MACHINE_CFG = machine_cfg_word();
+      } }
+    /* v0.15.303: строки слотов ПЗУ и признак «группа ROM недоступна» - тоже состояние, потерянное
+       вместе с прошлым битстримом. Без синхронизации слоты рисуются пустыми (g_pg_file только что
+       обнулил rom_pg_forget), а гашение группы остаётся ВЧЕРАШНИМ - от ядра, которого уже нет.
+       Зовём ПОСЛЕ заливки: строка обязана показывать результат, а не намерение. */
+    rom_slots_ui_sync();
     apply_halt();                                                    /* release per halt_src (normally 0) */
     
     /* Restore the OSD frame buffer base address to resolve the digital noise */
     OSD_DDR_BASE = OSDC_ADDR;
     
-    apply_pint(); apply_paper(); apply_crop(); apply_scr();          /* re-push fabric-only live registers */
+    apply_pint(); apply_paper(); apply_crop(); scr_view_sync(); apply_scr();  /* re-push fabric-only live registers (view <- this machine first) */
     apply_pos();  apply_dim();   apply_vol();
     apply_fast(); apply_tapesync(); apply_tape_snd(); apply_tapemute();
 
     /* Restore diagnostic registers */
     WARP_HOLD = 0;
     SYNC_HOLD = 1024u;
+
+    /* v0.15.201 (совет консулов 02.08, подтверждено чтением кода). После PCAP-перезагрузки ЯДРА все
+       регистры фабрики стоят в сбросе, и `OSD_CTRL` тоже - слои выключены. А флаги оболочки
+       (`osd_on`/`browser_on`/`osd_view`) переживают перезагрузку как были. Получалась худшая из
+       комбинаций: навигатор НЕ ВИДЕН, но оболочка считает его открытым, поэтому `joymap_eval()`
+       законно держит `JOY_STATE` в нуле и клавиши уходят в интерфейс - со стороны это выглядит как
+       «джойстик умер и Start не работает» сразу после смены машины из меню. Возвращаем железу то
+       состояние, в котором оболочка себя считает. */
+    OSD_CTRL = (osd_view == 3) ? 2u : (osd_on ? 1u : 0u);
+    /* Звук: пока идёт лента, мьют машины держится этим регистром; после перезагрузки он тоже сброшен. */
+    AUDIO_CTRL = (g_tape_on && opt_tapemute) ? 1u : 0u;
+    /* 🥇 ЗДЕСЬ ИДЕНТИЧНОСТЬ БОЛЬШЕ НЕ УГАДЫВАЕТСЯ (v0.15.339). Стояло угадывание по VERSION - ради
+       `fs cmd 9`, который меняет битстрим мимо меню. Оно же ЗАТИРАЛО верное имя, только что поставленное
+       pl_reload: ядро MiSTer-48 опознавалось как Atlas, PCAP не делался, меню врало. (v340: номер версии
+       MiSTer-48 в дереве не менялся - 0xB01B0059, top:409; так ведёт себя ЛЮБОЙ битстрим, чей номер
+       прошивке незнаком, например MiSTer-ядро, собранное без дефайна MISTER48_CORE.) Теперь имя ставит
+       сам pl_reload - по пути файла, сверенному со словом семейства MACHINE_ID, - а он общий и для меню,
+       и для fs cmd 9 (там путь известен как `p1`), и для отката к заводскому ПЗУ. Доугадывать нечего. */
 }
 static void apply_music_halt(void){      /* music STARTED over a game -> HALT. SET-ONLY: pausing / stopping music
                                             NEVER un-halts (owner: un-pause is MANUAL only). The music-HALT is cleared
@@ -6431,7 +14452,37 @@ static void draw_mute_icon(int rx,int by,int H){
 static void render_pause_sign(void){
     int paused = (halt_src & 3u) ? 1 : 0;
     int show_tape = (g_tape_on && !browser_on && !opt_on);
+    /* v219: имя вставленной дискеты рядом с аппаратной иконкой дисковода (она в правом нижнем
+       углу кадра, 24x24 в точке 1240,680). Второй слой в фабрику НЕ добавляем: баннер один, а
+       пауза и вставленная дискета одновременно владельцу не нужны - решает приоритет. Пауза,
+       глушение и лента важнее, поэтому имя показываем только когда их нет. */
+    /* v220: у иконки показываем ПОСЛЕДНИЙ обслуженный привод с его буквой - именно его активность
+       иконка и отражает. Если он пуст (образ вынули), берём первый непустой. */
+    /* v221: КАЖДЫЙ привод на своей строке - «какой образ на какой букве» видно целиком, без обрезки.
+       Плоскость 64 px при масштабе 2 (16 px на строку) держит все четыре привода. Блок прижат к низу
+       плоскости, а сама плоскость - к иконке дисковода (её низ 704), поэтому надписи стоят ровно
+       рядом с иконкой. Приоритет прежний: пауза, глушение и лента важнее имени. */
+    int nmount = 0; for(int d=0;d<NDRV;d++) if(g_dopen[d] && g_dnm[d][0]) nmount++;
+    int show_disk = (nmount > 0 && !paused && !g_mute && !show_tape);
     ban_select(); ban_clear();
+    if(show_disk){
+        int line = 0;
+        int y0 = BAN_H - 16 * nmount; if(y0 < 0) y0 = 0;
+        for(int d=0; d<NDRV; d++){
+            if(!g_dopen[d] || !g_dnm[d][0]) continue;
+            int nl = slen(g_dnm[d]); if(nl > 13) nl = 13;   /* 256 px / 16 = 16 знаков в масштабе 2 */
+            char s[17]; int k = 0;
+            s[k++] = DRV_LTR[d]; s[k++] = ':';
+            for(int i=0;i<nl;i++) s[k++] = g_dnm[d][i]; s[k] = 0;
+            draw_text(BAN_W - 8 - k * 8 * 2, y0 + 16 * line, 2, s);
+            line++;
+        }
+        osd_select();
+        ban_blit();
+        BAN_POS = (640u<<16) | 976u;   /* низ плоскости 704 = низ иконки; 976+256 = 1232, иконка с 1240 */
+        BAN_CTRL = 1;
+        return;
+    }
     if(!paused && !g_mute && !show_tape){ ban_blit(); BAN_CTRL = 0; return; }          /* neither -> hide the plane */
     int sc=3, H=8*sc, by=(BAN_H-H)/2;
     if(show_tape) by = 0;                                    /* shift PAUSE/MUTE up to make room for tape bar */
@@ -6472,7 +14523,31 @@ static void render_pause_sign(void){
 /* Step 15: within the ZX family (MACHINE_ID stays 0x...5A58) the MODEL is the ARM-selected machine
    (opt_defmachine drives MACHINE_CFG); label accordingly. Cross-family cores will key off MACHINE_ID. */
 static const char* machine_name(void){ return (opt_defmachine==1) ? "PENTAGON 1024K" : (opt_defmachine==3) ? "ZX SPECTRUM 48K (MiSTer)" : (opt_defmachine==2) ? "ZX SPECTRUM 48K (Atlas)" : "ZX SPECTRUM 128K"; }
-static const char* machine_type(void){ return (opt_defmachine==1) ? "PENT 1024" : (opt_defmachine==3) ? "ZX 48K MR" : (opt_defmachine==2) ? "ZX 48K" : "ZX 128K"; }
+/* v0.15.172 (owner: "the machine type in the navigator's top row is still wrong"). The old chain of
+   ternaries had NO case for machine 4, so the NES fell through to the "ZX 128K" default. A TABLE indexed
+   by the machine makes a missing label impossible: adding a machine to CH_MACHINE without a short label
+   would not compile-check, but the index is now the single source of truth and stays in step. */
+static const char* const MACHINE_SHORT[] = {"ZX 128K", "PENT 1024", "ZX 48K", "ZX 48K MR", "NES"};
+/* 🥇 v0.15.397 ОБЪЁМ ОЗУ В ИМЕНИ МАШИНЫ - ЖИВОЙ, А НЕ ЗАШИТЫЙ (задание владельца).
+   В таблице выше объём стоит строкой, и при `RAM size = 512K` шапка всё равно уверяла «1024» - ложь
+   в самом заметном месте интерфейса. Объём машины у нас настройка (`opt_ramsize` -> `RAMSIZE_CFG` ->
+   `MACHINE_CFG [16:14]`), и знать его глазами важно: софт ведёт себя по-разному, и «щелчки в
+   SAA-тесте» однажды объяснялись ровно тем, что машина стояла в 128К вместо мегабайта.
+   Собираем имя из ТОЙ ЖЕ настройки, что уходит в фабрику - тогда шапка не может разойтись с
+   железом. У 48К и NES объём не настраивается, их имена берём как есть. */
+static const char* machine_type(void){
+    static char nm[16];
+    int m = (opt_defmachine>=0 && opt_defmachine<N_MACHINES) ? opt_defmachine : 0;
+    if(m != 0 && m != 1) return MACHINE_SHORT[m];       /* 48К и NES - без объёма */
+    {   int r = (opt_ramsize >= 0 && opt_ramsize <= 3) ? opt_ramsize : 3;
+        const char* base = (m == 1) ? "PENT " : "ZX ";
+        int p = 0;
+        for(int i = 0; base[i] && p < (int)sizeof(nm) - 8; i++) nm[p++] = base[i];
+        for(int i = 0; CH_RAMSIZE[r][i] && p < (int)sizeof(nm) - 1; i++) nm[p++] = CH_RAMSIZE[r][i];
+        nm[p] = 0;                                     /* «PENT 1024K», «PENT 512K», «ZX 128K» */
+    }
+    return nm;
+}
 static void update_banner(void){         /* on state change: refresh ALL dynamic player-window regions */
     ban_scroll = 0; ban_last_scroll = 0; ban_scroll_started = 0;
     render_pause_sign();                   /* banner plane = machine-pause sign only (track/app info live in the DDR windows) */
@@ -6577,6 +14652,8 @@ static int audio_irq_init(void){
     return 1;
 }
 
+#include "net_kvm.c"   /* v0.15.233: веб-КВМ (экран + клавиатура), опрос без прерываний */
+
 void main(void){
     /* D-cache ON. boot.S enables caches+MMU; assert them here (the old code disabled D-cache to
        dodge an unaligned-buffer SD bug - now every DMA buffer is 32-byte aligned instead). The fast
@@ -6619,18 +14696,64 @@ void main(void){
 
     osd_clear(); osd_blit();          /* clean buffer, overlay starts off */
     close_osd();                      /* F12 opens it */
+    /* v360: том DivMMC поднимается лениво и заведомо ПОЗЖЕ старта машины - взводим признак, и
+       служба отдаст машине чистый старт, как только карта будет готова. */
+    /* 🥇 v0.15.300 ВИНЧЕСТЕР ВКЛЮЧЁН ПО УМОЛЧАНИЮ - И ДЕФОЛТ ЖИВЁТ В ПРОФИЛЕ МАШИНЫ, а не только в
+       opt_ide: живое значение опции берёт mp_load() из g_mp[]. Стоять он обязан СТРОГО до
+       config_load - тогда ini, где ключ `<тег>.ide` уже есть, перекроет его своим значением, и
+       осознанное «OFF» владельца переживёт обновление прошивки. Машины 0..2 - это ядро Atlas, в
+       котором и живёт блок NEMO; у MiSTer-48 (3) и NES (4) его нет вовсе, и включать там опцию
+       значило бы обещать несуществующее железо. Путь к образу берётся из ini (`<тег>.idefile`),
+       пустой = наш дефолт 0:/HDD.HDF (см. ide_img_path). */
+    for(int _m = 0; _m < 3; _m++) g_mp[_m].ide = 1;
     config_load();                    /* mount SD + read 0:/bulbulator.ini (fills g_mp[] per machine; defaults if absent) */
+    joy_policy_migrate();             /* v210: ZX=one NumPad-only Kempston; NES maps remain isolated */
+    scr_migrate_ini();                /* v170: pre-scale ini -> that machine's screen geometry back to defaults */
+    { const char* id = core_id_from_machid(MACHINE_ID);      /* v0.15.144: опознать ПРОШИТОЕ ядро, чтобы apply_machine
+                                                                 делал PCAP только на настоящей смене ядра.
+                                                                 v0.15.340: спрашиваем СЛОВО СЕМЕЙСТВА (0x60) - оно не
+                                                                 зависит от номера сборки, поэтому подъём версии ядра
+                                                                 опознание больше не ломает. Догадка по VERSION
+                                                                 осталась запасной - для ядер без этого слова.
+                                                                 Дальше по жизни имя ставит pl_reload по пути файла. */
+      g_cur_core = id ? id : core_id_from_version(REG_VERSION); }
+    /* v159: make the MACHINE setting truthful at boot - follow the core the BOOT image actually
+       configured (banner showed "ZX 128K" over a live NES core). NO boot-time reload; the user
+       can still switch machines from the menu as usual. */
+    if(cicmp(machine_core(opt_defmachine), g_cur_core) != 0){
+        if(!cicmp(g_cur_core,"NES"))           opt_defmachine = 4;
+        else if(!cicmp(g_cur_core,"MISTER48")) opt_defmachine = 3;
+        else if(opt_defmachine > 2)            opt_defmachine = 0;   /* ATLAS in PL, ini wanted NES/MiSTer -> ZX 128K */
+    }
+    /* 🥇 ЖИВЫЕ opt_* ВСЕГДА ПРИНАДЛЕЖАТ opt_defmachine - поэтому машину выбираем ДО mp_load.
+       Раньше опознание ядра стояло НИЖЕ, и порядок был обратный: сначала грузили профиль машины
+       из ini, потом молча меняли номер машины под прошитое ядро, а профиль не перегружали
+       (в apply_machine перезагрузка живёт только в ветке `changed`, а на старте changed = 0).
+       Итог: живые настройки от одной машины, номер - от другой, и первый же `mp_store` при выходе
+       записывал чужие числа в чужой слот. Улика 13.08: 0:/INI_B130_AUTOSAVE.BAK, где в zx128
+       лежат crop/paper/joymap/ide машины zx48mr. */
+    /* v349: старый ГЛОБАЛЬНЫЙ ключ snow= применяем только к машинам, у которых своего ключа в
+       файле не было. Иначе он затирал бы пер-машинные значения: в ini он стоит НИЖЕ секций машин,
+       и порядок разбора сыграл бы против нас. */
+    /* v352: Пентагон исключён - глобальный ключ старых конфигов включал ему снег, которого у него
+       нет. Свой ключ pent1024.snow= (если владелец его поставит) по-прежнему главнее. */
+    { int _m; for(_m = 0; _m < N_MACHINES; _m++)
+          if(_m != MACH_PENT1024 && !(g_snow_seen & (1u << _m))) g_mp[_m].snow = opt_snow ? 1 : 0; }
     mp_load(opt_defmachine);          /* Step 15: load the boot machine's OWN param set (INT/paper/crop) -> opt_* */
     apply_pint();                     /* Step 15: this machine's Pentagon INT position (from ini or default) */
     apply_paper();                    /* Step 15: this machine's paper position within frame */
-    apply_scr();                      /* Step 15: whole-frame HDMI position (GLOBAL) */
+    scr_view_sync(); apply_scr();     /* v157: per-machine whole-frame HDMI position */
+    /* v0.15.202: вызов ПЕРЕЕХАЛ ниже, за apply_machine(). Здесь он стоял ДО коррекции машины по
+       реально прошитому ядру и до PCAP-перезагрузки: если ini просил NES, а в ПЛИС лежал ZX, мы
+       стримили 160 КБ картриджа в несуществующие регистры — «автозагрузка не работает». */
     apply_crop();                     /* Step 15: this machine's display crop */
     apply_fast();                     /* Step 15: fast-load (warp) enable (GLOBAL tape-service) */
     apply_tapesync();                 /* Step 15: SYNC LOADER (demand tape) from ini */
     machine_menu_sync();              /* Step 15: Machine submenu = current machine's param set */
-    { uint32_t cv = REG_VERSION & 0xFFFFu;                 /* v0.15.144: identify the FLASHED core so apply_machine only PCAP-reloads on a real core change */
-      g_cur_core = (cv == 0x0059u) ? "MISTER48" : (cv == 0xCE08u) ? "NES" : "ATLAS"; }
+    /* v0.15.341: блок опознания ядра и исправления машины ПЕРЕЕХАЛ ВЫШЕ, к mp_load - см. там. */
     apply_machine();                  /* Step 15: apply the saved default machine (Pentagon timing bit) at boot; v144: PCAP-reload core if the default machine needs a different one */
+    /* v0.15.202: картридж грузим ТОЛЬКО когда машина уже выбрана правильно и её ядро поднято. */
+    if(opt_defmachine==4 && g_nesboot[0] && sd_mounted) nes_load(g_nesboot);   /* v159: default cart on NES boot */
     apply_dim();                      /* push the loaded dimming level to OSD_OP */
     apply_vol();                      /* push the loaded volume level to VOL_REG */
     /* Step 14 DDR true-colour OSD bring-up: draw the Winamp-classic canvas + enable the layer. */
@@ -6652,6 +14775,13 @@ void main(void){
     /* Flush scancodes buffered before this controller came up (keys pressed during PL config /
        ARM reload) plus the init's own ACK/BAT bytes, so the OSD always starts closed. */
     while(!(KBD_DATA & 0x100u)) { /* pop+discard until empty */ }
+    /* v0.15.215: kbd_init() deliberately ends with every LED off after its ready blink, but
+       opt_numjoy has already been restored from this machine's INI above.  Without restoring the
+       indicator here the logical mode could start ON while the NumLock lamp showed OFF: the first
+       press then correctly turned the mode OFF (lamp stayed dark), and only the second press looked
+       as if it worked.  The LED is an indicator, not the source of truth, so mirror the loaded mode
+       once the keyboard reset and the pre-boot FIFO flush are complete. */
+    kbd_leds_set(kbd_led_mask());
 
     /* Force clean state for tuner and player after reflash (prevents stuck tuner or auto-play) */
     OSD_CTRL &= ~2u;
@@ -6675,10 +14805,44 @@ void main(void){
        deadman edge-detector would miss a tight burst of kicks) and no blocking I/O on this path. */
     /* All keys route through the shared key-down table (kbd_note): single-shot keys fire on the
        rising edge, nav keys repeat on every make; the same table backs the modal get_keysym_blocking. */
+    ph_init();                        /* v297: пофазный секундомер - до первого прохода */
+    menu_index_audit();               /* v0.15.185: таблица опций не должна молча съезжать под строками меню */
+    menu_height_audit();              /* v0.15.292: и ни одно меню не должно перерастать канву */
     for(;;){
         KBD_HB = 1;                   /* pet the deadman every iteration (single write per pass) */
-        g_kbd_diag = KBD_DIAG;        /* Step 15: mirror PS/2 parity-error + auto-resend counters (JTAG-readable) */
+        /* v0.15.195 ТЕЛЕМЕТРИЯ ПРИТОРМАЖИВАНИЙ. Владелец: «срабатывания клавиш нечёткие, но
+           периодически, а не постоянно». Механизм известен и записан в этом же файле: RX PS/2
+           гейтится на время host-TX, а последовательность «префикс + код» рвётся, если цикл встал
+           между кадрами. Значит надо не гадать, а измерить САМИ ПРИТОРМАЖИВАНИЯ: длину прохода
+           цикла. Дальше видно, кто виноват - fs_service (мейлбокс с хоста), player_pump (музыка),
+           отрисовка навигатора или трафик JTAG. Считаем только проходы длиннее 1 мс, чтобы не
+           тратить деление на каждом проходе. */
+        { static XTime lp_prev = 0; XTime lp_now; XTime_GetTime(&lp_now); g_loop_n++;
+          if(lp_prev){
+              uint64_t d = (uint64_t)(lp_now - lp_prev);
+              if(d > (uint64_t)(COUNTS_PER_SECOND/1000u)){
+                  uint32_t us = (uint32_t)((d * 1000000ull) / (uint64_t)COUNTS_PER_SECOND);
+                  if(us > g_loop_max_us) g_loop_max_us = us;
+                  if(us > 4000u)  g_loop_gt4++;
+                  if(us > 15000u) g_loop_gt15++;
+              }
+          }
+          lp_prev = lp_now; }
+        /* v0.15.193 ОТКАТ ОПАСНОЙ ЭВРИСТИКИ v186 (моя регрессия, стоила владельцу «Start не нажимается»).
+           В v186 я сбрасывал таблицу зажатых клавиш при КАЖДОМ изменении KBD_DIAG, считая это счётчиком
+           ошибок чётности PS/2. На ZX так и есть, но НА NES регистр 0xB8 занят под отладку памяти ядра
+           (`bulbulator_nes_top.v`: `.kbd_diag_i(nes_dbg2)`) и тикает непрерывно -> таблица чистилась на
+           КАЖДОМ проходе главного цикла, и кнопка жила меньше миллисекунды вместо кадра. Меню иногда
+           успевало поймать нажатие, а последовательность «нажми Start -> отпусти Start» не срабатывала
+           никогда: игра вставала на экране номера уровня. Семантика 0xB8 машинно-зависима, поэтому
+           строить на ней логику ввода нельзя вообще. Зажатое чистим по ЯВНЫМ границам: смена фокуса
+           оверлея и запуск рома (v191/v192), плюс срок годности префикса E0 (v192). */
+        /* v0.15.200: когда у оболочки есть СВОЙ регистр (0x13C), берём числа оттуда - они одинаковы
+           на всех машинах. 0xB8 остаётся сырым машинно-зависимым словом (на NES - отладка памяти ядра). */
+        g_kbd_diag = (g_kbd_cooked > 0) ? PS2_DIAG : KBD_DIAG;   /* зеркало для JTAG; решений на нём не строим */
         joymap_eval();                /* v137: и на отпускания без новых нажатий */
+        kmouse_eval();                /* v304: разгон мыши считается по времени - служба обязана
+                                         крутиться и тогда, когда новых кадров клавиатуры нет */
         { static int dm_last=-999; if(dm_last==-999) dm_last=opt_defmachine;
           if(opt_defmachine!=dm_last){ dm_last=opt_defmachine; apply_machine(); } }  /* v137: KVM/JTAG-смена машины через guarded-переход */
         { static int ula_last=-999; if(ula_last==-999) ula_last=opt_ulalate;
@@ -6693,19 +14857,82 @@ void main(void){
           int _paused = (halt_src & 3u) ? 1 : 0;
           if(_paused != g_led_paused){                       /* pause state changed -> one LED command, once */
               g_led_paused = _paused;
-              kbd_set_leds(_paused ? 0x01u : 0x00u);         /* 0x01 = Scroll = right LED on when paused; all off when running */
+              kbd_set_leds(kbd_led_mask());                  /* v216: Scroll=pause, Num=NumPad owner */
           } }
         if(g_romtrap_on && (ROMTRAP & 1u)) romtrap_service();   /* #65: service a pending ROM-trap (fill block + resume 0x05E2) */
         if(g_autotrig){ g_autotrig=0; autoload_tape((const char*)g_autodir, (const char*)g_autoname); }  /* JTAG self-test (pokeable path) */
+        ph_mark(PH_MISC);             /* v297: закрыть шапку прохода */
+        /* v0.15.330: при живом GS — сначала карта (звук/протокол), потом дисковод.
+           A/B: ZYNAP/TR-DOS без стыков; Z-Player + disk_service first → реже gs_pump → стыки. */
+        dmmc_drain();                /* v423: ACK карте ДО gs_service — иначе сектор ждёт до 134 мс */
+        if(g_gs_live){
+            gs_service();
+            ph_mark(PH_GS);
+        }
+        disk_service();               /* v208: дисковод - подать сектор, если контроллер просит */
+        /* v245: метаданные FAT сбрасываем В ПРОСТОЕ. В обслуживании сектора этому не место -
+           сброс стоит десятки миллисекунд, а TR-DOS за это время даёт Force Interrupt. */
+        if(g_dsync_due && !(FDC_STAT & (FDCS_RD | FDCS_WR | FDCS_BUSY | FDCS_DRQ))){
+            int _d = g_drv_last;
+            if(_d >= 0 && _d < NDRV && g_dopen[_d]) f_sync(&g_dfil[_d]);
+            g_dsync_due = 0;
+        }
+        ph_mark(PH_SYNC);
+        { uint32_t _d = (FDC_STAT & FDCS_DRQ) ? 1u : 0u;   /* v235: фронты DRQ = сколько раз попросили байт */
+          if(_d && !g_drq_last) g_drq_edges++;
+          g_drq_last = _d; }
+        ph_mark(PH_DISK);
+        net_poll();                   /* v0.15.233: Ethernet опросом, НЕ прерыванием - ленточный ISR не трогаем */
+        ph_mark(PH_NET);
+        if(!g_gs_live){
+            gs_service();                 /* ленивый boot / карта выкл */
+            ph_mark(PH_GS);
+        }
+        nemo_service();               /* v283: NEMO-IDE - регистры в фабрике, диск здесь */
+        ph_mark(PH_IDE);
+        /* v0.15.348 ГЛОБАЛЬНЫЙ ВЫХОД ПО F12 - точка снятия флага. Раскрутка вложенных окон
+           заканчивается ЛИБО в обработчике меню, ЛИБО здесь: диалог мог быть открыт прямо из
+           навигатора, и меню в цепочке не было вовсе. Без этой ветки флаг остался бы поднятым и
+           следующий же диалог закрылся бы сам собой, не показавшись. */
+        if(g_ui_abort){ g_ui_abort = 0; g_ui_abort_n = 0; close_osd(); }
+        /* 🥇 v0.15.401 САМОИСЦЕЛЕНИЕ КАРКАСА. До главного цикла не доходят ни открытое меню, ни
+           модальное окно - значит здесь стек фонов ОБЯЗАН быть пуст. Непустой = кто-то не закрыл
+           своё окно, и следующее легло бы фоном поверх мусора: ровно так рождаются «артефакты на
+           экране», которые потом ищут глазами. Чиним и СЧИТАЕМ - прибор вместо жалобы. */
+        if(box_depth() != 0){
+            g_bst_leak += (unsigned)box_depth();
+            box_drop_to(0);
+            if(browser_on) render_browser();
+        }
+        dmmc_drain();                 /* v423: добрать то, что пришло за время GS; linger ловит пачку */
+        if(!(DMMC_STAT & (DMS_RQ_RD | DMS_RQ_WR))){
+            /* 100 мс без запроса: пауза между секторами кластера короче, сброс FAT — нет.
+               Раньше порог 5 мс попадал МЕЖДУ секторами mkdir и снова делал f_write на пути ACK. */
+            if(dm_wq_n > 0 && (uint32_t)(ph_ccnt() - dm_wq_acc) > (g_ph_1ms * 100u)){
+                int k;
+                for(k = 0; k < 4 && dm_wq_n > 0; k++){
+                    if(dm_stat_rq() & (DMS_RQ_RD | DMS_RQ_WR)) break;
+                    dm_wq_flush_one();
+                }
+            } else if(dm_wq_n == 0 && g_dm_sync_due && g_dm_img_open){
+                (void)f_sync(&g_dm_img);
+                g_dm_sync_due = 0;
+            }
+        }
+        divmmc_service();             /* v327 */
+        hard_reset_service();         /* v0.15.394: F11 перезапускает и General Sound */
         if(!g_tape_on) fs_service();  /* Step 15: JTAG file-manager (LIST/WRITE/DELETE/RENAME/MKDIR); deferred while a tape loads (polled FatFs, main-loop only) */
+        ph_mark(PH_FS);
         player_pump();                /* feed the audio FIFO when a music file is playing (no-op otherwise) */
         if(player_active() && !g_tape_on && browser_on){    /* music: DN status line (name / M:SS/M:SS / progress bar), updated on change */
             unsigned pct = player_progress(); if(pct>100u) pct=100u;
             unsigned el = player_elapsed_s();
             if(pct != g_music_last_pct || el != g_music_last_sec){ g_music_last_pct = pct; g_music_last_sec = el; dn_draw_status(); }
         }
+        ph_mark(PH_PLAY);
         tape_pump();                  /* feed the tape pulse FIFO while a .tap is loading (no-op otherwise) */
         if(g_tape_on && g_tape_fmt == 3) tape_pump(); /* extra pump for heavier MP3 decode path */
+        ph_mark(PH_TAPE);
         if(player_take_ended()) player_autoadvance();   /* track finished -> next per play mode (cursor follows) */
         /* During tape load (especially MP3), reduce drawing load so the pump + decode can keep the pulse ring fed.
            WAV is fast direct reads; MP3 decode + SD is heavier. */
@@ -6714,6 +14941,22 @@ void main(void){
             banner_scroll_tick();
         }
 
+        /* v0.15.198 ВЫЧЕРПЫВАЕМ FIFO ЦЕЛИКОМ, а не по одному кадру за проход.
+           Приборно (кольцо трассировки v197): кадры приходят пачками с паузой 3 МИКРОсекунды между
+           ними, хотя кадр PS/2 физически идёт ~1000 мкс. Значит это не клавиатура, а накопленная
+           очередь: пока проход цикла затягивался (отрисовка навигатора, бегущие строки, player_pump,
+           мейлбокс, а в модальном окне цикл не крутится вовсе), тайпматик-повторы копились в FIFO,
+           и разбирались потом залпом. Отпускание при этом стоит В ОЧЕРЕДИ ЗА повторами нажатия -
+           владелец описал это как «нажатия прилетают потом», а для машины это лишние кадры
+           удержания. У стрелки на одно нажатие 4-6 кадров (при включённом NumLock клавиатура шлёт
+           вокруг них «фальшивый Shift» E0 12), у клавиши цифрового блока - один: поэтому на стрелках
+           плохо, а на numpad заметно лучше. Ограничитель 32 кадра - чтобы поток клавиш не смог
+           запереть цикл; остальное разберётся следующим проходом.
+           Тело блока НЕ переотступлено намеренно: переотступ 120 строк спрятал бы саму правку в диффе. */
+        ph_mark(PH_NAV);
+        int kdrain_n = 0;
+        for(;;){
+        if(++kdrain_n > 32) break;                       /* предохранитель: не запирать главный цикл */
         uint32_t d = KBD_DATA;        /* atomic pop+read */
 
 
@@ -6726,20 +14969,52 @@ void main(void){
                     XTime_GetTime(&last_probe);
                 }
             }
-            continue;
+            break;                    /* v198: FIFO пуст - выходим из вычерпывания в главный цикл */
         }
+        if(kdrain_n > (int)g_kdrain_max) g_kdrain_max = (uint32_t)kdrain_n;   /* v198: телеметрия залпов */
         uint32_t code = d & 0xFFu;
         int release = (d & 0x200u) != 0;           /* bit9: this code is a release */
 
         /* Pause key: PS/2 set-2 sends its make as the byte run E1 14 77 (no auto-repeat). Match on
            code bytes - robust to the make/break flag; the break burst E1 F0 14 F0 77 self-cancels. */
         if(pst==1){ if(code==0x14u){ pst=2; continue; } pst=0; }
-        else if(pst==2){ pst=0; if(code==0x77u){ pause_toggle(); continue; } }
+        else if(pst==2){ pst=0; if(code==0x77u){ if(!release) pause_toggle(); continue; } }
+        /* v0.15.182 ПАУЗА ЗАЛИПАЛА. До v175 серия отпускания E1 F0 14 F0 77 сама рвала цепочку (кадры F0
+           доходили до матчера). v175 стал съедать F0 в kbd_data_read -> отпускание пришло как E1,14,77,
+           то есть КОД-В-КОД как нажатие, и делало второй тоггл: пауза либо не включалась вовсе, либо
+           застревала. Серию по-прежнему проглатываем целиком (иначе 14/77 утекут в таблицу клавиш),
+           но переключает состояние ТОЛЬКО нажатие. */
+        if(code==0x77u){                           /* v179: ОДИНОЧНЫЙ Num Lock (не часть Pause) = переключить
+                                                      владельца цифрового блока; лампочка = индикатор.
+                                                      Свой детектор фронта: kbd_note() здесь ещё не вызван,
+                                                      поэтому rising недоступен, а тайпматик ловить нельзя. */
+            /* v0.15.196: защёлка снимается ещё и по ДАВНОСТИ. Тайпматик повторяет удержание каждые
+               ~90 мс, поэтому 250 мс тишины = клавишу отпустили, а отпускание до нас не дошло
+               (раньше его съедало ожидание ACK - см. kbd_wait_byte). Без этого одна потеря делала
+               переключатель мёртвым до следующего случайного отпускания: «то с первого, то с 3 раза». */
+            static int nl_held = 0; static XTime nl_t = 0;
+            if(release){ nl_held = 0; }
+            else {
+                XTime nl_now; XTime_GetTime(&nl_now);
+                int nl_stale = nl_held && ((uint64_t)(nl_now - nl_t) > (uint64_t)(COUNTS_PER_SECOND/4u));
+                nl_t = nl_now;
+                if(!nl_held || nl_stale){
+                    nl_held = 1;
+                    opt_numjoy = !opt_numjoy; apply_numjoy();
+                    kbd_leds_set(kbd_led_mask());
+                    dn_status_msg(opt_numjoy ? "NUMPAD -> JOYSTICK" : "NUMPAD -> SHELL");
+                }
+            }
+            continue;
+        }
         if(code==0xE1u){ pst=1; continue; }
 
         int rising = kbd_note(code, release);      /* THE key-state update (shared with get_keysym_blocking) */
         joymap_eval();                             /* v137: обновить JOY_STATE по новой карте клавиш */
-        if(code==0xF0u || code==0xE0u) continue;   /* prefix frames */
+        if(numpad_is_joy(code)) continue;          /* v176: цифровой блок отдан джойстику - оболочка его не видит
+                                                      (joymap_eval выше уже учёл нажатие, g_kd тоже) */
+        if(!osd_on && !browser_on && !g_menu_open && !is_shell_fkey(code) && !is_shell_always(code)) continue;   /* v178/179: фокус в игре */
+        /* v175: префиксы свёрнуты в kbd_data_read - здесь их уже не бывает */   /* prefix frames */
         kb_alt = g_kd[0x11];                        /* Alt held (for Alt+F3) - from the one table */
 
         /* DN sort hotkeys: Ctrl+F3=name F4=ext F5=date F6=size; pressing the same field again reverses.
@@ -6750,33 +15025,76 @@ void main(void){
                 if(sortmode==nm) g_sort_desc=!g_sort_desc; else { sortmode=nm; g_sort_desc=0; }
                 sort_entries(); remap_playing_idx();
                 bcursor=0; btop=0; sel_scroll=0; last_scroll=0; dn_draw_list();
+                dn_sort_ind();            /* v250: обновить букву в рамке */
                 dn_status_msg(sort_label());
                 continue;
             }
         }
 
-        { int kbmod = g_kd[0x14] ? 1 : 0;                      /* DN dynamic hint bar: Ctrl held -> the sort F-keys */
+        /* v249: Alt тоже переключает подсказки. Раньше проверялся только Ctrl, поэтому Alt в
+           навигаторе не давал ни подсказок, ни комбинаций. */
+        { int kbmod = g_kd[0x11] ? 2 : (g_kd[0x14] ? 1 : 0);
           if(browser_on && kbmod!=g_kbar_mod){ dn_keybar_browser_mode(kbmod); g_kbar_mod=kbmod; } }
 
+        /* v250: Alt+B - диалог выбора сортировки, как в DN. */
+        if(rising && browser_on && !g_menu_open && g_kd[0x11] && code==0x32){   /* 0x32 = B */
+            app_dispatch(cmFileSort);
+            continue;
+        }
+        /* v249 ALT+БУКВА открывает меню - буква берётся из разметки заголовка (`~F~iles`).
+           Делаем до одиночных клавиш, чтобы Alt+F3 и подобные не перехватывались сортировкой. */
+        if(rising && browser_on && !g_menu_open && g_kd[0x11]){
+            char ch = sc_to_ascii(code, 0);
+            if(ch >= 'a' && ch <= 'z') ch = (char)(ch - 'a' + 'A');
+            if(ch){
+                int _hit = 0;
+                for(int _b=0; _b<g_bar_n; _b++){
+                    const char* ti = g_bar[_b].title;
+                    char hot = 0;
+                    for(int _i=0; ti[_i]; _i++) if(ti[_i]=='~'){ hot = ti[_i+1]; break; }
+                    if(hot >= 'a' && hot <= 'z') hot = (char)(hot - 'a' + 'A');
+                    if(hot && hot == ch){
+                        int cmd = menubar_exec(_b);
+                        if(cmd > 0) app_dispatch(cmd);
+                        _hit = 1;
+                        break;
+                    }
+                }
+                /* v252: съедать нажатие можно ТОЛЬКО если меню действительно открылось. Раньше
+                   `continue` стоял безусловно, и при зажатом (или залипшем) Alt любая буква
+                   молча пропадала - вместе с ней и все обычные команды навигатора. */
+                if(_hit) continue;
+            }
+        }
         /* single-shot action keys (rising edge only -> immune to typematic + to a modal eating the break) */
         if(code==SC_F10){ if(rising) pause_toggle(); continue; }                       /* Pause fallback */
         if(code==SC_F8){ if(rising && browser_on) delete_selected(); continue; }       /* F8: delete (DN-style) */
         if(code==SC_F6){ if(rising && browser_on) rename_selected(); continue; }       /* F6: rename / move */
         if(code==SC_F7){ if(rising && browser_on) mkdir_selected(); continue; }         /* F7: make directory */
+        /* v227: Ctrl+L - та же инфо-панель. Клавиша как в DN; свободных «чистых» F-клавиш у нас
+           уже нет, все F1..F12 заняты. 0x4B = скан-код L, 0x14 = Ctrl. */
+        if(code==0x4Bu && kbd_mod_held(0x14)){ if(rising && browser_on) sd_info_dialog(); continue; }
         if(code==SC_F11){ if(rising){ if(g_tape_on){ tape_stop(); if(browser_on) dn_draw_status(); }  /* F11 wipes the machine -> abort any in-flight tape load (don't keep feeding a just-reset machine) */
                                        g_app_stopped=1; update_banner(); } continue; }  /* hard reset marker */
-        if(code==SC_KPPLUS ){ if(g_kd[0x12]||g_kd[0x59]){ if(rising && browser_on) select_by_mask(1); }         /* Shift+KP+ : select by mask */
-                              else if(!release){ opt_vol+=5; if(opt_vol>100)opt_vol=100; if(g_mute){g_mute=0; update_banner();} apply_vol(); } continue; }  /* KP+ : volume up (unmutes) */
-        if(code==SC_KPMINUS){ if(g_kd[0x12]||g_kd[0x59]){ if(rising && browser_on) select_by_mask(0); }         /* Shift+KP- : unselect by mask */
-                              else if(!release){ opt_vol-=5; if(opt_vol<0)  opt_vol=0;   if(g_mute){g_mute=0; update_banner();} apply_vol(); } continue; }  /* KP- : volume down (unmutes) */
-        if(code==SC_KPMUL  ){ if(g_kd[0x12]||g_kd[0x59]){ if(rising && browser_on) invert_selection(); }        /* Shift+KP* : invert selection */
-                              else if(rising){ g_mute^=1; apply_vol(); update_banner(); } continue; }           /* KP* : global mute toggle (machine + player + tape) + on-screen speaker */
+        if(code==SC_KPPLUS ){ if((kbd_mod_held(0x12)||kbd_mod_held(0x59)) && browser_on){ if(rising) select_by_mask(1); }  /* Shift+KP+ в браузере : выделить по маске */
+                              else if(!release){ shell_vol_key(code); } continue; }   /* KP+ : громкость (снимает мьют) */
+        if(code==SC_KPMINUS){ if((kbd_mod_held(0x12)||kbd_mod_held(0x59)) && browser_on){ if(rising) select_by_mask(0); }  /* Shift+KP- в браузере : снять выделение */
+                              else if(!release){ shell_vol_key(code); } continue; }   /* KP- : громкость (снимает мьют) */
+        if(code==SC_KPMUL  ){ if((kbd_mod_held(0x12)||kbd_mod_held(0x59)) && browser_on){ if(rising) invert_selection(); } /* Shift+KP* в браузере : инвертировать */
+                              else if(rising){ shell_vol_key(code); } continue; }     /* KP* : общий мьют + значок динамика */
 
         if(release) continue;                       /* below: makes only */
         switch(code){
-            case SC_F1:    if(rising){ if(!browser_on) open_browser(); dn_help(); } break;   /* DN help window */
+            /* v225 (владелец): F1 показывает справку ТОЛЬКО при открытом навигаторе. Раньше он сам
+               открывал окно - то есть F1 при работающей машине выдёргивал её из полного экрана.
+               Теперь как у F5/F6/F7: клавиша живёт только внутри навигатора. */
+            case SC_F1:    if(rising && browser_on) dn_help(); break;
             case SC_F5:    if(rising && browser_on) copy_selected(); break;  /* F5: copy (navigator open) */
             case SC_F12:   if(rising) toggle_view(3); break;                 /* F12: hide / show the navigator */
+            /* v348: страховка главного цикла. Глобальный выход по F12 раскручивает вложенные окна,
+               отдавая им Escape, и заканчивается ЛИБО в обработчике меню, ЛИБО здесь - когда диалог
+               был открыт прямо из навигатора и меню в цепочке не было. Без этой ветки флаг остался бы
+               поднятым и следующий же диалог закрылся бы сам собой. */
             case SC_UP:    if(browser_on) browser_move(-1); break;           /* nav: typematic auto-repeat wanted */
             case SC_DOWN:  if(browser_on) browser_move(+1); break;
             case SC_PGUP:  if(browser_on) browser_move(-BROWS); break;       /* fast page scroll */
@@ -6803,5 +15121,8 @@ void main(void){
                              } break;
             default: break;           /* every other key belongs to the Z80 */
         }
+        }                             /* v198: конец вычерпывания FIFO */
+        ph_mark(PH_KBD);
+        if((g_loop_n & 511u) == 0u){ PH_M_PASS = g_loop_n; ph_flush(); }
     }
 }

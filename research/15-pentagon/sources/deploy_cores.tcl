@@ -57,8 +57,11 @@ run_cmd 5
 # 2. Write ATLAS.BIT.BIN
 write_file "0:/CORES/ATLAS.BIT.BIN" "/home/lavrinovich/bulb-v13/research/15-pentagon/bulbulator_zx_loader.bit.bin"
 
-# 3. Write NES.BIT.BIN
+# 3. Write MISTER48.BIT.BIN
+write_file "0:/CORES/MISTER48.BIT.BIN" "/home/lavrinovich/bulb-v13/research/15-pentagon/sources/build/bulbulator_zx_loader_mister48.bit.bin"
+
+# 4. Write NES.BIT.BIN
 write_file "0:/CORES/NES.BIT.BIN" "/home/lavrinovich/bulb-v13/research/15-pentagon/sources/build/bulbulator_zx_loader_nes.bit.bin"
 
-puts "CORES DEPLOYED SUCCESSFULLY"
+puts "ALL THREE CORES DEPLOYED SUCCESSFULLY"
 exit

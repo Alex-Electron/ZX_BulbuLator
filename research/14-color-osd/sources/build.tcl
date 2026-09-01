@@ -5,7 +5,7 @@
 # vs Step 13 the delta: a new osd_ddr_rd.v reads an ARGB8888 OSD canvas from DDR over its OWN AXI-HP1
 # port (a simplified fb_line_disp clone) and the top alpha-blends it over the 1bpp OSD output for a
 # full per-pixel true-colour OSD (Winamp-style skins). axi_ctl gains OSD_DDR_BASE (0x94) + OSD_CTRL
-# bit1 DDR_OSD_EN + LOAD_CAPS (0xC0, reserved). VERSION 0xB01B0014.
+# bit1 DDR_OSD_EN + LOAD_CAPS (0xC0, reserved). VERSION 0xB01B0019.
 
 set NOSNOW [expr {[llength $argv] > 0 && [lindex $argv 0] eq "nosnow"}]
 
@@ -26,7 +26,7 @@ read_verilog [list \
 read_verilog [list clock_zx.v mem_zx.v kbd_buttons.v \
   axi_ctl.v inject_cdc.v \
   fb_capture_rr.v async_fifo.v fb_wr_axi.v fb_bufmgr3.v fb_line_disp.v osd_compositor.v \
-  osd_ddr_rd.v tape_player.v \
+  osd_ddr_rd.v tape_player.v ps2_tx.v \
   bulbulator_zx_ddr_top.v]
 read_xdc bulbulator_ddr.xdc
 
@@ -44,7 +44,11 @@ foreach line [split [report_utilization -return_string] "\n"] {
 opt_design
 place_design
 route_design
+puts ">>> ==== CLOCKS (must list fclk100 + 3 derived + clk_audio; empty = the old unconstrained lottery) ===="
+puts [report_clocks -return_string]
+puts ">>> ==== CHECK_TIMING no_clock (must be 0 unconstrained endpoints) ===="
+puts [check_timing -override_defaults no_clock -return_string]
 puts ">>> ==== TIMING ===="
-puts [report_timing_summary -no_header -return_string -delay_type max -max_paths 1]
+puts [report_timing_summary -no_header -return_string -delay_type max -max_paths 4]
 write_bitstream -force $BIT
 puts ">>> DONE bit=$BIT size=[file size $BIT]"

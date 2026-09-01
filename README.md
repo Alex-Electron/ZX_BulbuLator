@@ -76,6 +76,13 @@ joysticks, and Dendy / Sega gamepads.
 Sound covers the AY-3-8912 / YM2149F, Turbo Sound (two AY chips), General Sound,
 and the beeper, with output over I²S and HDMI audio.
 
+Tracked post-Step-15 expansion plans:
+
+- [General Sound emulation](https://github.com/Alex-Electron/ZX_BulbuLator/issues/83):
+  classic GS compatibility with a secondary Z80, private RAM/ROM and four PCM channels.
+- [Pentagon hardware Multicolor / 16-colour mode](https://github.com/Alex-Electron/ZX_BulbuLator/issues/84):
+  hardware multicolor plus the optional `#EFF7` 16-colour extension, isolated from the normal video path.
+
 Storage is where it gets fun. Virtual `.trd` / `.scl` disks through a WD1793
 TR-DOS, DivMMC / ESXDOS, and the part I most want to build: routing the WD1793
 signals out to GPIO through a 3.3V→5V level shifter so a real floppy drive can
@@ -226,10 +233,14 @@ So far:
   (PSG/MP3/WAV, play modes, non-blocking pause), and a data-driven menu whose settings persist to
   `bulbulator.ini`.
 
+- **[Step 15 — Pentium (machine family) and beyond](research/15-pentagon/).** Starting with v0.15.01, all new multi-machine work (Pentagon as first additional machine with correct 320-line timings, wider border, floating bus off, live tuners, etc.) lives in the dedicated step-15 tree. The 14-color-osd tree is frozen after its public publication.
+
 More steps get added as I get them working.
 
 ## Changelog
 - **2026-07-08 — Step 14: colour OSD & the ZX-BulboNavigator.** The 1-bpp strip is replaced by a true-colour 640×400 ARGB8888 DDR OSD (`osd_ddr_rd` over AXI-HP1 + a per-pixel alpha compositor), hosting a full DOS Navigator-style file manager on the idle ARM: a browser with `Ctrl+F3-6` sort, mask select, a 78×15 Copy/Move dialog (six conflict modes), rename / mkdir / recursive delete; a data-driven menu bar with options saved to `bulbulator.ini`; a machine-agnostic tape station (`.tap`/`.tzx`/`.wav`/`.mp3` with a hardware tape-head reader model, MP3/WAV-as-tape, Tape Sound, Mute-machine-on-load); the music player folded in (PSG/MP3/WAV, play modes, non-blocking pause, MP3 preload); a pause bitmask, boot-nav, and a transparent PAUSE sign. A clean clone reproduces the bitstream — the PS/2 watchdog patch is vendored in `third_party/atlas-zx-ps2-watchdog/` and overlaid at build time. (control-plane VERSION `0xB01B0017`, firmware v0.14.92).
+
+- **2026-07-10 — Step 15 starts in dedicated tree.** All new work for multi-machine support (Pentagon first) moves to `research/15-pentagon/`. Development, builds and commits for v0.15.01+ are only in the step-15 folder. 14-color-osd is frozen.
 
 - **2026-06-30 — Step 13: Universal ARM music player.** A machine-agnostic music player built into the ARM control plane. Press **Enter** on a `.psg` file in the F5 browser to play it over HDMI, while the ZX Spectrum core runs in the background. Uses the AYUMI soft-synth library. Requires D-Cache (enabled via custom `lscript.ld` for the Cortex-A9) for real-time 47996 Hz playback without audio underruns. Audio is pushed via AXI to a new hardware FIFO in the PL, replacing the fabric audio when active. (control-plane VERSION `0xB01B000B`).
 

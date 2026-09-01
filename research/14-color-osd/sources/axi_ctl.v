@@ -7,7 +7,7 @@
 // inject Z80 registers (T80 DIR vector) and machine ports (7FFD / border) -> load .sna/.z80.
 //
 // Register map (base = M_AXI_GP0 0x4000_0000), AXI3, 32-bit, single-beat:
-//   0x00 VERSION   R   0xB01B0014
+//   0x00 VERSION   R   0xB01B0019  (top instantiation overrides this default)
 //   0x04 CONTROL   RW  bit0 HALT (1 = freeze the Z80; ARM owns the memory bus)
 //   0x08 STATUS    R   bit0 HALT_ACK, bit1 RAM_BUSY
 //   0x0C COUNTER   R   free-running aclk counter (liveness)
@@ -51,7 +51,7 @@
 // the top (async_fifo, spclk write / aclk read).
 //-------------------------------------------------------------------------------------------------
 module axi_ctl #(
-    parameter [31:0] VERSION    = 32'hB01B0015,
+    parameter [31:0] VERSION    = 32'hB01B0019,
     parameter [31:0] MACHINE_ID = 32'h00805A58,  // 'ZX' (0x5A58) + variant 0x80 (128K)
     parameter [31:0] LOAD_CAPS  = 32'h00000000    // loader capability mask (machine-agnostic; 0 = none built yet)
 )(
@@ -136,6 +136,13 @@ module axi_ctl #(
     output reg         kbd_deadman_kick,  // 1-aclk pulse (on a KBD_HB write)
     output reg  [8:0]  ctl_kbd_inject,    // 0xA8 W: {make[8], scancode[7:0]} - ARM injects a synthetic key into the core (bypasses the gate)
     output reg         ctl_kbd_inject_we, // 1-aclk pulse on a KBD_INJECT write
+    output reg  [7:0]  ctl_kbd_tx_data,   // 0xB0 W: byte for the PS/2 host transmitter (LEDs / typematic / resend)
+    output reg         ctl_kbd_tx_we,     // 1-aclk pulse on a KBD_TX write
+    output reg         ctl_pentagon,      // 0xBC MACHINE_CFG bit0: 1 = Pentagon timing (aclk; CDC'd to spclk in top)
+    output reg  [31:0] ctl_pent_int,      // 0xC4 PENT_INT: {v[24:16], hc[8:0]} Pentagon INT position (default 239/326)
+    input  wire        kbd_tx_busy,       // 0xB4 R bit0: PS/2 host TX in progress
+    input  wire        kbd_tx_ack,        // 0xB4 R bit1: device ACK bit of the last send
+    input  wire [31:0] kbd_diag,          // 0xB8 R: {resend_cnt[31:16], parity_err_cnt[15:0]}
     input  wire [31:0] memwr_cnt,         // 0xAC R: core RAM-write counter (tape-load verification probe)
     input  wire        halt_ack,
     input  wire        ram_busy,
@@ -171,7 +178,12 @@ module axi_ctl #(
                IDX_TAPESTAT= 6'h29,                                          // 0xA4 TAPE_STATUS (R: full/playing)
                IDX_KBDINJ  = 6'h2A,                                          // 0xA8 KBD_INJECT (W: {make,code})
                IDX_MEMWR   = 6'h2B,                                          // 0xAC MEMWR_CNT (R: core RAM writes)
-               IDX_LOADCAPS= 6'h30;                                          // 0xC0 LOAD_CAPS (R)
+               IDX_KBDTX   = 6'h2C,                                          // 0xB0 KBD_TX (W: byte -> PS/2 host TX)
+               IDX_KBDTXST = 6'h2D,                                          // 0xB4 KBD_TXSTAT (R: bit0 busy, bit1 ack)
+               IDX_KBDDIAG = 6'h2E,                                          // 0xB8 KBD_DIAG (R: {resend[31:16], parity_err[15:0]})
+               IDX_MACHCFG = 6'h2F,                                          // 0xBC MACHINE_CFG (W: bit0 pentagon; room for model/ram_size)
+               IDX_LOADCAPS= 6'h30,                                          // 0xC0 LOAD_CAPS (R)
+               IDX_PENTINT = 6'h31;                                          // 0xC4 PENT_INT (W: {v[24:16], hc[8:0]} - Pentagon INT position tuner)
 
     reg [31:0] counter;
     reg [31:0] reg_scratch;
@@ -198,6 +210,7 @@ module axi_ctl #(
         ctl_tape_we      <= 1'b0;
         kbd_deadman_kick <= 1'b0;
         ctl_kbd_inject_we <= 1'b0;
+        ctl_kbd_tx_we    <= 1'b0;
         if (!aresetn) begin
             wstate <= W_IDLE; s_awready <= 1'b0; s_wready <= 1'b0; s_bvalid <= 1'b0;
             s_bresp <= 2'b00; s_bid <= 12'd0;
@@ -216,6 +229,9 @@ module axi_ctl #(
             ctl_tape_run <= 1'b0; ctl_tape_earmux <= 1'b0; ctl_tape_mute <= 1'b0; ctl_tape_data <= 32'd0;
             kbd_deadman_kick <= 1'b0;
             ctl_kbd_inject <= 9'd0;
+            ctl_kbd_tx_data <= 8'd0;
+            ctl_pentagon <= 1'b0;
+            ctl_pent_int <= 32'h00EF0146;   // Pentagon INT default: v=239 (0xEF), hc=326 (0x146)
         end else begin
             case (wstate)
                 W_IDLE: begin
@@ -236,6 +252,9 @@ module axi_ctl #(
                             ctl_ram_addr  <= ctl_ram_addr + 17'd1;
                         end
                         IDX_SCRATCH: reg_scratch <= s_wdata;
+                        IDX_MACHCFG: ctl_pentagon <= s_wdata[0];   // Step 15: 1 = Pentagon timing
+                        IDX_PENTINT: ctl_pent_int <= s_wdata;      // Step 15: Pentagon INT position tuner
+
                         6'h08: ctl_dir[ 31:  0] <= s_wdata;          // DIR0
                         6'h09: ctl_dir[ 63: 32] <= s_wdata;          // DIR1
                         6'h0A: ctl_dir[ 95: 64] <= s_wdata;          // DIR2
@@ -278,6 +297,7 @@ module axi_ctl #(
                         IDX_TAPEFIFO:begin ctl_tape_data<=s_wdata; ctl_tape_we<=1'b1; end
                         IDX_KBDHB: kbd_deadman_kick <= 1'b1;   // heartbeat: keep the gate open
                         IDX_KBDINJ: begin ctl_kbd_inject <= s_wdata[8:0]; ctl_kbd_inject_we <= 1'b1; end
+                        IDX_KBDTX:  begin ctl_kbd_tx_data <= s_wdata[7:0]; ctl_kbd_tx_we <= 1'b1; end
                         default: ;
                     endcase
                     if (s_wlast) begin
@@ -341,6 +361,8 @@ module axi_ctl #(
                     IDX_TAPECTL: s_rdata <= {29'd0, ctl_tape_mute, ctl_tape_earmux, ctl_tape_run};
                     IDX_TAPESTAT:s_rdata <= {30'd0, tape_playing, tape_full};
                     IDX_MEMWR:   s_rdata <= memwr_cnt;
+                    IDX_KBDTXST: s_rdata <= {30'd0, kbd_tx_ack, kbd_tx_busy};
+                    IDX_KBDDIAG: s_rdata <= kbd_diag;
                     IDX_LOADCAPS:s_rdata <= LOAD_CAPS;
                     default:     s_rdata <= 32'hDEADBEEF;
                 endcase

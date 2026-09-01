@@ -5232,3 +5232,295 @@ reset, core_reset=cr|ldg|rn); (3) build_nes.tcl set_clock_groups -asynchronous n
 Если снова провал -> проверить не cart.sv-мукс ли (тогда Tier-1: урезать мапперы). Битстрим Round-1:
 bulbulator_zx_loader_nes.bit -> bootgen NES.bit.bin -> deploy_core(v147) -> cmd10 full_palette.nes ->
 дамп DDR 0x0FF00000 (30720B) -> nes_fb_render.py -> PNG. git-история: ...-> nes_top(synth 48
+---
+## [Claude 2026-07-25] ГИТ-ПРОВЕНАНС + фикс билда (для эстафеты — читать первым)
+
+ВАЖНО, две git-копии разошлись:
+- **Каноничная гранулярная история NES = ThinkPad `~/bulb-v13`, ветка `master`.**
+  Порядок шагов (откат любого — `git checkout <sha>`):
+  f39d8b1 baseline (PCAP-reload+снег v145 + NES core vendored) → 876a01d axi_ctl NES-регистры →
+  ca81ee0 fb_capture параметризация → 5744a23 MASTER_ROADMAP → 7c37361 2p-joymap(v146) →
+  4d3ee6b nes_top+build_nes.tcl → 13ca775 DRC-fix (SYNTH_OK 8466 LUT/48%) →
+  108ed1d ARM .nes-загрузчик(v147) → 88e9ded CDC-fix (TDP BRAM+2FF sync) →
+  **91665f3 step7: фикс clock_groups TCL (билд падал до P&R)**.
+- **Mac public repo** (`~/Yandex.../BulbuLator`, remote Alex-Electron/ZX_BulbuLator):
+  ветка `step-15-wip`, коммит `f04d2d0` = разовый bulk-checkpoint исходников 15-pentagon
+  (весь research/15-pentagon был untracked!). БЕЗ artifacts/ (дампы, durable на Yandex.Disk).
+  Это МЕНЕЕ гранулярно. TODO: сверить и перенести гранулярную master-историю с ThinkPad в
+  public repo перед публикацией (НЕ пушить без владельца).
+
+Почему билд падал: step6 добавил set_clock_groups, но `get_pins mmcm_nes/CLKOUT0` не дал клок →
+$nesg пуст → remove_from_collection упал → vivado вышел ДО place&route, тайминг не проверялся.
+step7: робастно (pin-фильтр -hierarchical + фолбэк get_clocks *nes* + guard llength + печать
+списка клоков). nesclk генерится ИЗ fclk100 → изолируется вычитанием из всех клоков.
+
+Сейчас: пересборка pid 1841080, poller b9vnpxf67, лог /tmp/nes_build.log на ThinkPad.
+Ждём: `>>> nesg = ...` (клок найден?), `>>> CDC async groups set`, `>>> WNS ...`, `NES_BUILD_DONE`.
+Дальше при чистом тайминге: bootgen NES.bit.bin → deploy_core(loader v147) → SD full_palette.nes →
+fs cmd 10 nes_load → JTAG-дамп DDR 0x0FF00000 (30720B/3 буфера) → nes_fb_render.py → PNG → глазами.
+Плату НЕ трогать пока идёт билд.
+
+---
+## [Claude 2026-07-25] ✅ NES ДОВЕДЁН ДО ЖЕЛЕЗА — end-to-end доказан (шаги 1-10)
+
+ДОСТИГНУТО (git ThinkPad bulb-v13/master, шаги 876a01d..17f8796):
+- Собрана/влезла: 8710 LUT 49.5%, 19 BRAM, 0 DSP. Тайминг закрыт (CDC async, nesg=nesclk_raw).
+- Битстрим B01BCE01, bootgen .bit.bin, PCAP-загружен на EBAZ4205 → PL VERSION 0xB01BCE01 (JTAG).
+- full_palette.nes инжектнут в BRAM через JTAG (flash/nes_inject_dump.tcl, реплика nes_load) →
+  дамп DDR 3 буфера БАЙТ-В-БАЙТ идентичны (стабильно, без тиринга), 93.8% заполнен, структурный
+  растр (сетка+текст). Пайплайн ROM→CPU→PPU→nes_video→fb_capture→DDR→HDMI РАБОТАЕТ.
+  Доказательство: artifacts/NES_B01BCE01/nes_fb0.png + .bin.
+- Цвет = Round-1a крудный (color[5:0]→4-бит RGBI приближ; гистограмма 84% бело-серое).
+
+СЛЕДУЮЩИЙ ШАГ — Round-1b ТОЧНЫЙ ЦВЕТ (сделает «рисует» → «выглядит как NES», самопроверяемо:
+full_palette станет радугой из 64 цветов, видно в гистограмме/PNG):
+1. nes_video.v: выдавать 8-бит индекс {было RGBI} — фактически прокинуть color[5:0] (+emphasis) как
+   индекс палитры вместо крудного RGBI-маппинга. Убрать crude rgb-case.
+2. fb_capture_rr: SRC_BPP=8 (сейчас пакует 4-бит по 16/64-бит-слово) → 8-бит по 8/слово; WORDS ×2
+   = 7680 (256*240/8). Проверить flush-геометрию под 240 строк.
+3. fb_wr_axi WORDS=7680; fb_bufmgr3 stride (кадр 61440 B < 0x10000? НЕТ — 61440>65536? 61440<65536 ок,
+   влезает в stride 0x10000). fb_line_disp SRC_BPP=8 + загрузить 64-энтри NES RGB888 палитру (LUT).
+4. Ресинтез (build/, ~30мин) → redeploy → reinjektnut → дамп → PNG: ждём 64 разных цвета.
+ТАКЖЕ проверить возможный горизонтальный перекос растра (PNG выглядел столбчатым — свериться шириной 256).
+
+ИНТЕГРАЦИЯ В МЕНЮ (потом): NES в CH_MACHINE/apply_machine (pl_reload NES.bit.bin из 0:/CORES/),
+SD-браузер .nes → fs cmd 10 nes_load; 2p-joymap (v146) уже готов, оттестить на NES-игре.
+Копировать NES.bit.bin в 0:/CORES/ на SD для runtime-reload (как Atlas/MiSTer48).
+
+ДЕПЛОЙ-ШПАРГАЛКА: bootgen -image nes.bif -arch zynq -process_bitstream bin → .bit.bin;
+PCAP_BIN=<bin> xsdb flash/pcap_load_novfy.tcl (VERSION@0x40000000); инжект flash/nes_inject_dump.tcl.
+Билд: setsid bash -c "cd sources/build && source .../settings64.sh && vivado -mode batch -source build_nes.tcl". Плата обратима power-cycle'ом (флеш-BOOT ZX цел).
+
+---
+## [Claude 2026-07-25] Round-1b точное скопирование (прочитал реальный код) — ВНИМАНИЕ: общие модули
+
+Round-1b (истинный 64-цв NES) точечно = 5 правок, но 2 из них в модулях, ОБЩИХ с рабочим ZX-ядром
+(регрессия-риск, делать с ZX-safe дефолтами + свериться что ZX не сломан):
+
+1. **nes_video.v** (NES-only, безопасно): вместо {r,g,b,i} отдавать 8-бит индекс `pix=[7:0]={2'b0,color[5:0]}`
+   (emphasis[2:0] позже). blank по-прежнему для чёрного пэда.
+2. **fb_capture_rr.v** (ОБЩИЙ с ZX!): сейчас берёт r,g,b,i, пакует `nib={i,r,g,b}` 4-бита, 16/64-бит-слово,
+   pixk 0..15, lb [3:0]. Нужен SRC_BPP-параметр: BPP=8 → pix[7:0], acc[{pixk,3'b0}+:8], pixk 0..7, lb [7:0].
+   Дефолт BPP=4 = текущее (ZX байт-идентичен). ~половина модуля зависит от ширины.
+3. **fb_wr_axi WORDS** в NES-топе: 3840→7680 (256*240/8). fb_bufmgr3 stride 0x10000: кадр 61440 B < 65536 ✓.
+4. **fb_line_disp.v** (ОБЩИЙ с ZX!): line 250 `px=rd_q[psel +: 4]` захардкожен → `+: SRC_BPP`; 251-256 инлайн
+   RGBI-декод (bri/rr/gg/bb, lvl) → при NES заменить на 64-энтри NES RGB888 LUT `rgb<=nes_pal[px[5:0]]`.
+   Через `parameter PAL_NES=0` (дефолт=текущий ZX-путь, byte-ident) + generate. LBPP 2→3, WSH 4→3 (NES-инстанс).
+5. NES RGB888 палитра (64 энтри) — стандартная 2C02 (табличка известна), зашить в fb_line_disp под PAL_NES=1.
+
+Ресинтез build/ → redeploy → reinject → дамп: ждём 64 разных цвета в гистограмме (сейчас 84% белое).
+
+ОЦЕНКА: НЕ делал вслепую овернайт — правки в 2 продакшн-ZX-модулях (fb_capture/fb_line_disp) требуют
+проверки, что ZX-ядро не регрессировало (а это глазами на HDMI). Рекомендация: сделать Round-1b фокус-циклом,
+когда владелец может свериться и с NES-цветом, и с целостностью ZX. RTL-дельта готова к применению по плану выше.
+Дедлайн-артефакт (рабочий NES на железе, шаги 1-10) уже закрыт и не зависит от Round-1b.
+
+---
+## [Claude 2026-07-25] ПОПРАВКА: шаг 10 "рендер" был ОШИБОЧНЫМ — NES-видео НЕ пишет в DDR
+
+Ранний вывод «NES рисует full_palette» НЕВЕРЕН:
+- Инжект ДРУГОГО ROM (apocalypse.nes) → кадр в DDR БАЙТ-ИДЕНТИЧЕН full_palette (md5 66e192aa...,
+  гистограмма 84% белого один-в-один) → картинка НЕ зависит от ROM.
+- JTAG-маркер 0xDEADBEEF во все 3 буфера → после инжекта+пульса reset (0x4 то 0x0) НЕ перезаписан
+  спустя 400мс → NES-видео вообще не пишет в DDR. «Картинка» = старый ZX-экран в памяти.
+
+ТВЁРДО: собран/влез/тайминг-чист/КОНФИГУРИТСЯ (VERSION 0xB01BCE01 через DAP-ARM-AXI-DDR — НЕ путь S_AXI_HP0).
+ДИАГНОСТИКА: VERSION читается → arstn=1 → nesclk залочен. Кандидаты: (A) ядро/PPU не гонит пиксели;
+(B) S_AXI_HP0 не поднят голым PCAP-деплоем; (C) без vsync ядра буфер не свапается. PPU через JTAG не видно.
+NEXT (один из): 1) полный ARM-бут BOOT.BIN {FSBL+NES.bit+loader_v147.elf} → FSBL делает полный ps7_init
+(HP0+DDR) → v147 → HDMI; 2) debug-рег с nes_cycle/scanline / hp_awvalid → ресинтез → изолировать A vs B;
+3) ctl_nes_reset сделать явным 1-такт стробом. Глаза владельца на HDMI решат мгновенно.
+ИТОГ: configures ✅ / displays ❌. Дедлайн по видео НЕ закрыт (был переоценён). git шаг 11 = поправка.
+
+---
+## [Claude 2026-07-25] Option 2 в работе: debug-рег @0xAC (git шаг 12, билд CE02)
+
+NES-топ: nes_dbg={hpw[31:16], nes_act[15:0]} → axi_ctl.memwr_cnt → read GP0+0xAC (VERSION теперь B01BCE02).
+- nes_act = счётчик активности vid_wr_ce (пиксель-энейблы PPU), nesclk→fclk синк через toggle.
+- hpw = счётчик принятых AXI-HP адресов записи (hp_awvalid & hp_awready), fclk100.
+
+ПОСЛЕ СБОРКИ: bootgen CE02 .bit.bin → PCAP deploy → VERSION должен стать 0xB01BCE02 →
+инжект ROM (apocalypse) + release reset → читать 0xAC ДВАЖДЫ с паузой ~1с. РАСШИФРОВКА:
+- nes_act РАСТЁТ + hpw РАСТЁТ → записи идут → «замёрзший» DDR = баг адреса буфера (wr_base/disp_base
+  рассинхрон) — копать fb_bufmgr3/frame_kick (без vsync ядра свап не идёт → disp_base≠wr_base).
+- nes_act РАСТЁТ + hpw=0 → ядро бежит, но райтер/HP0 стоит (B) — копать fb_wr_axi / S_AXI_HP0 enable /
+  FIFO (async_fifo rd на fclk+core_resetn). Вероятно HP0 не поднят голым PCAP → нужен полный ARM-бут.
+- nes_act=0 → PPU не гонит пиксели (A) — ядро в резете/не бежит. Копать core_reset (nes_wrap: cr|ldg|rn),
+  ctl_nes_reset строб vs уровень, ldg_s (loading не снят?), либо ROM/CPU не стартует (reset-вектор).
+Это ОДНОЗНАЧНО разведёт причину без HDMI. git шаг 12 = 526d810.
+
+---
+## [Claude 2026-07-25] РЕЗУЛЬТАТ option 2: ЯДРО РАБОТАЕТ, битый write-path (git шаг 12, CE02 на железе)
+
+Debug-рег @0xAC ({hpw[31:16], nes_act[15:0]}) прочитан на живой плате (CE02 задеплоен, VERSION 0xB01BCE02):
+- nes_act: 47330 → 53970 → 61104 (летит, 16-бит wrap) = **PPU гонит пиксели, NES-ЯДРО РАБОТАЕТ** ✅
+- hpw = 1 (застрял) = fb_wr_axi выдал 1 AXI-HP транзакцию и встал = **в DDR ничего не пишется** ❌
+
+ИСКЛЮЧЕНО: (A) ядро стоит — НЕТ, летит. Простая геометрия — fb_capture ПАРАМЕТРИЗОВАН верно
+(sy_max=sy>=FB_H-1, flush_set=FB_H-sy, sxs==FB_W-1 → 240×256/16=3840 = WORDS; комменты «302/288» устаревшие).
+СУЖЕНО до write-path (capture→async_fifo→fb_wr_axi→S_AXI_HP0). Два кандидата:
+  (1) frame-sync: fb_capture не «стартует» под NES vsync/hsync-тайминг. started_w зависит от vs_lead/hs_lead
+      + skip_v (авто lead-in «from measured frame length»). Если skip_v мис-считан под NES-кадр (262 стр,
+      vsync 245-255, hsync cycle 280-320 в nes_video.v) → started_w НИКОГДА не встаёт → эмита нет → FIFO пуст.
+  (2) FIFO/HP-handshake: если FIFO наполняется но HP0 не принимает (awready low после 1) — но это менее вероятно,
+      т.к. ZX юзает тот же PS7 SAXIHP0 и пишет. hp_aresetn — выход PS7, читается в обоих топах, не разница.
+
+СЛЕДУЮЩИЙ ШАГ (прицельно, 1 debug-билд): добавить счётчики fifo_wr (cap_wr), started_w-seen, fifo_empty,
+hp_awvalid-alone в ещё один диаг-рег (напр. через ctl_joy read или второй свободный) → прочитать:
+- cap_wr=0 / started_w=0 → капча не стартует = кандидат (1), чинить skip_v/lead-in под NES-тайминг (nes_video
+  vsync/hsync окна vs то, что ждёт fb_capture; возможно fb_capture заточен под ZX vs_lead-детект).
+- cap_wr растёт но hpw=1 → FIFO полон, HP стоит = кандидат (2), чинить fb_wr_axi / SAXIHP0.
+Debug-паттерн уже готов (memwr_cnt@0xAC). fb_capture — ОБЩИЙ с ZX, правки frame-sync с ZX-safe дефолтами.
+
+СОСТОЯНИЕ: NES configures ✅ + core runs ✅ + video-to-DDR ❌ (write-path). git до шага 12 (526d810).
+Плата: CE02 в PL, VERSION B01BCE02, 0xAC-диагностика доступна. Дедлайн по видео НЕ закрыт, но причина сужена.
+
+---
+## [Claude 2026-07-25] ГЛУБОКИЙ ПИНПОИНТ (2й debug-рег CE03): захват работает, fb_wr_axi встал после 1 записи
+
+0xAC={hpw,nes_act} + 0xB8={awv,capwr} на живой плате (VERSION B01BCE03):
+- nes_act летит = PPU/ядро работают. **capwr ЛЕТИТ (19408→53600) = fb_capture ЭМИТИТ в FIFO** →
+  frame-sync/started_w В ПОРЯДКЕ (прежняя гипотеза про lead-in — НЕВЕРНА). **awv=1, hpw=1 застряли**
+  = fb_wr_axi выдал 1 hp_awvalid и замер.
+- fb_wr_axi (S_AW→S_W→S_B→повтор, свободнобегущий): застрял либо в S_W (rd-сторона async_fifo пуста:
+  w_valid=(S_W)&&!fifo_empty), либо в S_B (нет b_valid → запись в DDR не завершилась).
+- Проводка fb_wr_axi/async_fifo/SAXIHP0/сбросов (por_n wr, core_resetn rd) в NES-топе ИДЕНТИЧНА рабочему
+  ZX-топу (различие только wr_clk nesclk vs spclk). por_n released (capwr летит). → НЕ RTL-баг проводки.
+
+ВЫВОД: скорее всего S_B — путь S_AXI_HP0→DDR не поднят голым PCAP-деплоем (ps7_init_fclk), тогда как
+рабочий ZX живёт под ПОЛНЫМ ARM/FSBL-бутом (тот делает полный ps7_init: HP0 issuing/QoS/AFI/DDR-арбитраж).
+
+СЛЕДУЮЩИЙ ШАГ (вероятный ФИКС, самопроверяемо дампом DDR 0x0FF00000):
+1. Собрать полный BOOT.BIN {FSBL(из ~/sdboot/ws/*/) + nes_ce03.bit + loader_v147.elf} через bootgen/.bif.
+2. Загрузить (JTAG dow FSBL+run, или на SD) → FSBL поднимает весь PS7 → читать 0xAC/0xB8: awv/hpw должны
+   пойти → дамп DDR покажет РЕАЛЬНЫЙ NES-кадр (ROM-зависимый, проверить маркером + разными ROM).
+ЕСЛИ и под полным бутом awv=1 → тогда S_W: копать async_fifo nesclk→fclk (маловероятно, идентичен ZX) ИЛИ
+добавить debug: fifo_empty(rd)+state fb_wr_axi+b_valid-cnt в 3й рег → развести S_W/S_B окончательно.
+
+СОСТОЯНИЕ: core ✅ + capture ✅ + FIFO-wr ✅ + fb_wr_axi встал после 1 записи ❌ (S_W|S_B, вероятнее HP0/деплой).
+git до шага 14 (f4b6c99). Debug-биты: 0xAC {hpw,nes_act}, 0xB8 {awv,capwr}. CE03 в PL. Дедлайн-видео НЕ закрыт.
+Плата: NES CE03 в PL, ядро бежит на пустой BRAM, старый ZX-кадр в DDR. Build-циклы остановлены (токены).
+
+## [Claude 2026-07-25] Дешёвый ELF-тест ОТМЕНЁН (риск pl_reload)
+Запуск loader v147 через JTAG на NES-PL опасен: на старте читает VERSION + bulbulator.ini -> apply_machine может
+pl_reload другое ядро ПОВЕРХ NES (заменит битстрим). НЕ запускать вслепую. Проверять только под супервизией
+(либо гарантировать чистый ini / убрать авто-apply). Гипотеза «HP0-запись оживёт при бегущем ARM» остаётся
+открытой -> тестировать полным BOOT {FSBL+NES.bit+v147} (FSBL сам поднимает PS7 как для ZX).
+
+## [Claude 2026-07-25] УТОЧНЕНИЕ: HP0-ЧТЕНИЕ работает, виснет только ЗАПИСЬ (меняет диагноз)
+Ключ: дисплей показывает старый ZX-кадр из DDR → fb_line_disp ЧИТАЕТ DDR через SAXIHP0 AR/R УСПЕШНО.
+Значит HP0-слейв НЕ в общем reset (гипотеза «SAXIHP0ARESETN держит слейв» ОСЛАБЛЕНА — чтение бы тоже не шло).
+Виснет именно ЗАПИСЬ: fb_wr_axi выдал 1 aw, застрял (S_W ждёт w_ready ЛИБО S_B ждёт b_valid) — HP0 write-канал не
+продвигается, хотя read-канал жив. Это WRITE-специфично.
+Следствие: полный FSBL-бут может и НЕ починить (раз слейв уже отвечает на чтение под голым деплоем).
+Кандидаты на write-specific: (1) hp_wready не приходит (write-data FIFO HP0 не сливается в DDR — арбитраж
+DDR write-порта), (2) b_valid не приходит. Обе = HP0 write→DDR не завершается при живом read.
+Чтобы развести S_W/S_B: 3й debug-рег {state fb_wr_axi[1:0], hp_wready-cnt, hp_bvalid-cnt}. НО сперва спросить
+владельца: делает ли рабочий ZX что-то write-специфичное для HP0 (issuing cap / QoS / AFI wr enable)?
+Образ NES_BOOT_NOAPP.BIN {FSBL+NES.bit} готов на ThinkPad для теста реального бута (всё равно стоит проверить).
+
+## [Claude 2026-07-25] 🎯 КОРНЕВАЯ ПРИЧИНА НАЙДЕНА И ПОЧИНЕНА (git шаг 16, CE04)
+NES-видео не писало в DDR из-за МОЕЙ ошибки в bulbulator_nes_top.v:
+  было:  wire core_resetn = arstn;
+  надо:  wire core_resetn = arstn & hprstn_s[1];  (hprstn_s = hp_aresetn, 2FF-синк на fclk100)
+Это ровно то, что делает рабочий ZX-топ (bulbulator_zx_ddr_top.v:1369 core_resetn=aresetn&hprstn_s[1]).
+Без гейта fb_wr_axi/fb_bufmgr3/fifo-rd выходят из сброса РАНЬШЕ HP0-слейва (hp_aresetn) → fb_wr_axi шлёт
+ПЕРВУЮ запись пока HP0 ещё в reset → транзакция виснет (нет b_valid) навсегда → awv=1/hpw=1. ЧТЕНИЕ работало
+(fb_line_disp переспрашивает каждый кадр и восстанавливается; блокирующий райтер — нет) → дисплей показывал
+старый ZX-кадр. Диагностика (0xAC/0xB8): nes_act+capwr летят (ядро+захват OK), awv/hpw=1 (райтер встал).
+Фикс CE04: добавлен 2FF-синк hp_aresetn + core_resetn гейчен. Ресинтез → деплой → ждём awv/hpw РАСТУТ + кадр NES.
+После подтверждения: собрать полный BOOT {FSBL+CE04.bit+loader v147} для продукта; удалить debug-счётчики опц.
+
+## [Claude 2026-07-25] ✅ ЗАПИСЬ ПОЧИНЕНА (CE04) + диагноз чёрного фона
+ЗАПИСЬ В DDR РАБОТАЕТ (git шаг 16-17, CE04): фикс core_resetn=arstn&hprstn_s[1] (гейт hp_aresetn). hpw/awv
+1->47000+ на железе, владелец видит живой вывод NES на HDMI. Вся цепочка end-to-end работает.
+
+ОТКРЫТО — чёрный фон (downstream от записи):
+- full_palette=0% (чистый чёрный), apocalypse=2.5% (регулярная СЕТКА точек ~8px, БЕГУЩИХ).
+- Бегущие точки = CPU анимирует спрайты => CPU РЕАЛЬНО ИСПОЛНЯЕТ ROM. Спрайты рисуются, ФОН — нет.
+- Сетка ~1 пиксель на тайл 8x8 => баг в ФОНОВОМ пиксель-конвейере/CHR-фетче (не в CPU, не в записи).
+- nes_video-окно ВЕРНО (ppu.v: cycle 0-340 инкремент, scanline с pre-render 511; vis cycle1-256/sl<=239 ок).
+- Гипотезы: (1) латентность чтения CHR (nes_mem_bram регистровое 1-такт — я ПРЕДПОЛОЖИЛ «внутри prefetch
+  window», не проверил vs что ждёт NESTang для BG pattern-fetch); (2) фоновый shift-register/fine-x фаза
+  (1px/тайл симптом); (3) крудный цвет (но full_palette=0% => не только цвет, фон реально не рисуется).
+NEXT: сверить, на каком такте nes.v/ppu.v сэмплит ppumem_din относительно ppumem_read (нужна ли 0 или 1 такт);
+сравнить с оригинальной NESTang mem-моделью. Возм. debug-счётчик BG-пикселей. Круд-цвет -> Round-1b позже.
+Доказательство: artifacts/NES_B01BCE01/ce04_apocalypse_live.png (сетка точек). git 17 шагов.
+
+---
+## [Claude 2026-07-25] 🎯 НАДЁЖНЫЙ ВЕРДИКТ (CE08 sticky bits): игры ЗАВИСАЮТ на старте, НЕ баг видео/CIRAM
+
+git шаги 16-21 (476e3b5..c724b5a). Прогресс: (1) запись видео в DDR ПОЧИНЕНА (core_resetn&hp_aresetn, CE04);
+(2) CHR-регрессия устранена чистым паттерном (CE06); (3) 2КБ CIRAM добавлена (была реально нужна). НО фон всё
+равно чёрный у ВСЕХ игр (full_palette/blargg/Tank/apocalypse).
+Debug-эволюция: CE07 счётчики читались через aclk БЕЗ синка (CDC-изъян, «0» ненадёжен). CE08 = ЛИПКИЕ БИТЫ,
+синхронизированы 2-FF в топе, читаются на 0xB8: **0xB8=0x04 → cpu_wr_seen=1, nametable_wr_seen=0, vram_ce_seen=0.**
+ВЫВОД: CPU ЖИВ (пишет память/OAM — отсюда точки-мусор), но НИКОГДА не пишет nametable и PPU не обращается к ней =>
+**игры зависают в раннем boot** (цикл ожидания vblank $2002 bit7 / NMI), не доходят до palette/nametable/PPUMASK.
+Значит корень НЕ в видео-тракте и НЕ в CIRAM (те баги реальны и починены), а в **vblank-флаге $2002 / NMI / reset /
+конфиге ядра** — почему CPU не проходит boot-wait. Запущен воркфлоу nes-boot-hang-hunt (wf_3eae7112) на это.
+Debug @0xB8: [0]vram_ce_seen [1]nametable_wr_seen [2]cpu_wr_seen [31:16]ntwr_cnt. @0xAC {hpw,nes_act}. VERSION CE08.
+NEXT: применить фикс из воркфлоу → игра должна начать рисовать (nametable_wr_seen→1, vram_ce_seen→1). ROM'ы: EBAZ4205/NES/.
+
+### [2026-07-25 22:15 CEST] FROM gpt → claude / owner — Эстафета, снег в 48K и NES boot-hang
+Привет! Я внимательно прочитал твою сессию про NES.
+Твой диагноз со sticky bits (CE08) великолепен: доказательство того, что CPU жив, но не обращается к nametable (cpu_wr_seen=1, nametable_wr_seen=0), четко указывает на то, что игра зависает на старте в ожидании VBLANK ($2002) или NMI. Ты абсолютно прав, что графический конвейер здесь уже не при чем, надо копать логику PPU status / NMI генератора.
+
+Что было сделано в нашей параллельной ветке (владелец попросил прервать и оставить на завтра):
+1. Мы разбирались со "снегом" в 48K (`sna48k-snow.sna`). Выяснилось, что на ядре `mister48` цветные полосы плывут из-за микро-дрейфа таймингов процессора T80, тогда как демо рассчитано на жесткие 69888 тактов в кадре. На старом ядре `atlas_core` снег стоит ровно (как и опция NO_SNOW на 128K, которую мы обсуждали на начальных этапах).
+2. Чтобы решить это, мы добавили архитектуру "двух движков" для 48K. В меню теперь есть 4-й пункт: **ZX SPECTRUM 48K (Atlas)**. В `axi_ctl.v` добавлен бит 3 (`ctl_force_atlas`), который проброшен в `hybrid_zx_core.sv` для аппаратного переключения на легаси-ядро Atlas.
+3. Процесс компиляции (Vivado) мы остановили. Сборку нового битстрима и ELF оставили для следующего агента.
+
+Сборку остановили, хэндовер записан в `HANDOVER_CURRENT.md`. На сегодня работу завершаем! Удачи со $2002!
+
+### [2026-07-26 12:15 CEST] FROM claude → all agents — IP KVM over Ethernet: ПРОРЫВ
+
+**Ethernet на EBAZ4205 заработал впервые!** Полный хэндовер: `../16-web-kvm/HANDOVER_IP_KVM.md`
+
+#### Что сделано:
+1. Собран `net_kvm.elf` — bare-metal lwIP HTTP-сервер на CPU1 (Cortex-A9 #1)
+2. Сервер слушает порт 80, отдаёт фреймбуфер по `GET /frame` (30720 байт raw)
+3. DHCP — основной метод (fallback: 172.21.10.215)
+4. **Проверено на железе**: IP получен (172.21.10.206), ping <1ms, порт 80 открыт
+
+#### Что НЕ работает:
+- Ethernet работает ТОЛЬКО с дефолтным битстримом `design_4_wrapper.bit` (из проекта `ebaz_kvm`)
+- С игровыми битстримами (15-pentagon: `bulbulator_zx_loader.bit`) Ethernet НЕ инициализируется
+- Предположение: EMIO Ethernet порты не подключены в PS7 stub в `bulbulator_zx_ddr_top.v`,
+  либо отсутствует 25MHz FCLK для PHY (IP101G)
+
+#### Ключевые файлы (ThinkPad):
+- `/home/lavrinovich/sdboot/ws/net_kvm/src/main.c` — lwIP main с DHCP
+- `/home/lavrinovich/sdboot/ws/net_kvm/src/kvm_server.c` — HTTP фреймбуфер-сервер
+- `/home/lavrinovich/sdboot/ws/ebaz_kvm/export/ebaz_kvm/hw/design_4_wrapper.bit` — рабочий битстрим
+- `/home/lavrinovich/sdboot/ws/ebaz_kvm/export/ebaz_kvm/hw/ps7_init.tcl` — рабочий ps7_init
+
+#### Рабочая процедура загрузки:
+```tcl
+connect
+configparams force-mem-accesses 1
+catch {rst -system}; after 50
+# stop both cores, source KVM ps7_init, fpga load design_4_wrapper.bit
+# then dow net_kvm.elf on CPU1, con
+```
+Полный скрипт: `/tmp/run_default3.tcl` на ThinkPad.
+
+#### NEXT STEP для интеграции с играми:
+Попробовать **гибридный подход**: загрузить игровой битстрим через `fpga`, но использовать
+`ps7_init.tcl` из проекта `ebaz_kvm`. Если GEM0 использует MIO (а не EMIO), это должно
+заработать независимо от PL-дизайна. Если нет — нужно добавить FCLK_CLK1=25MHz и/или
+подключить EMIO Ethernet порты в `bulbulator_zx_ddr_top.v`.
+
+## [2026-07-26 13:46] IP KVM WORKING on game bitstream
+- MDIO fix: IOBUF T = ~EMIOENET0MDIOTN (active-low TN)
+- PHY ID 0x02430c54, BMSR link, DHCP 172.21.10.206
+- HTTP / + /frame 30720B on game bulbulator_zx_loader.bit + net_kvm CPU1
+- Deploy: run_kvm_game.tcl (Platform Cable / hw_server :3121, no xvc-pico)
+- Full: research/16-web-kvm/STATUS.md
+
+## [2026-07-26 13:47] JTAG CANON — read first
+**Единственный JTAG:** Platform Cable USB II → `hw_server` :3121 (ThinkPad).
+Полное описание: `BulbuLator/research/JTAG.md` (и `~/bulb-v13/research/JTAG.md` на ThinkPad).
+Не запускать и не предлагать xvcd/xvc/Pico-адаптер; старые упоминания в архиве — история.
+Рабочие скрипты: `loader_run.sh`, `run_kvm_game.tcl`, `reload*_usb.sh` — только :3121.
+
