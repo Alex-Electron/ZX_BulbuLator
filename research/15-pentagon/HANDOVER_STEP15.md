@@ -136,7 +136,7 @@ bash /tmp/build_loader.sh && cp loader.elf.new loader.elf   # линк
 
 - **Общение с владельцем — по-русски.** Владелец тестирует на живом железе и ОЦЕНИВАЕТ успех загрузки сам; не заявлять успех без его подтверждения на экране.
 - **Telegram-канал:** `echo "текст" | ssh thinkpad 'python3 ~/.hermes/send_to_user.py'`. Слать первые ощутимые результаты / когда есть что тестировать / по просьбе. Токены `~/.hermes/.env` — НИКОГДА не эхо/лог/коммит.
-- **Git-личность публичных артефактов — ТОЛЬКО** `Alexander Lavrinovich <7916859+Alex-Electron@users.noreply.github.com>` (author И committer). Никаких (имя удалено)/рабочей почты. Никаких co-author/generated-by футеров.
+- **Git-личность публичных артефактов — ТОЛЬКО** `Alexander Lavrinovich <7916859+Alex-Electron@users.noreply.github.com>` (author И committer). Никаких чужих личностей и рабочей почты. Никаких co-author/generated-by футеров.
 - **Упоминание ИИ:** в личных проектах — только обобщённо «ИИ»/«AI», НИКОГДА не называть конкретную модель/агента. В git-сообщениях ИИ не упоминать вообще.
 - **Волт Обсидиана** (`~/Documents/Obsidian Vault/Projects/Lichnoe/BulbuLator/`) — журнал после каждого шага: `state/HANDOVER.md`+`STATUS.md`+`state/current.md`. Дублировать суть в файловую память агента.
 - **Хьюманайзер** на все публичные тексты (README/доки) перед коммитом. RU-переводы — через DeepL, не LLM-калькой.
