@@ -28,6 +28,27 @@ which permits this combination.
 | **speexdsp** — resampler | audio resample | BSD-3-Clause | © Xiph.Org Foundation | vendored |
 | **`atlas-zx-ps2-watchdog/ps2.v`** — patched PS/2 decoder | keyboard fix | GPL-2.0-or-later | © Sorgelig; mods © 2026 A. Lavrinovich | vendored (modified GPL) |
 
+| **NES core** — 6502 + PPU + APU + mappers | NES / Dendy machine | GPL | © 2012-2013 Ludvig Strigeus; NES_MiSTer contributors (GreyRogue et al.); NESTang adaptation © nand2mario | fetched + our wrapper (`nes_wrap.v`, `nes_video.v`, `nes_mem_bram.v` © 2026 A. Lavrinovich) |
+| ├ **T65** — 6502 CPU | in the NES core | permissive (Wallner-style) | © Daniel Wallner and contributors | fetched (via NES core) |
+| **z80emu** ([anotherlin/z80emu](https://github.com/anotherlin/z80emu) v1.1.3) — Z80 interpreter on the ARM, used for the General Sound card | GS card CPU | "This code is free, do whatever you want with it" (upstream header) | © 2012-2017 Lin Ke-Fong | vendored; `z80user.h` replaced by our binding — see `research/15-pentagon/arm/z80emu/ВЕНДОРЕНО.md` |
+| **Terminus** (`CyrKoi-TerminusBoldVGA16`) — the 8×16 CP866 OSD font | shell text | **SIL OFL 1.1** | © Dimitar Zhekov and contributors | vendored as `arm/vga866.h` (bitmap extracted) |
+| **FatFs** (via the Xilinx `xilffs` BSP library) — FAT16/FAT32 on the SD card | file service | BSD-style 1-clause (ChaN) | © ChaN | build dependency, not vendored here |
+
+### ROM sets and device firmware — see [`research/15-pentagon/roms/PROVENANCE.md`](research/15-pentagon/roms/PROVENANCE.md)
+
+`research/15-pentagon/roms/` ships the ROM sets the machine was actually tested against. **None of
+them is our work**, the project licence does not cover them, and we are not the rights holders. The
+manifest names, per file, what is inside (identified from the files themselves, not from their
+names), who the author is, and the single modification we made — one corrupted TR-DOS page restored
+from a clean 5.03. Where we could not establish authorship with confidence, the manifest says so
+instead of guessing.
+
+Summary of the rights holders: Sinclair 48K/128K ROMs © **Amstrad plc** (redistribution with
+emulators permitted with acknowledgement); **TR-DOS** © Technology Research Ltd; **Gluk Reset
+Service** by *Mr Gluk*; **Proteus** / **FATALL** / the PentoGraf sets by PentoGraf and the respective
+authors; **esxDOS** by the esxDOS team; **General Sound** card firmware by the General Sound
+developers. If you hold rights to any of these and want a file removed, open an issue.
+
 ## Chiptune playback engines (selected 2026-08-09, see [`research/15-pentagon/CHIPTUNE_OSS.md`](research/15-pentagon/CHIPTUNE_OSS.md))
 
 Every entry below was built for the real target — `arm-none-eabi-gcc 14.2.1`, bare-metal newlib,
