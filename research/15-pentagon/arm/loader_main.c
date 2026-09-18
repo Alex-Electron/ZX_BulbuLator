@@ -1,5 +1,6 @@
 #include <stdint.h>
 #include "xil_cache.h"   /* Xil_DCacheEnable / Xil_ICacheEnable */
+#include "xil_cache_l.h" /* v0.15.436: Xil_L2Cache*Range для честного снимка кадра */
 #include "xil_mmu.h"     /* Xil_SetTlbAttributes + NORM_NONCACHE (carve the fabric-shared DMA window) */
 #include "ff.h"          /* FatFs (xilffs) - BSP provides xsdps + ChaN FatFs */
 #include "divmmc_fs.h"   /* v327 */
@@ -289,10 +290,11 @@ static inline uint32_t kbd_data_read(void){
 #define ROMTRAP_REG(k) (*(volatile uint32_t*)(GP0+0xE4u+4u*(unsigned)(k)))  /* R: T80 register vector words 0..6 (same packing as DIR inject) */
 #define KBD_DIAG   (*(volatile uint32_t*)(GP0+0xB8))  /* Step 15: R {resend_cnt[31:16], parity_err_cnt[15:0]} */
 #define MACHINE_CFG (*(volatile uint32_t*)(GP0+0xBC))  /* Step 15: bit0=Pentagon, bit1=48K, bit2=Sinclair ULA Late (48K/128K) */
-#define PENT_INT    (*(volatile uint32_t*)(GP0+0xC4))  /* Step 15: W {v[24:16], hc[8:0]} = Pentium INT position tuner */
+#define PENT_INT    (*(volatile uint32_t*)(GP0+0xC4))  /* Step 15: W {v[24:16], hc[8:0]} = Pentagon INT position tuner */
 #define PAPER_H     (*(volatile uint32_t*)(GP0+0xC8))  /* live paper h start (left border) */
 #define PAPER_V     (*(volatile uint32_t*)(GP0+0xCC))
-#define ULA_TUNE_REG (*(volatile uint32_t*)(GP0+0x100))  /* B0156: live ULA timing, contention & border phase tuner */  /* live paper v start (top border) */
+#define ULA_TUNE_REG  (*(volatile uint32_t*)(GP0+0x1C0)) /* B0157: live ULA timing lab; 0x114 is reserved for QUIESCE */
+#define ULA_TUNE2_REG (*(volatile uint32_t*)(GP0+0x1C4)) /* B0157: floating bus, memory contention and border mode */
 #define SCR_POS     (*(volatile uint32_t*)(GP0+0xD0))
 #define SCR_SCALE   (*(volatile uint32_t*)(GP0+0x118)) /* CE21: live integer upscale {ymul[7:4], xmul[3:0]} - PER MACHINE */  /* live whole-frame HDMI position: {vmargin[15:0], hmargin[15:0]} (fb_line_disp) */
 #define CROP_A      (*(volatile uint32_t*)(GP0+0xD4))  /* live crop origin: {sy0[15:0], sx0[15:0]} (trims left/top) */
@@ -1229,7 +1231,7 @@ static void browser_status(const char* s){   /* transient feedback (MOUNT/READ/F
 /* Title screen (shown when the OSD opens with F12): just the name, centred, scale 2. */
 /* Firmware build tag shown on the F12 splash (bump per milestone). The PL core VERSION
    (0x4000_0000) is shown live too, so the splash states exactly which firmware + bitstream run. */
-#define BULB_FW "v0.15.432"
+#define BULB_FW "v0.15.440"
 static char hexnib(uint32_t v){ return (v<10) ? ('0'+v) : ('A'+v-10); }
 /* Single source of truth for the version line ("v0.13 core 0xB01B0013"): the ARM firmware tag
    BULB_FW + the live PL core VERSION read from register 0x00. Used by BOTH the F12 splash
@@ -1459,6 +1461,12 @@ static int         opt_ide    = 1;             /* v283: NEMO-IDE - 0 OFF / 1 ON.
 static int         opt_divmmc = 0;             /* v0.15.327: DivMMC OFF/ON */
 static int         opt_dmmode = 0;             /* v0.15.327: 0 FOLDER / 1 IMAGE */
 static int         opt_zc = 0;                 /* v350: Z-Controller (#77/#57) - другой транспорт к той же карте */
+static int         opt_kj = 0;                 /* B0175: интерфейс Kempston (порт с a5=0).
+                                                  На ГОЛОМ 48K его нет, и порты с a5=0 обязаны
+                                                  отдавать плавающую шину - иначе тесты 35/36/37
+                                                  Timing Tests 48K не сходятся (их тело грузит B
+                                                  прямо с шины). Умолчание ВЫКЛ - решение владельца;
+                                                  включать, когда джойстик нужен игре. */
 static int         opt_zcmode = 0;             /* v379: 0 FOLDER / 1 IMAGE */
 static int         opt_zcfat32 = 1;            /* v379: 0 FAT16 / 1 FAT32 (default 1 for ZC) */
 static int         opt_zcroot = 0;
@@ -1810,11 +1818,17 @@ static int   opt_paper_h     = 2;        /* paper H within frame. 12.08: вла�
                                             INT H = 326 — граница бордюр/бумага сошлась, разрыв полоски
                                             в тайминговой демке ушёл. */
 static int   opt_paper_v     = 60;       /* paper V within frame (owner-tuned 60) */
-static int   opt_io_cont     = 0;        /* B0156: I/O contention phase delay (0..7 clk) */
+static int   opt_ula_tune_en = 0;        /* B0157: lab override; OFF is the exact baked B0154 path */
+static int   opt_io_cont     = 2;        /* B0157 neutral = B0154 I/O contention phase */
+static int   opt_mem_cont    = 0;        /* memory contention phase delay (0..7 clk) */
+static int   opt_fbus_delay  = 1;        /* floating bus: 0=B0153, 1=B0154 measured phase */
+static int   opt_border_mode = 0;        /* 0=phase-latched, 1=pixel-live */
 static int   opt_bord_phase  = 5;        /* B0156: Border quantization phase (0..15) */
 static int   opt_bord_delay  = 0;        /* B0156: Border subpixel delay (0..3 px) */
 static int   opt_pap_delay   = 0;        /* B0156: Paper delay pipeline (0..15 px) */
-static int   opt_sincl_inth  = 0;        /* B0156: Sinclair INT start timing offset (-128..+127) */       /* paper V within frame (owner-tuned 60) */
+static int   opt_ula_phase   = 32;       /* displayed signed -32..+31; stored biased by +32 */
+static int   opt_irq_phase   = 256;      /* displayed signed -256..+255; stored biased by +256 */
+static int   opt_int_src     = 0;        /* 0=legacy pc3M5, 1=raw ULA, 2=nc3M5 */
 /* (per-machine store g_mp[] + mp_store/mp_load live below, after N_MACHINES is defined) */
 /* Step 15 GLOBAL DISPLAY layer - machine-INDEPENDENT (owner: crop + output-window position adjust
    regardless of which machine is loaded). One set, applied to whatever the display shows. */
@@ -1913,6 +1927,9 @@ static const char* const CH_LAUNCH[]= {"MACHINE","MUSIC"};
 static const char* const CH_MACHINE[]  = {"ZX 128K (Atlas)", "PENTAGON 1024K (Atlas)", "ZX SPECTRUM 48K (Atlas)", "ZX SPECTRUM 48K (MiSTer)", "NES (NESTang)"};   /* every machine labeled with its source core (Atlas / MiSTer / NESTang) */
 static const char* const MACHINE_TAG[] = {"zx128",   "pent1024",         "zx48",                    "zx48mr",                  "nes"};
 static const char* const CH_ULATIM[]   = {"EARLY (TYPE 1)", "LATE (TYPE 2)"};
+static const char* const CH_TUNE[]     = {"OFF (B0154)", "ON (LIVE)"};
+static const char* const CH_INTSRC[]   = {"PC3M5 LEGACY", "RAW ULA", "NC3M5"};
+static const char* const CH_BORDMODE[] = {"PHASE LATCH", "PIXEL LIVE"};
 static const char* const CH_REGION[]   = {"NTSC 60Hz", "PAL 50Hz", "DENDY 50Hz"};
 /* v0.15.189 РЕГИОН NES (владелец: "игра идёт быстрее, чем задумано; музычка быстрее").
    Ощущение верное, и причина не в кварце: nesclk = 21.500 МГц против эталонных 21.477272, это
@@ -2122,6 +2139,7 @@ typedef struct { int pint_v, pint_h, paper_h, paper_v, crop_l, crop_r, crop_t, c
                  int snow;  /* v349: снег ULA - свойство МАШИНЫ (у Пентагона его нет, MiSTer-48 бит
                                игнорирует). Дефолт задан явно ниже: .snow = 1 */
                  int zc;    /* v350: Z-Controller - вкл/выкл на машину */
+                 int kj;    /* B0175: интерфейс Kempston - вкл/выкл на машину */
                  int zcmode; /* v379: 0 FOLDER / 1 IMAGE */
                  int zcfat32; /* v379: 0 FAT16 / 1 FAT32 (default 1) */
                  int zcroot;  /* v379: 0 2048 / 1 512 */
@@ -2220,6 +2238,7 @@ static void mp_store(int m){ if(m<0||m>=N_MACHINES) return;
     g_mp[m].gs     = opt_gs ? 1 : 0;                                /* v265 */
     g_mp[m].snow   = opt_snow ? 1 : 0;                              /* v349: снег - свойство машины */
     g_mp[m].zc     = opt_zc ? 1 : 0;                                /* v350 */
+    g_mp[m].kj     = opt_kj ? 1 : 0;                                /* B0175 */
     g_mp[m].gsram  = (opt_gsram >= 0 && opt_gsram <= 3) ? opt_gsram : 1;   /* v281 */
     g_mp[m].gsclk  = (opt_gsclk >= 0 && opt_gsclk <= 3) ? opt_gsclk : GSCLK_DEF;   /* v336 */
     g_mp[m].ramsize = (opt_ramsize >= 0 && opt_ramsize <= 3) ? opt_ramsize : 3;   /* v314 */
@@ -2255,6 +2274,7 @@ static void mp_load (int m){ if(m<0||m>=N_MACHINES) return;
     opt_gs     = g_mp[m].gs ? 1 : 0;
     opt_snow   = g_mp[m].snow ? 1 : 0;                              /* v349: снег берём из профиля */
     opt_zc     = g_mp[m].zc ? 1 : 0;                                /* v350 */
+    opt_kj     = g_mp[m].kj ? 1 : 0;                                /* B0175 */
     opt_zcmode = g_mp[m].zcmode ? 1 : 0;
     opt_zcfat32= g_mp[m].zcfat32 ? 1 : 0;
     opt_zcroot = g_mp[m].zcroot ? 1 : 0;
@@ -2734,6 +2754,28 @@ static void ph_flush(void){
     PH_M_UNDR = g_gs_under;
     PH_M_UNGP = g_gs_ungap;
 }
+/* v0.15.437: тело команды 14 вынесено, чтобы звать его и при играющей ленте (fs_service тогда не вызывается:
+   FatFs из главного цикла нельзя, а здесь FatFs нет - только memcpy из DDR в DDR). */
+static void fs_frame_snapshot(void){
+    const uint32_t fb0 = 0x0FF00000u, stride = 0x10000u, fsz = 384u*302u/2u;   /* 57 984 Б, 4bpp 384x302 */
+    /* v0.15.436: ARM читает буферы кадра через L2, а Xil_DCacheInvalidateRange трогает только L1 - после первого
+       снимка строки кадра оседали в L2 и все снимки отдавали старый кадр (esh1 при идущем SHOCK, 02.09). */
+    Xil_L2CacheInvalidateRange((INTPTR)fb0, 3u*stride);
+    Xil_DCacheInvalidateRange((INTPTR)fb0, 3u*stride);
+    for(uint32_t b = 0; b < 3u; b++)
+        memcpy((void*)(FS_BUF_ADDR + b*stride), (const void*)(fb0 + b*stride), fsz);
+    Xil_DCacheFlushRange((INTPTR)FS_BUF_ADDR, 3u*stride);
+    Xil_L2CacheFlushRange((INTPTR)FS_BUF_ADDR, 3u*stride);
+    g_fs_n = 3u;
+    g_fs_done = 1;
+}
+/* v0.15.437: при g_tape_on обслуживается ТОЛЬКО команда 14 (снимок кадра) - остальное ждёт конца ленты, как раньше. */
+static void fs_snapshot_only_service(void){
+    if(g_fs_cmd != 14u) return;
+    g_fs_cmd = 0; g_fs_done = 0; g_fs_err = 0;
+    fs_frame_snapshot();
+}
+
 static void fs_service(void){
     uint32_t cmd = g_fs_cmd;
     if(cmd == 0) return;                       /* cheap poll: nothing requested */
@@ -2863,6 +2905,21 @@ static void fs_service(void){
         f_close(&f);
         g_fs_n = bw;
         if(rr == FR_OK && bw == n){ g_fs_done = 1; } else { g_fs_err = rr ? (uint32_t)rr : 0xF5u; g_fs_done = 0xE; }
+        return;
+    }
+
+    if(cmd == 14){                             /* ---- v0.15.435 FRAME SNAPSHOT: три буфера кадра машины -> FS_BUF ----
+                                                  🥇 Зачем. Кадр из DDR читался с хоста по JTAG ~15 с, а машина за это время
+                                                  рисует сотни кадров; тройной буфер (fb_bufmgr3: FB0 0x0FF00000, шаг 0x10000)
+                                                  вращает роли запись/готов/дисплей каждый кадр - снимок выходил СМЕСЬЮ
+                                                  кадров, и всё, что дрейфует от кадра к кадру, выглядело как пространственная
+                                                  периодика (ложный «период 96 строк» у CONTINT 02.09). Здесь ARM копирует все
+                                                  три буфера за ~3 мс - внутри одного кадра, - и минимум две копии из трёх
+                                                  оказываются ЦЕЛЫМИ последовательными кадрами (буфер записи - рваный, виден по
+                                                  разрыву). Копии лежат в FS_BUF с тем же шагом 0x10000; хост читает их по JTAG
+                                                  сколько угодно. Буферы пишет PL, значит кеш ARM для них надо ИНВАЛИДИРОВАТЬ до
+                                                  чтения; копии - СБРОСИТЬ после записи, иначе JTAG увидит старое. */
+        fs_frame_snapshot();
         return;
     }
 
@@ -8656,6 +8713,7 @@ static void apply_zc(void){
     int m = (opt_defmachine>=0 && opt_defmachine<N_MACHINES) ? opt_defmachine : 0;
     opt_zc = opt_zc ? 1 : 0;
     g_mp[m].zc = opt_zc;
+    g_mp[m].kj = opt_kj;
     if(opt_zc){
         if(!zc_open()){
             opt_zc = 0; g_mp[m].zc = 0;
@@ -9246,6 +9304,7 @@ static void cfg_set(const char* k, const char* v){
     else if(!cicmp(k,"fastload")){ int d=v[0]-'0'; if(d<0)d=0; if(d>2)d=2; opt_fastload=d; }
     else if(!cicmp(k,"region")){ int r=v[0]-'0'; if(r>=0&&r<=2) opt_region=r; }   /* v0.15.189 регион NES */
     else if(!cicmp(k,"snow")){ opt_snow = (v[0]!='0'); }   /* v145 ULA snow (global) */
+    else if(!cicmp(k,"kempston")){ opt_kj = (v[0]!='0'); }   /* B0175 интерфейс Kempston */
     else if(!cicmp(k,"dmrootent")){ opt_dmroot = (v[0]!='0'); }   /* v355 */
     else if(!cicmp(k,"dmfat32")){ opt_dmfat32 = (v[0]!='0'); }    /* v359 */
     else if(!cicmp(k,"dmwrite")){ opt_dmwr = (v[0]!='0'); }       /* v405, теперь только DivMMC */
@@ -9565,6 +9624,7 @@ static int config_save(void){                  /* 1 = written OK, 0 = failed (ca
     { p=appstr(o,p,"fastload="); p=appch(o,p,(char)('0'+(opt_fastload&3))); p=appch(o,p,'\r'); p=appch(o,p,'\n'); }                    /* GLOBAL tape-service */
     { p=appstr(o,p,"region=");   p=appch(o,p,(char)('0'+(opt_region&3)));   p=appch(o,p,'\r'); p=appch(o,p,'\n'); }                  /* v0.15.189 регион NES */
     { p=appstr(o,p,"snow=");     p=appch(o,p,(char)('0'+(opt_snow&1)));     p=appch(o,p,'\r'); p=appch(o,p,'\n'); }
+    { p=appstr(o,p,"kempston="); p=appch(o,p,(char)('0'+(opt_kj&1)));       p=appch(o,p,'\r'); p=appch(o,p,'\n'); }
     { p=appstr(o,p,"dmrootent="); p=appch(o,p,(char)('0'+(opt_dmroot&1))); p=appch(o,p,'\r'); p=appch(o,p,'\n'); }   /* v355 */
     { p=appstr(o,p,"dmfat32=");   p=appch(o,p,(char)('0'+(opt_dmfat32&1))); p=appch(o,p,'\r'); p=appch(o,p,'\n'); }  /* v359 */
     { p=appstr(o,p,"dmwrite=");   p=appch(o,p,(char)('0'+(opt_dmwr&1))); p=appch(o,p,'\r'); p=appch(o,p,'\n'); }  /* v405 */
@@ -9678,14 +9738,28 @@ static void apply_pos(void){ DDR_OSD_POS = ((unsigned)opt_y<<16) | (unsigned)opt
    cold-reboots the machine (the F11 RESET+wipe path), like a real machine swap. At boot we only set
    the register (the machine cold-starts anyway). index 1 = Pentagon 1024K -> Pentagon timing bit. */
 static void apply_pint(void){ PENT_INT = ((unsigned)opt_pintv<<16) | (unsigned)opt_pinth; }  /* LIVE only: pokes register. Core keeps running, border not broken. */
-static void apply_paper(void){ PAPER_H = (unsigned)opt_paper_h; PAPER_V = (unsigned)opt_paper_v; }
+static void apply_crop(void);   /* v0.15.434: панорама живёт в кропе, объявление нужно раньше тела */
+/* v0.15.434: пункт двигает ДВА механизма - растровый (Пентагон) и оконный (все остальные),
+   поэтому кроп надо пересчитать здесь же, иначе сдвиг не вступит в силу до чужого вызова. */
+static void apply_scr(void);    /* v0.15.440: панорама двигает окно вывода - нужно объявление раньше тела */
+static int  machine_pans_view(void);   /* v0.15.440: тело ниже, рядом с apply_crop */
+static void apply_paper(void){ PAPER_H = (unsigned)opt_paper_h; PAPER_V = (unsigned)opt_paper_v; apply_crop(); apply_scr(); }
 static void apply_ulatune(void){
-    unsigned val = (1u << 31); /* TUNE_ENABLE */
+    int ula_delta = opt_ula_phase - 32;
+    int irq_delta = opt_irq_phase - 256;
+    unsigned val = opt_ula_tune_en ? (1u << 31) : 0u;
+    unsigned val2 = 0u;
     val |= ((unsigned)opt_bord_phase & 0xFu);
     val |= (((unsigned)opt_io_cont & 0x7u) << 4);
-    val |= ((((unsigned)opt_sincl_inth) & 0x1FFu) << 15);
+    val |= (((unsigned)opt_int_src & 0x3u) << 7);
+    val |= (((unsigned)ula_delta & 0x3Fu) << 9);
+    val |= (((unsigned)irq_delta & 0x1FFu) << 15);
     val |= (((unsigned)opt_bord_delay & 0x3u) << 24);
     val |= (((unsigned)opt_pap_delay & 0xFu) << 26);
+    val2 |= ((unsigned)opt_fbus_delay & 0x3u);
+    val2 |= (((unsigned)opt_mem_cont & 0x7u) << 2);
+    val2 |= (((unsigned)opt_border_mode & 0x1u) << 5);
+    ULA_TUNE2_REG = val2; /* extension first; EN in the primary word commits the coherent profile */
     ULA_TUNE_REG = val;
 }  /* LIVE only: pokes register. Core keeps running, border not broken. */
 /* v0.15.157 PER-MACHINE whole-frame HDMI position. The menu edits opt_scr_x/y (the VIEW); apply
@@ -9741,7 +9815,19 @@ static void apply_scr(void){
     if(opt_scr_y + ph > 720)  opt_scr_y = (ph > 720)  ? 0 : (720-ph);
     g_mp[m].scr_x  = opt_scr_x;   g_mp[m].scr_y  = opt_scr_y;
     g_mp[m].scr_sx = opt_scr_sx;  g_mp[m].scr_sy = opt_scr_sy;
-    SCR_POS   = ((unsigned)opt_scr_y<<16) | ((unsigned)opt_scr_x & 0xFFFFu);
+    /* v0.15.440: на машинах, где фабрика игнорирует paper_h/paper_v, тот же пункт меню двигает
+       картинку НА РАСТРЕ ВЫВОДА. Сдвиг НЕ пишется в сохранённые scr_x/scr_y - иначе он копился бы
+       при каждом применении. Знак круговой, как владелец привык с B0127: 440 = «минус восемь». */
+    int ox = opt_scr_x, oy = opt_scr_y;
+    if(machine_pans_view()){
+        int px = opt_paper_h, py = opt_paper_v;
+        if(px > 224) px -= 448;
+        if(py > 156) py -= 312;
+        ox += px; oy += py;
+        if(ox < 0) ox = 0;   if(ox + pw > 1280) ox = (pw > 1280) ? 0 : (1280 - pw);
+        if(oy < 0) oy = 0;   if(oy + ph > 720)  oy = (ph > 720)  ? 0 : (720 - ph);
+    }
+    SCR_POS   = ((unsigned)oy<<16) | ((unsigned)ox & 0xFFFFu);
     SCR_SCALE = ((unsigned)opt_scr_sy<<4) | ((unsigned)opt_scr_sx & 0xFu);
 }
 static void apply_numjoy(void){                 /* v176: живёт сразу + в набор машины */
@@ -9789,13 +9875,39 @@ static void act_scr_center(void){                 /* one keypress instead of hun
 }
 /* LIVE crop: L/R/T/B trim the captured 384x302 frame. Compute the effective fb_line_disp window
    (origin sx0/sy0 + size cropw/croph), clamped so it can never invert. Global (machine-independent). */
+/* Фабрика применяет paper_h/paper_v только на Пентагоне (см. video.v). На остальных машинах тот
+   же пункт меню осмысленно двигать окно вывода - механизм другой, направление для владельца то же. */
+static int machine_pans_view(void){ return opt_defmachine != 1; }   /* 1 = pent1024 */
+
+/* 🥇 v0.15.434 PAN X/Y ТЕПЕРЬ ДВИГАЕТ ОКНО ВЫВОДА, А НЕ ТОЛЬКО РАСТР.
+   Жалоба владельца 02.09: «прокрутка экрана машины внутри кадра Pan X/Y не работает, экран съехал,
+   выровнять не могу». Причина была в фабрике: `paper_h`/`paper_v` применяются ТОЛЬКО на Пентагоне
+   (`video.v`: `pentagon ? paper_h : 9'd0`), и это сделано намеренно - они двигают бумагу ВНУТРИ
+   растра, а окно контеншена считается по сырой растровой координате и за ними не идёт. На Пентагоне
+   контеншена нет, поэтому там сдвиг безопасен; на 48K он разъехал бы бумагу с окном занятости и
+   сломал бы порог stime и CONTP, которые сведены с живой машиной.
+   Поэтому на машинах, где фабрика эти значения игнорирует, тот же пункт меню двигает окно ВЫВОДА:
+   меняется начало кропа, а ШИРИНА остаётся. Раньше так было нельзя - `Crop left` двигает начало И
+   сжимает ширину, то есть панорама требовала крутить два пункта в разные стороны.
+   Знак берётся кругом, как владелец уже привык с B0127: 0 - без сдвига, 440 - «минус восемь».
+   Величина - в исходных пикселях кадра (384x302), то есть в тех же единицах, что и кроп. */
 static void apply_crop(void){
     int l=opt_crop_l, r=opt_crop_r, t=opt_crop_t, b=opt_crop_b;
     if(l+r > 380) { r = 380-l; if(r<0){l=380;r=0;} }          /* keep width >= 4 */
     if(t+b > 298) { b = 298-t; if(b<0){t=298;b=0;} }          /* keep height >= 4 */
-    unsigned sx0=(unsigned)l, sy0=(unsigned)t;
     unsigned cropw=(unsigned)(384-l-r), croph=(unsigned)(302-t-b);
-    CROP_A = (sy0<<16) | (sx0 & 0xFFFFu);
+    int sx0=l, sy0=t;
+    /* 🥇 v0.15.440 ПАНОРАМА БОЛЬШЕ НЕ ТРОГАЕТ ОКНО ИСТОЧНИКА. Окно в кадре ОДНОЗНАЧНО задано парой
+       «сверху crop_t, снизу crop_b» - свободы для сдвига там нет ВООБЩЕ, поэтому любая попытка
+       положить туда ещё и панораму неизбежно подменяет смысл одного из краёв. Так и было: при
+       `paper_v=5` и `crop_b=0` окно выходило 5..306 из 302 строк, зажим двигал НАЧАЛО, и каждый шаг
+       «кроп снизу» резал СВЕРХУ (жалоба владельца 16.09: «кроп боттом делает кроп сверху, и кроп топ -
+       тоже сверху»). Промежуточная правка v0.15.439 зажимала саму панораму запасом кропа - окно
+       переставало вылезать за кадр, но верх всё равно съедался, потому что панорама честно
+       расходовала тот самый запас. Развели окончательно: КРОП режет свои края, ПАНОРАМА двигает
+       картинку на растре вывода (см. apply_scr). На Пентагоне панорама как была растровой в фабрике
+       (`video.v`: `pentagon ? paper_h : 0`), так и осталась. */
+    CROP_A = ((unsigned)sy0<<16) | ((unsigned)sx0 & 0xFFFFu);
     CROP_B = (croph<<16) | (cropw & 0xFFFFu);
 }
 static void rom_reapply_and_reset(void);   /* v302: общий хвост всех правок ПЗУ (тело ниже) */
@@ -9846,6 +9958,10 @@ static unsigned machine_cfg_word(void){
     if(opt_zc && opt_defmachine != 4 && (LOAD_CAPS_R & LOADCAP_DIVMMC)){
         cfg |= (1u << 19);
     }
+    /* B0175 бит28 = интерфейс Kempston ЕСТЬ. На голом 48K его нет, и конус `a5=0` не должен
+       перебивать плавающую шину: измерено на стенде - из 1659 чтений за кадр джойстик отдавал 831.
+       Умолчание 0 (нет интерфейса) - решение владельца 09.09; включать опцией под игру. */
+    if(opt_kj && opt_defmachine != 4) cfg |= (1u << 28);
     /* v383/v387 Бит скорости SPI принадлежит ОБЩЕМУ движку карты, а не одному транспорту: карта в
        фабрике одна, и оба порта (#57 у Z-Controller, #EB у DivMMC) сдвигают через неё же. Раньше бит
        ставился только внутри ветки Z-Controller, поэтому конфигурация «DivMMC включён, ZC выключен»
@@ -9887,7 +10003,7 @@ static void apply_machine(void){
         g_menu_restructure = 1;                    /* the Machine submenu item set changes -> force a full menu re-render */
         mp_store(applied);                         /* save the machine we are leaving (keep its live tweaks) */
         mp_load(opt_defmachine);                   /* load the machine we are entering -> opt_* */
-        apply_pint(); apply_paper(); apply_crop(); /* push that machine's INT + paper + crop to the fabric (live, safe) */
+        apply_pint(); apply_paper(); apply_ulatune(); apply_crop(); /* push machine timing + paper + crop */
     }
     if(first || changed){
         /* GUARDED, glitch-free machine-mode transition. The core's ROM bank / RAM paging / contention
@@ -9957,7 +10073,8 @@ static int rom_port_ok(void){
     dn_status_msg("ROM PORT ABSENT");
     return 0;
 }
-static void apply_snow(void){ MACHINE_CFG = machine_cfg_word(); }   /* v145: LIVE ULA-snow toggle. Only bit4 changes vs the running mode -> the vmmA1 mux flips, no ROM/paging glitch, no reset. */
+static void apply_snow(void){ MACHINE_CFG = machine_cfg_word(); }
+static void apply_kj(void){ MACHINE_CFG = machine_cfg_word(); }   /* B0175: бит28 живой, сброс не нужен */   /* v145: LIVE ULA-snow toggle. Only bit4 changes vs the running mode -> the vmmA1 mux flips, no ROM/paging glitch, no reset. */
 /* v0.15.207 ROM SET: смена набора ПЗУ - это смена ЛИЦА машины, поэтому обязателен холодный старт
    (иначе Z80 продолжит исполнять адреса прежнего ПЗУ). MACHINE_CFG перетолкивается ПОСЛЕ заливки:
    бит5 (трап TR-DOS) зависит от того, нашлась ли в наборе страница TR-DOS. */
@@ -10317,8 +10434,8 @@ static menu_item opt_items[] = {
     {"MACHINE", ITEM_CHOICE, &opt_defmachine, CH_MACHINE, N_MACHINES, machine_select_dialog, apply_machine, 0, 0, 1},
     {"PENT INT V", ITEM_RANGE, &opt_pintv, 0, 1, 0, apply_pint, 319, ""},   /* [21] step 1 (hold to repeat) */
     {"PENT INT H", ITEM_RANGE, &opt_pinth, 0, 1, 0, apply_pint, 447, ""},   /* [22] step 1 */
-    {"PAPER H OFF", ITEM_RANGE, &opt_paper_h, 0, 1, 0, apply_paper, 447, ""}, /* [23] step 1: paper h within frame. B0127: диапазон ВСЯ СТРОКА (447), потому что ручка стала КРУГОВОЙ: 447 = минус один пиксель, 440 = минус восемь. Раньше 127 и упор в ноль - владелец не мог увести бумагу влево, а именно это и нужно, когда бумага разъехалась с бордюром (INT H двигает их вместе и не помогает). */
-    {"PAPER V OFF", ITEM_RANGE, &opt_paper_v, 0, 1, 0, apply_paper, 319, ""}, /* [24] step 1: paper v within frame. B0127: круговая по числу строк кадра (319 = минус одна строка). */
+    {"PAPER H OFF", ITEM_RANGE, &opt_paper_h, 0, 1, 0, apply_paper, 447, ""}, /* [24] step 1: paper h within frame. B0127: диапазон ВСЯ СТРОКА (447), потому что ручка стала КРУГОВОЙ: 447 = минус один пиксель, 440 = минус восемь. Раньше 127 и упор в ноль - владелец не мог увести бумагу влево, а именно это и нужно, когда бумага разъехалась с бордюром (INT H двигает их вместе и не помогает). */
+    {"PAPER V OFF", ITEM_RANGE, &opt_paper_v, 0, 1, 0, apply_paper, 319, ""}, /* [25] step 1: paper v within frame. B0127: круговая по числу строк кадра (319 = минус одна строка). */
     {"SCREEN X",   ITEM_RANGE, &opt_scr_x, 0, 1, 0, apply_scr, 1280, ""},    /* [25] step 1: whole frame H position on HDMI (HMARGIN, live) */
     {"SCREEN Y",   ITEM_RANGE, &opt_scr_y, 0, 1, 0, apply_scr, 720, ""},    /* [26] step 1: whole frame V position on HDMI (VMARGIN, live) - moves BORDER+paper together */
     {"CROP L",     ITEM_RANGE, &opt_crop_l, 0, 1, 0, apply_crop, 190, ""},  /* [27] step 1: trim left edge (global display) */
@@ -10414,12 +10531,20 @@ static menu_item opt_items[] = {
      note_dmwr, why_dmwr},
     {"Z-CONTROLLER WRITE", ITEM_CHOICE, &opt_zcwr, CH_DMWRITE, 2, 0, apply_cardwr, 0, 0, 1,
      note_zcwr, why_zcwr},
-    /* [80..84] B0156 / v0.15.432: live ULA timing, contention and border tuning */
+    /* [80..90] B0157 / v0.15.433: complete live Atlas-48 ULA timing lab.  Live-only by design:
+       a bad experimental profile must disappear on reboot; the accepted winner is baked into a new core. */
     {"IO CONT DLY", ITEM_RANGE, &opt_io_cont, 0, 1, 0, apply_ulatune, 7, " clk"},   /* [80] */
     {"BORD PHASE",  ITEM_RANGE, &opt_bord_phase, 0, 1, 0, apply_ulatune, 15, ""},   /* [81] */
     {"BORD DELAY",  ITEM_RANGE, &opt_bord_delay, 0, 1, 0, apply_ulatune, 3, " px"},  /* [82] */
     {"PAPER DELAY", ITEM_RANGE, &opt_pap_delay,  0, 1, 0, apply_ulatune, 15, " px"}, /* [83] */
-    {"SINCL INT H", ITEM_RANGE, &opt_sincl_inth, 0, 1, 0, apply_ulatune, 127, ""},   /* [84] */
+    {"IRQ PHASE",   ITEM_RANGE, &opt_irq_phase,  0, 1, 0, apply_ulatune, 511, " px"},/* [84], signed display */
+    {"INT SOURCE",  ITEM_CHOICE,&opt_int_src, CH_INTSRC, 3, 0, apply_ulatune},         /* [85] */
+    {"ULA PHASE",   ITEM_RANGE, &opt_ula_phase,  0, 1, 0, apply_ulatune, 63, " px"},  /* [86], signed display */
+    {"TUNE OVERRIDE",ITEM_CHOICE,&opt_ula_tune_en,CH_TUNE,2,0,apply_ulatune},          /* [87] */
+    {"MEM CONT DLY",ITEM_RANGE, &opt_mem_cont, 0, 1, 0, apply_ulatune, 7, " clk"},    /* [88] */
+    {"FLOAT BUS DLY",ITEM_RANGE,&opt_fbus_delay,0,1,0,apply_ulatune,3," tap"},         /* [89] */
+    {"BORDER MODE", ITEM_CHOICE,&opt_border_mode,CH_BORDMODE,2,0,apply_ulatune},       /* [90] */
+    {"KEMPSTON JOYSTICK", ITEM_CHOICE, &opt_kj, CH_NOYES, 2, 0, apply_kj},              /* [91] B0175: интерфейса на голом 48K нет; ВЫКЛ = порты с a5=0 отдают плавающую шину */
 };
 /* (no opt_menu instance any more: opt_items[] feed the Options > Settings nested dropdown directly) */
 
@@ -10583,7 +10708,9 @@ static const struct { short ix; const char* lab; } MENU_IX_EXPECT[] = {
     {73,"Z-CONTROLLER"},{74,"DIVMMC ROOT ENTRIES"},{75,"Z-DISK..."},{76,"DIVMMC FOLDER FS"},
     {77,"SVC PAGE UNDER TR-DOS"},                                                                 /* v388 */
     {78,"DIVMMC WRITE"},{79,"Z-CONTROLLER WRITE"},
-    {80,"IO CONT DLY"},{81,"BORD PHASE"},{82,"BORD DELAY"},{83,"PAPER DELAY"},{84,"SINCL INT H"},                                                /* v409 */
+    {80,"IO CONT DLY"},{81,"BORD PHASE"},{82,"BORD DELAY"},{83,"PAPER DELAY"},{84,"IRQ PHASE"},
+    {85,"INT SOURCE"},{86,"ULA PHASE"},{87,"TUNE OVERRIDE"},{88,"MEM CONT DLY"},
+    {89,"FLOAT BUS DLY"},{90,"BORDER MODE"},                                                /* v433 */
 };
 /* v231 АУДИТ ВЫСОТ МЕНЮ. Тот же приём, что MENU_IX_EXPECT для индексов: проверяем инвариант на
    старте, а не ждём жалобы на артефакты. Подменю машин уже дважды перерастало окружение, когда в
@@ -10637,14 +10764,10 @@ static const MenuItem mi_machine_zx[] = {
   {"GS speed...",    0,0,NULL, NULL, &opt_items[61]},   /* v298: прибор темпа карты - там же, где её опции */
   {"ULA timing",     0,0,NULL, NULL, &opt_items[38]},
   {"ULA snow",       0,0,NULL, NULL, &opt_items[39]},
-  {"IO contention",  0,0,NULL, NULL, &opt_items[80]},
-  {"Border phase",   0,0,NULL, NULL, &opt_items[81]},
-  {"Border delay",   0,0,NULL, NULL, &opt_items[82]},
-  {"Paper delay",    0,0,NULL, NULL, &opt_items[83]},
-  {"Sinclair INT H", 0,0,NULL, NULL, &opt_items[84]},
   {"Kempston map",   0,0,NULL, NULL, &opt_items[15]},   /* ввод - свойство машины, а не картинки */
   {"NumPad as joystick",0,0,NULL, NULL, &opt_items[43]},
   {"Kempston mouse", 0,0,NULL, NULL, &opt_items[67]},   /* v304: #FADF/#FBDF/#FFDF; KEYPAD = водит цифровой блок */
+  {"Kempston joystick", 0,0,NULL, NULL, &opt_items[91]},   /* B0175: интерфейс, а не раскладка */
 };
 static const MenuItem mi_machine_pent[] = {
   {"Machine",        0,0,NULL, NULL, &opt_items[21]},
@@ -10660,6 +10783,7 @@ static const MenuItem mi_machine_pent[] = {
   {"Kempston map",   0,0,NULL, NULL, &opt_items[15]},
   {"NumPad as joystick",0,0,NULL, NULL, &opt_items[43]},
   {"Kempston mouse", 0,0,NULL, NULL, &opt_items[67]},   /* v304 */
+  {"Kempston joystick", 0,0,NULL, NULL, &opt_items[91]},   /* B0175: интерфейс, а не раскладка */
   {"Service page under TR-DOS", 0,0,NULL, NULL, &opt_items[77]},   /* v388: {DOS,7FFD[4]} - вход в
                                                             файловый менеджер сервисной страницы */
 };
@@ -10672,14 +10796,10 @@ static const MenuItem mi_machine_48[] = {
   {"GS speed...",    0,0,NULL, NULL, &opt_items[61]},   /* v298: прибор темпа карты - там же, где её опции */
   {"ULA timing",     0,0,NULL, NULL, &opt_items[38]},
   {"ULA snow",       0,0,NULL, NULL, &opt_items[39]},
-  {"IO contention",  0,0,NULL, NULL, &opt_items[80]},
-  {"Border phase",   0,0,NULL, NULL, &opt_items[81]},
-  {"Border delay",   0,0,NULL, NULL, &opt_items[82]},
-  {"Paper delay",    0,0,NULL, NULL, &opt_items[83]},
-  {"Sinclair INT H", 0,0,NULL, NULL, &opt_items[84]},
   {"Kempston map",   0,0,NULL, NULL, &opt_items[15]},
   {"NumPad as joystick",0,0,NULL, NULL, &opt_items[43]},
   {"Kempston mouse", 0,0,NULL, NULL, &opt_items[67]},   /* v304 */
+  {"Kempston joystick", 0,0,NULL, NULL, &opt_items[91]},   /* B0175: интерфейс, а не раскладка */
 };
 static const MenuItem mi_machine_nes[] = {
   {"Machine",        0,0,NULL, NULL, &opt_items[21]},
@@ -10843,6 +10963,24 @@ static void machine_menu_sync(void){                     /* point the Machine/Di
     kbd_leds_set(kbd_led_mask());                           /* v216: не затереть ScrollLock-паузу */
 }
 
+/* B0157/v0.15.433: one live lab for every timing control that can affect Atlas 48K border demos.
+   It is deliberately a sibling of Machine/Display: eleven controls do not fit in the machine menu,
+   and experimental values are not persisted.  OFF returns the baked B0154 path in one step. */
+static const MenuItem mi_ulatiming[] = {
+  {"Tune override",   0,0,NULL, NULL, &opt_items[87]},
+  {"I/O contention",  0,0,NULL, NULL, &opt_items[80]},
+  {"Memory contention",0,0,NULL,NULL, &opt_items[88]},
+  {"Floating bus",    0,0,NULL, NULL, &opt_items[89]},
+  {"Border mode",     0,0,NULL, NULL, &opt_items[90]},
+  {"Border phase",    0,0,NULL, NULL, &opt_items[81]},
+  {"Border delay",    0,0,NULL, NULL, &opt_items[82]},
+  {"Paper delay",     0,0,NULL, NULL, &opt_items[83]},
+  {"ULA phase",       0,0,NULL, NULL, &opt_items[86]},
+  {"IRQ phase",       0,0,NULL, NULL, &opt_items[84]},
+  {"INT source",      0,0,NULL, NULL, &opt_items[85]},
+};
+static Menu m_ulatiming = { mi_ulatiming, MENU_N(mi_ulatiming), 0 };
+
 /* v0.15.171 (owner): "OSD dim" moved to Options > Navigator - it dims the NAVIGATOR/OSD overlay, so it
    belongs with the other UI rows. (v0.15.293: Options > Display вернулось - но уже не пустым и не
    «глобальным», а с геометрией картинки текущей машины; сюда, в Navigator, по-прежнему идёт только
@@ -10869,6 +11007,7 @@ static Menu m_audio = { mi_audio, MENU_N(mi_audio), 0 };
    (NES, MiSTer-48): там менять нечего, и живой пункт обещал бы несуществующее. Ставит признак
    machine_menu_sync() по LOAD_CAPS бит4. */
 #define MI_OPTS_ROM 1                                       /* индекс строки ROM в mi_opts */
+#define MI_OPTS_ULALAB 6                                    /* B0157: Atlas 48K-only live lab */
 static MenuItem mi_opts[] = {
   {"~M~achine",          0,           0, NULL, &m_machine, NULL, 0, st_txt_machine},   /* v411: справа - какая машина и с каким ОЗУ */
   {"~R~OM",              0,           0, NULL, &m_rom},         /* v302: слоты ПЗУ текущей машины */
@@ -10876,6 +11015,7 @@ static MenuItem mi_opts[] = {
   {"~D~isplay",          0,           0, NULL, &m_display},     /* v293: геометрия картинки текущей машины */
   {"~N~avigator",        0,           0, NULL, &m_navigator},   /* UI / browser */
   {"~A~udio",            0,           0, NULL, &m_audio},
+  {"ULA timing ~l~ab",   0,           0, NULL, &m_ulatiming},  /* live, non-persistent Atlas 48K experiments */
   {NULL},
   {"Sa~v~e config",      cmOptSave,   0, NULL},                 /* act_save()  */
   {"~E~ject SD",         cmOptEject,  0, NULL},                 /* act_eject() */
@@ -10907,6 +11047,7 @@ static void rom_slots_ui_sync(void){
       g_rombus_auto[p++] = (char)('0' + (bp & 3)); g_rombus_auto[p++] = ')'; g_rombus_auto[p] = 0; }
     /* Ядро без порта заливки (NES, MiSTer-48) менять ПЗУ не умеет - строка группы честно неактивна. */
     mi_opts[MI_OPTS_ROM].disabled = (LOAD_CAPS_R & LOADCAP_ROM) ? 0 : 1;
+    mi_opts[MI_OPTS_ULALAB].disabled = (opt_defmachine == 2 && REG_VERSION >= 0xB01B0157u) ? 0 : 1;
 }
 
 static const MenuItem mi_help[] = {
@@ -11629,7 +11770,14 @@ static void menubox_draw_row(Menu* m, int cur, int left, int top, int W, int row
             for (int j = 0; vs[j] && q < (int)sizeof(vb)-1; j++) vb[q++] = vs[j];
             vb[q] = 0;
         } else if (vit->kind == ITEM_RANGE && vit->val) {
-            itoa_u(*vit->val, vb);
+            /* B0157: the generic range engine remains 0..max, but the two signed ULA deltas are
+               stored biased so the menu can traverse both signs.  Show the physical signed value,
+               not the storage encoding (32/256 are zero). */
+            if(vit->val == &opt_ula_phase || vit->val == &opt_irq_phase){
+                int sv = *vit->val - (vit->val == &opt_ula_phase ? 32 : 256);
+                int q = 0; if(sv < 0){ vb[q++]='-'; sv = -sv; }
+                itoa_u((uint32_t)sv, vb+q);
+            } else itoa_u((uint32_t)*vit->val, vb);
             int n = slen(vb);
             if (vit->unit) {
                 for (int j = 0; vit->unit[j] && n < 20; j++) vb[n++] = vit->unit[j];
@@ -14359,7 +14507,7 @@ static void fabric_reinit_after_reload(void){
     /* Restore the OSD frame buffer base address to resolve the digital noise */
     OSD_DDR_BASE = OSDC_ADDR;
     
-    apply_pint(); apply_paper(); apply_crop(); scr_view_sync(); apply_scr();  /* re-push fabric-only live registers (view <- this machine first) */
+    apply_pint(); apply_paper(); apply_ulatune(); apply_crop(); scr_view_sync(); apply_scr();  /* re-push fabric-only live registers */
     apply_pos();  apply_dim();   apply_vol();
     apply_fast(); apply_tapesync(); apply_tape_snd(); apply_tapemute();
 
@@ -14742,6 +14890,7 @@ void main(void){
     mp_load(opt_defmachine);          /* Step 15: load the boot machine's OWN param set (INT/paper/crop) -> opt_* */
     apply_pint();                     /* Step 15: this machine's Pentagon INT position (from ini or default) */
     apply_paper();                    /* Step 15: this machine's paper position within frame */
+    apply_ulatune();                  /* B0157: lab defaults OFF; establishes coherent readback after boot */
     scr_view_sync(); apply_scr();     /* v157: per-machine whole-frame HDMI position */
     /* v0.15.202: вызов ПЕРЕЕХАЛ ниже, за apply_machine(). Здесь он стоял ДО коррекции машины по
        реально прошитому ядру и до PCAP-перезагрузки: если ini просил NES, а в ПЛИС лежал ZX, мы
@@ -14922,6 +15071,7 @@ void main(void){
         divmmc_service();             /* v327 */
         hard_reset_service();         /* v0.15.394: F11 перезапускает и General Sound */
         if(!g_tape_on) fs_service();  /* Step 15: JTAG file-manager (LIST/WRITE/DELETE/RENAME/MKDIR); deferred while a tape loads (polled FatFs, main-loop only) */
+        else fs_snapshot_only_service(); /* v0.15.437: снимок кадра (cmd 14) - и при ленте: без него SHOCK не измерить */
         ph_mark(PH_FS);
         player_pump();                /* feed the audio FIFO when a music file is playing (no-op otherwise) */
         if(player_active() && !g_tape_on && browser_on){    /* music: DN status line (name / M:SS/M:SS / progress bar), updated on change */

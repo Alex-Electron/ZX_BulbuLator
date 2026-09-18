@@ -1,0 +1,13 @@
+# артефакты xsim - пересобираются ./run.sh --build
+xsim.dir/
+wd/
+gen/
+.Xil/
+*.pb
+*.jou
+xsim*.log
+xelab.log
+xvhdl.log
+xvlog.log
+rom128.hex
+prog/*.bin

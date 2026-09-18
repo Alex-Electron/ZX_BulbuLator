@@ -1,0 +1,421 @@
+  <button type="button" data-m="files">Files</button>
+  <button type="button" data-m="play">Play</button>
+  <button type="button" data-m="tape">Tape</button>
+  <button type="button" data-m="machine">Machine</button>
+  <button type="button" data-m="options">Options</button>
+  <button type="button" data-m="help">Help</button>
+  <div class="drop" id="menu-drop"></div>
+  <section class="card" id="card-screen" data-zone="screen">
+    <h2><span>Screen</span><span class="mono" id="fps">0 FPS</span></h2>
+    <div class="screen-wrap" id="screen-wrap" tabindex="0">
+      <span class="zone-hint" id="screen-hint">click to focus 
+ machine</span>
+      <canvas id="cv" width="384" height="302"></canvas>
+    </div>
+    <div class="bar">
+      <span id="lat">
+      <span id="netinfo">net: 
+      <span id="verinfo">ver: 
+    </div>
+  </section>
+  <div class="side" style="display:flex;flex-direction:column;gap:10px;min-height:0">
+    <section class="card zone-active" id="card-side" style="flex:1;min-height:420px" data-zone="files">
+      <div class="tb" id="file-tb">
+        <button type="button" class="pri" data-act="load" title="Enter">Load/Run</button>
+        <button type="button" data-act="up" title="..">
+ Up</button>
+        <button type="button" data-act="copy" title="F5">F5 Copy</button>
+        <button type="button" data-act="rename" title="F6">F6 Ren</button>
+        <button type="button" data-act="mkdir" title="F7">F7 MkDir</button>
+        <button type="button" class="danger" data-act="delete" title="F8">F8 Del</button>
+        <button type="button" data-act="refresh" title="F5 list">
+</button>
+        <button type="button" data-act="tag" title="Insert">Tag</button>
+        <button type="button" data-act="halt">Pause</button>
+        <button type="button" data-act="reset">Reset</button>
+      </div>
+      <div class="pathrow">
+        <input id="path" value="0:/" spellcheck="false" autocomplete="off">
+      </div>
+      <div class="files" id="files">
+        <div class="head" id="fs-head"><span data-s="name">Name 
+</span><span data-s="size">Size</span><span data-s="kind">T</span></div>
+        <div class="empty">Loading
+      </div>
+      <div class="msg" id="fs-msg">BulboNavigator web 
+ loader on CPU0 for FS</div>
+    </section>
+    <section class="card" id="card-opts" style="display:none">
+      <h2>Options / Network / Help</h2>
+      <div class="panel on" id="p-opts"></div>
+    </section>
+  </div>
+<div class="modal" id="modal">
+  <div class="box">
+    <h3 id="modal-title">Dialog</h3>
+    <div id="modal-body"></div>
+    <div class="actions">
+      <button type="button" id="modal-cancel">Cancel</button>
+      <button type="button" class="ok" id="modal-ok">OK</button>
+    </div>
+  </div>
+<script>
+const BASE='';
+const MACHINES=['ZX 128K','PENTAGON 1024K','ZX SPECTRUM 48K (Atlas)','ZX SPECTRUM 48K (MiSTer)','NES / DENDY'];
+const HELP_TEXT=`BulboNavigator Web 
+ parity with on-board OSD navigator
+ZONES (Focus)
+  Screen  
+ keys/gamepad 
+ guest (KBD_INJECT + JOY_STATE)
+  Files   
+ browser navigation & file ops
+  UI      
+ forms / menus
+FILES (needs loader on CPU0)
+  Enter       Load / Run (g_autotrig / mailbox)
+ Home End  Cursor
+  Insert      Tag for multi-op
+  Backspace   Parent dir
+  F5          Copy
+  F6          Rename / Move
+  F7          Make directory
+  F8 / Del    Delete (recursive)
+  Click col   Sort name/size/type
+  Pause / Reset via CONTROL (GP0)
+  Machine list 
+ opt_defmachine mailbox
+TAPE / OPTIONS (mailbox-coherent)
+  fastload, wavfast, tapesync, autostart,
+  smartload, romtrap, snow, ulalate
+  HDMI-identical RGBI colours, auto geometry,
+  native 50/60 Hz pacing, keep-alive pipeline.`;
+/* ---- state ---- */
+let zone='files', entries=[], sel=-1, sortKey='name', sortDir=1;
+let curPath='0:/', listBusy=false, joyMask=0;
+const tags=new Set(), heldKeys=new Set();
+let W=384,H=302,FB_SIZE=57984,targetHz=50,family='zx';
+let frames=0,lastMs=0,run=true,nextFetch=null;
+let modalResolve=null;
+const cv=document.getElementById('cv');
+const ctx=cv.getContext('2d',{alpha:false,desynchronized:true});
+const PAL32=(()=>{const t=new Uint32Array(16);for(let i=0;i<16;i++){const bri=i&8,r=i&4,g=i&2,b=i&1,lvl=bri?0xFF:0xD7;
+  t[i]=(r?lvl:0)|((g?lvl:0)<<8)|((b?lvl:0)<<16)|(255<<24);}return t;})();
+let img=ctx.createImageData(W,H), pix32=new Uint32Array(img.data.buffer);
+document.getElementById('host').textContent=location.host||'local';
+/* ---- zone ---- */
+function setZone(z){
+  zone=z;
+  document.querySelectorAll('.zones button').forEach(b=>b.classList.toggle('on',b.dataset.zone===z));
+  document.getElementById('card-screen').classList.toggle('zone-active',z==='screen');
+  document.getElementById('card-side').classList.toggle('zone-active',z==='files'||z==='ui');
+  const pill=document.getElementById('pill-zone');
+  pill.textContent='zone: '+z;
+  pill.className='pill'+(z==='screen'?' ok':'');
+  document.getElementById('screen-hint').textContent=z==='screen'?'ACTIVE 
+ machine':'click to focus 
+ machine';
+  if(z==='screen') document.getElementById('screen-wrap').focus({preventScroll:true});
+  if(zone!=='screen') releaseAllGuestKeys();
+  closeMenu();
+document.querySelectorAll('.zones button').forEach(b=>b.onclick=e=>{e.stopPropagation();setZone(b.dataset.zone);});
+document.getElementById('card-screen').addEventListener('mousedown',()=>setZone('screen'));
+document.getElementById('card-side').addEventListener('mousedown',()=>{if(zone!=='files')setZone('files');});
+/* ---- modal ---- */
+function modal(title, html, def=''){
+  return new Promise(res=>{
+    modalResolve=res;
+    document.getElementById('modal-title').textContent=title;
+    document.getElementById('modal-body').innerHTML=html;
+    document.getElementById('modal').classList.add('on');
+    const inp=document.querySelector('#modal-body input');
+    if(inp){inp.value=def;inp.focus();inp.select();}
+function modalClose(v){
+  document.getElementById('modal').classList.remove('on');
+  const r=modalResolve; modalResolve=null; if(r) r(v);
+document.getElementById('modal-cancel').onclick=()=>modalClose(null);
+document.getElementById('modal-ok').onclick=()=>{
+  const inp=document.querySelector('#modal-body input');
+  modalClose(inp?inp.value:true);
+document.getElementById('modal').addEventListener('keydown',e=>{
+  if(e.key==='Escape'){e.preventDefault();modalClose(null);}
+  if(e.key==='Enter'){e.preventDefault();document.getElementById('modal-ok').click();}
+/* ---- menubar ---- */
+const MENUS={
+  files:[
+    {t:'Load / Run',k:'Enter',a:()=>fsActivate()},
+    {t:'Up one dir',a:()=>goUp()},
+    {sep:1},
+    {t:'Copy
+',k:'F5',a:()=>opCopy()},
+    {t:'Rename / Move
+',k:'F6',a:()=>opRename()},
+    {t:'Make dir
+',k:'F7',a:()=>opMkdir()},
+    {t:'Delete
+',k:'F8',a:()=>opDelete()},
+    {sep:1},
+    {t:'Refresh',a:()=>listDir()},
+    {t:'Sort by name',a:()=>setSort('name')},
+    {t:'Sort by size',a:()=>setSort('size')},
+  play:[
+    {t:'Launch selected as media',a:()=>fsActivate()},
+    {t:'(Play/Pause on-board Space 
+ via Screen zone)',a:()=>setZone('screen')},
+  tape:[
+    {t:'Launch selected as tape',a:()=>fsActivate()},
+    {sep:1},
+    {t:'Smart load ON',a:()=>optSet({smartload:1})},
+    {t:'Smart load OFF',a:()=>optSet({smartload:0})},
+    {t:'Auto-start ON',a:()=>optSet({autostart:1})},
+    {t:'TAP/TZX FAST 8
+',a:()=>optSet({fastload:1})},
+    {t:'TAP/TZX OFF',a:()=>optSet({fastload:0})},
+  machine:[
+    {t:'Pause machine',a:()=>ctrl({halt:1})},
+    {t:'Resume machine',a:()=>ctrl({halt:0})},
+    {t:'Hard reset',a:()=>ctrl({reset:1})},
+    {sep:1},
+    ...MACHINES.map((name,id)=>({t:name,a:()=>setMachine(id)})),
+  options:[
+    {t:'Refresh options',a:()=>showOpts()},
+    {t:'Network (DHCP/Static)',a:()=>showNet()},
+    {sep:1},
+    {t:'ULA snow ON',a:()=>optSet({snow:1})},
+    {t:'ULA snow OFF',a:()=>optSet({snow:0})},
+    {t:'ULA Late',a:()=>optSet({ulalate:1})},
+    {t:'ULA Early',a:()=>optSet({ulalate:0})},
+  help:[
+    {t:'Hotkeys',a:()=>showHelp()},
+    {t:'About /info',a:()=>showAbout()},
+function closeMenu(){document.getElementById('menu-drop').classList.remove('on');}
+function openMenu(name,btn){
+  const drop=document.getElementById('menu-drop');
+  const items=MENUS[name]||[];
+  drop.innerHTML='';
+  items.forEach(it=>{
+    if(it.sep){const s=document.createElement('div');s.className='sep';drop.appendChild(s);return;}
+    const b=document.createElement('button');
+    b.type='button';
+    b.innerHTML=esc(it.t)+(it.k?`<kbd>${it.k}</kbd>`:'');
+    b.onclick=()=>{closeMenu();it.a&&it.a();};
+    drop.appendChild(b);
+  const r=btn.getBoundingClientRect();
+  drop.style.left=Math.max(8,r.left)+'px';
+  drop.classList.add('on');
+document.querySelectorAll('.menubar > button[data-m]').forEach(b=>{
+  b.onclick=e=>{e.stopPropagation();const on=document.getElementById('menu-drop').classList.contains('on')&&b.classList.contains('open');
+    document.querySelectorAll('.menubar > button').forEach(x=>x.classList.remove('open'));
+    if(on) closeMenu(); else {b.classList.add('open');openMenu(b.dataset.m,b);setZone('ui');}
+document.addEventListener('click',e=>{if(!e.target.closest('.menubar'))closeMenu();});
+/* ---- FS API ---- */
+async function fsApi(cmd,path,path2){
+  const body={cmd};
+  if(path!=null) body.path=path;
+  if(path2!=null) body.path2=path2;
+  const r=await fetch(BASE+'/api/fs',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify(body)});
+  const t=await r.text();
+  if(!r.ok) throw new Error(t);
+  return t;
+async function ctrl(o){
+  const r=await fetch(BASE+'/api/ctrl',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify(o)});
+  const t=await r.text(); msg(t,r.ok); return r.ok;
+async function optSet(o){
+  const r=await fetch(BASE+'/api/opt',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify(o)});
+  const t=await r.text(); msg(t,r.ok); pollStatus(); return r.ok;
+async function setMachine(id){
+  await fetch(BASE+'/api/machine',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify({id})});
+  await optSet({defmachine:id});
+  msg('Machine '+id+': '+MACHINES[id],true);
+function msg(t,ok){const el=document.getElementById('fs-msg');el.textContent=t;el.className='msg'+(ok===false?' err':ok?' ok':'');}
+function esc(s){return String(s).replace(/[&<>"']/g,c=>({'&':'&amp;','<':'&lt;','>':'&gt;','"':'&quot;',"'":'&#39;'}[c]));}
+function joinPath(dir,name){
+  let p=dir||'0:/'; if(!p.endsWith('/')) p+='/';
+  return p+name;
+function selectedEntry(){return (sel>=0 && entries[sel])?entries[sel]:null;}
+function selectedPaths(){
+  if(tags.size) return [...tags];
+  const e=selectedEntry();
+  return e && e.name!=='..' ? [e.full] : [];
+async function listDir(path){
+  if(path==null) path=document.getElementById('path').value||'0:/';
+  if(!path.endsWith('/') && path!=='0:') path+='/';
+  if(path==='0:') path='0:/';
+  curPath=path; document.getElementById('path').value=path;
+  const box=document.getElementById('files');
+  listBusy=true; document.getElementById('pill-fs').textContent='fs busy'; document.getElementById('pill-fs').className='pill hot';
+    const r=await fetch(BASE+'/api/fs/list?path='+encodeURIComponent(path),{cache:'no-store'});
+    const t=await r.text();
+    if(!r.ok) throw new Error(t);
+    const lines=t.trim().split('\n').filter(Boolean);
+    entries=[];
+    if(path!=='0:/') entries.push({name:'..',size:0,kind:'D',full:path,ext:''});
+    lines.forEach(line=>{
+      if(line.startsWith('...')) return;
+      const [name,size,kind]=line.split('\t');
+      if(!name) return;
+      const isDir=kind==='D';
+      const ext=isDir?'':(name.includes('.')?name.split('.').pop().toLowerCase():'');
+      entries.push({name,size:+size||0,kind:isDir?'D':'F',full:joinPath(path,name)+(isDir?'/':''),ext});
+    sortEntries();
+    renderFiles();
+    msg(entries.length+' entries 
+ loader FS mailbox',true);
+    document.getElementById('pill-fs').textContent='fs ok';
+    document.getElementById('pill-fs').className='pill ok';
+  }catch(e){
+    entries=[]; renderFiles();
+    msg(String(e.message||e),false);
+    document.getElementById('pill-fs').textContent='fs offline';
+    document.getElementById('pill-fs').className='pill err';
+  }finally{listBusy=false;}
+function setSort(k){
+  if(sortKey===k) sortDir=-sortDir; else {sortKey=k;sortDir=1;}
+  sortEntries(); renderFiles();
+function sortEntries(){
+  const head=entries[0]&&entries[0].name==='..'?entries.shift():null;
+  entries.sort((a,b)=>{
+    if(a.kind!==b.kind) return a.kind==='D'?-1:1;
+    let c=0;
+    if(sortKey==='size') c=a.size-b.size;
+    else if(sortKey==='kind') c=a.ext.localeCompare(b.ext);
+    else c=a.name.localeCompare(b.name,{sensitivity:'base'});
+    return c*sortDir;
+  if(head) entries.unshift(head);
+  document.querySelectorAll('#fs-head span').forEach(s=>{
+    const on=s.dataset.s===sortKey;
+    s.textContent=s.dataset.s[0].toUpperCase()+s.dataset.s.slice(1)+(on?(sortDir>0?' 
+function renderFiles(){
+  const box=document.getElementById('files');
+  const head=document.getElementById('fs-head');
+  box.innerHTML=''; box.appendChild(head);
+  if(!entries.length){const e=document.createElement('div');e.className='empty';e.textContent='(empty or offline)';box.appendChild(e);sel=-1;return;}
+  if(sel<0||sel>=entries.length) sel=0;
+  entries.forEach((e,i)=>{
+    const el=document.createElement('div');
+    el.className='f'+(e.kind==='D'?' d':'')+(i===sel?' sel':'')+(tags.has(e.full)?' tag':'');
+    const sz=e.kind==='D'?'&lt;DIR&gt;':fmtSize(e.size);
+    el.innerHTML=`<span class="n">${e.kind==='D'?'
+'} ${esc(e.name)}</span><span>${sz}</span><span>${e.kind}</span>`;
+    el.onclick=()=>{setZone('files');sel=i;renderFiles();};
+    el.ondblclick=()=>{setZone('files');sel=i;fsActivate();};
+    box.appendChild(el);
+  const cur=box.querySelector('.f.sel'); if(cur) cur.scrollIntoView({block:'nearest'});
+function fmtSize(n){n=+n||0;if(n<1024)return n+'';if(n<1048576)return (n/1024).toFixed(n<10240?1:0)+'K';return (n/1048576).toFixed(1)+'M';}
+function goUp(){
+  let p=curPath.replace(/\/+$/,'');
+  const i=p.lastIndexOf('/');
+  listDir(i<=1?'0:/':p.slice(0,i+1));
+async function fsActivate(){
+  const e=selectedEntry(); if(!e) return;
+  if(e.name==='..'||e.kind==='D'){ if(e.name==='..') goUp(); else listDir(e.full); return; }
+  /* launch via autotrig 
+ loader dispatches by extension */
+  const dir=curPath, name=e.name;
+    const r=await fetch(BASE+'/api/launch',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify({dir,name})});
+    msg(await r.text(),r.ok);
+    document.getElementById('pill-load').textContent='load '+name;
+    document.getElementById('pill-load').className='pill hot';
+  }catch(err){msg(String(err),false);}
+async function opCopy(){
+  const paths=selectedPaths(); if(!paths.length) return msg('nothing selected',false);
+  const dest=await modal('Copy to','<label>Destination path</label><input id="m-in">',curPath);
+  if(dest==null) return;
+  for(const src of paths){
+    const base=src.replace(/\/$/,'').split('/').pop();
+    let dst=dest;
+    if(dst.endsWith('/')||dst.endsWith(':')) dst=dst+base;
+    try{msg(await fsApi('copy',src,dst),true);}catch(e){msg(String(e.message||e),false);return;}
+  tags.clear(); listDir();
+async function opRename(){
+  const e=selectedEntry(); if(!e||e.name==='..') return msg('select a file',false);
+  const dest=await modal('Rename / Move','<label>New path</label><input id="m-in">',e.full.replace(/\/$/,''));
+  if(dest==null) return;
+  try{msg(await fsApi('rename',e.full.replace(/\/$/,''),dest),true);tags.clear();listDir();}
+  catch(err){msg(String(err.message||err),false);}
+async function opMkdir(){
+  const name=await modal('Make directory','<label>Path</label><input id="m-in">',joinPath(curPath,'newdir'));
+  if(name==null) return;
+  try{msg(await fsApi('mkdir',name),true);listDir();}
+  catch(err){msg(String(err.message||err),false);}
+async function opDelete(){
+  const paths=selectedPaths(); if(!paths.length) return msg('nothing selected',false);
+  const ok=await modal('Delete','<p>Delete '+paths.length+' item(s)? Recursive for folders.</p><input type="hidden" value="1">','1');
+  if(ok==null) return;
+  for(const p of paths){
+    try{msg(await fsApi('delete',p.replace(/\/$/,'')),true);}catch(e){msg(String(e.message||e),false);return;}
+  tags.clear(); listDir();
+function toggleTag(){
+  const e=selectedEntry(); if(!e||e.name==='..') return;
+  if(tags.has(e.full)) tags.delete(e.full); else tags.add(e.full);
+  if(sel<entries.length-1) sel++;
+  renderFiles();
+document.getElementById('file-tb').onclick=e=>{
+  const a=e.target.closest('button')?.dataset.act; if(!a) return;
+  setZone('files');
+  ({load:fsActivate,up:goUp,copy:opCopy,rename:opRename,mkdir:opMkdir,delete:opDelete,refresh:()=>listDir(),tag:toggleTag,
+    halt:()=>ctrl({halt:1}),reset:()=>ctrl({reset:1})})[a]?.();
+document.getElementById('fs-head').onclick=e=>{
+  const s=e.target.closest('[data-s]')?.dataset.s; if(s) setSort(s);
+document.getElementById('path').addEventListener('keydown',e=>{
+  if(e.key==='Enter'){setZone('ui');listDir(e.target.value);}
+/* ---- stream ---- */
+function resizeFb(w,h,sz,hz){
+  W=w|0;H=h|0;FB_SIZE=sz|0; if(hz) targetHz=hz|0;
+  cv.width=W;cv.height=H;cv.style.aspectRatio=W+'/'+H;
+  img=ctx.createImageData(W,H);pix32=new Uint32Array(img.data.buffer);
+  document.getElementById('geom').textContent=W+'
+ '+(FB_SIZE>>10)+' KiB 
+ '+targetHz+' Hz';
+function decode4bpp(u8){
+  const need=Math.min(u8.length,(W*H)>>1); let o=0;
+  for(let i=0;i<need;i++){const b=u8[i];pix32[o++]=PAL32[b&15];pix32[o++]=PAL32[(b>>4)&15];}
+async function fetchFrame(){
+  const r=await fetch(BASE+'/frame',{cache:'no-store'});
+  if(!r.ok) throw new Error(r.status);
+  return {headers:r.headers,buf:new Uint8Array(await r.arrayBuffer())};
+async function stream(){
+  if(!run) return;
+  const t0=performance.now();
+    const cur=nextFetch||fetchFrame(); nextFetch=fetchFrame();
+    const {headers,buf}=await cur;
+    if(!buf.length) throw new Error('empty');
+    const hw=+headers.get('X-FB-W'),hh=+headers.get('X-FB-H'),hz=+headers.get('X-FB-HZ');
+    const fam=headers.get('X-FB-FAMILY'); if(fam) family=fam;
+    if(hw&&hh&&(hw!==W||hh!==H||buf.length!==FB_SIZE)) resizeFb(hw,hh,buf.length,hz||targetHz);
+    else if(buf.length===57984&&FB_SIZE!==57984) resizeFb(384,302,57984,hz||50);
+    else if(buf.length===30720&&FB_SIZE!==30720) resizeFb(256,240,30720,hz||60);
+    decode4bpp(buf); ctx.putImageData(img,0,0);
+    frames++; lastMs=performance.now()-t0;
+    document.getElementById('lat').textContent=lastMs.toFixed(0)+' ms 
+'+H+(fam?' 
+ '+fam:'');
+    document.getElementById('dot').className='dot on';
+    document.getElementById('pill-link').textContent='live';
+    document.getElementById('pill-link').className='pill ok';
+  }catch(e){
+    nextFetch=null;
+    document.getElementById('dot').className='dot bad';
+    document.getElementById('pill-link').textContent='down';
+    document.getElementById('pill-link').className='pill err';
+    await new Promise(r=>setTimeout(r,250));
+  const wait=Math.max(0,1000/(targetHz||50)-(performance.now()-t0));
+  if(wait>2) setTimeout(()=>requestAnimationFrame(stream),wait); else requestAnimationFrame(stream);
+setInterval(()=>{document.getElementById('fps').textContent=frames+' FPS';frames=0;},1000);
+/* ---- input ---- */
+const PS2={KeyA:0x1C,KeyB:0x32,KeyC:0x21,KeyD:0x23,KeyE:0x24,KeyF:0x2B,KeyG:0x34,KeyH:0x33,KeyI:0x43,KeyJ:0x3B,KeyK:0x42,KeyL:0x4B,KeyM:0x3A,KeyN:0x31,KeyO:0x44,KeyP:0x4D,KeyQ:0x15,KeyR:0x2D,KeyS:0x1B,KeyT:0x2C,KeyU:0x3C,KeyV:0x2A,KeyW:0x1D,KeyX:0x22,KeyY:0x35,KeyZ:0x1A,Digit0:0x45,Digit1:0x16,Digit2:0x1E,Digit3:0x26,Digit4:0x25,Digit5:0x2E,Digit6:0x36,Digit7:0x3D,Digit8:0x3E,Digit9:0x46,Space:0x29,Enter:0x5A,Backspace:0x66,Tab:0x0D,Escape:0x76,ShiftLeft:0x12,ShiftRight:0x59,ControlLeft:0x14,AltLeft:0x11,ArrowUp:0x75,ArrowDown:0x72,ArrowLeft:0x6B,ArrowRight:0x74,F1:0x05,F2:0x06,F5:0x03,F6:0x0B,F7:0x83,F8:0x0A,F9:0x01,F10:0x09,F11:0x78,F12:0x07};
+const JOY_KEY={ArrowRight:1,ArrowLeft:2,ArrowDown:4,ArrowUp:8,KeyZ:16,KeyX:32,KeyC:64,Space:16};
+async function sendKey(code,release){try{await fetch(BASE+'/api/key',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify({code,release:release?1:0})});}catch(_){}}
+async function sendJoy(mask){joyMask=mask|0;try{await fetch(BASE+'/api/joy',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify({mask:joyMask})});}catch(_){}}
+function releaseAllGuestKeys(){heldKeys.forEach(c=>sendKey(c,1));heldKeys.clear();if(joyMask)sendJoy(0);}
+window.addEventListener('keydown',ev=>{
+  if(document.getElementById('modal').classList.contains('on')) return;
+  const tag=(ev.target&&ev.target.tagName)||'';
+  if(tag==='INPUT'||tag==='SELECT'||tag==='TEXTAREA'){if(zone!=='ui')setZone('ui');return;}
+  /* global navigator hotkeys when Files zone (or always for F-keys if not screen) */
+  if(zone==='files' || (zone!=='screen' && /^F\d/.test(ev.key))){
+    if(ev.key==='ArrowDown'){ev.preventDefault();sel=Math.min(entries.length-1,sel+1);renderFiles();return;}
+    if(ev.key==='ArrowUp'){ev.preventDefault();sel=Math.max(0,sel-1);renderFiles();return;}
+    if(ev.key==='Home'){ev.preventDefault();sel=0;renderFiles();return;}
+    if(ev.key==='End'){ev.preventDefault();sel=entries.length-1;renderFiles();return;}
+    if(ev.key==='Enter'){ev.preventDefault();fsActivate();return;}

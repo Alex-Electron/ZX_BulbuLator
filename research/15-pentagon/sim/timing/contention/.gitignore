@@ -1,0 +1,11 @@
+wd/
+xsim.dir/
+*.pb
+*.jou
+*.backup.*
+xsim.log
+xelab.log
+xvhdl.log
+xvlog.log
+rom128.hex
+gen/

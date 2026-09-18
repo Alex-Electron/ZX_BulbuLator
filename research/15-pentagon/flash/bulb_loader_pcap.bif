@@ -1,1 +1,1 @@
-all:{ ../bulbulator_zx_loader.bit }
+all:{ ../sources/build/bulbulator_zx_loader.bit }

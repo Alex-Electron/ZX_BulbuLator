@@ -3,7 +3,56 @@ module memory
 //-------------------------------------------------------------------------------------------------
 (
 	input  wire       model,
-	input  wire       mapper,
+	input  wire       pent1024,  // 1 = машина Пентагон 1024: расширенные банки 7FFD[7:5] + порт EFF7
+	input  wire[ 2:0] ram_nobit, // B0120 ОБЪЁМ ОЗУ (MACHINE_CFG [16:14]): маска ОТСУТСТВУЮЩИХ
+	                             //     старших бит банка. 000 = все три есть (1024К, прежнее
+	                             //     поведение и значение по умолчанию, поэтому поле инвертное),
+	                             //     001 = нет d6 (512К), 011 = нет d6/d7 (256К), 111 = нет ни
+	                             //     одного (128К). Недостающего бита у машины просто НЕТ - он
+	                             //     ИГНОРИРУЕТСЯ, как на плате без этих микросхем: запись в 7FFD
+	                             //     проходит, банк не меняется. Это НЕ то же самое, что снять
+	                             //     бит0 MACHINE_CFG ради «честных 128К»: там бит5 порта снова
+	                             //     становится БЛОКИРОВКОЙ страничности, и софт, который его
+	                             //     пишет (Wild Player пишет 7FFD=0x20), намертво замораживает
+	                             //     окно 0xC000 - проверено на железе 10.08.
+	                             //     Маску считает ARM, а не фабрика: готовые три бита складываются
+	                             //     в ту же LUT, что и условие окна, и правка стоит НОЛЬ LUT
+	                             //     (дизайн стоит на 91 % и уже один раз не разместился).
+	input  wire       snow_off,  // 1 = ULA snow OFF (clean raster fetch); 0 = faithful 128 snow (default)
+	input  wire       mapper,    // 1 = DivMMC/esxdos ЕСТЬ. Это и есть признак «DivMMC включён»
+	                             //     (main.v:18 «0 = off, 1 = on»), MACHINE_CFG бит17. Отдельный
+	                             //     второй порт под то же понятие не заводим сознательно: два
+	                             //     предиката на один латч в этом проекте уже оплачены (варп
+	                             //     ленты, B0128) - топ поднимает ОДИН этот провод, и вместе с
+	                             //     ним оживают порт #E3, автомаппер, матрица памяти и шестой
+	                             //     терм дешифрации EFF7. РЕШЕНИЕ ВЛАДЕЛЬЦА 13.08: при DivMMC = ON
+	                             //     бета-диск не нужен, поэтому этот же провод ГАСИТ трап 0x3Dxx
+	                             //     TR-DOS (см. trdos_en_eff ниже) - отдельной опции арбитража нет.
+
+	// --- B0131 DivMMC: опции машины. ВСЕ ПОЛЯ ИНВЕРТНЫ ИЛИ ДЕФОЛТНО-НУЛЕВЫЕ СОЗНАТЕЛЬНО ---
+	// Правило то же, что у ram_nobit: НОЛЬ = рекомендованное (спековое) поведение. Тогда и
+	// неподключённый порт, и незаполненный ini дают ПРАВИЛЬНУЮ машину, а не тихо сломанный старт.
+	// Все четыре бита ЗАГЕЙТОВАНЫ mapper: при DivMMC = OFF выражения сворачиваются в прежние.
+	//   [0] MACHINE_CFG[18] = СНЯТЬ гейт входов автомаппера.
+	//        0 (умолчание) = как ЖИВОЙ Sizif (cpld/rtl/divmmc.sv:63-67): 0x0008/0x0038/0x04C6/
+	//          0x0562/0x3Dxx срабатывают только при (48 BASIC в окне || предыдущая выборка НЕ из
+	//          окна ПЗУ). Это нужно на Пентагоне и 128К, иначе RST 8 из 128-редактора уходит
+	//          в esxDOS. Трогать: когда софт требует поведения настоящей платы Prato/MiSTer.
+	//   [1] MACHINE_CFG[23] = СНЯТЬ защиту записи страницы 3 при MAPRAM.
+	//        0 (умолчание) = спека Zilog/Sizif/Next (Divide_pgm_model.txt:145-151). 1 = поведение
+	//        MiSTer (rtl/divmmc.v:88-90, защиты нет вовсе). Трогать: софту, который кладёт систему
+	//        в страницу 3 «по-простому», уже подняв MAPRAM.
+	//   [2] MACHINE_CFG[24] = вход 0x0066 (NMI) ОТДАН DivMMC.
+	//        0 (умолчание) = NMI остаётся нашей магической кнопке (MACHINE_CFG бит13, main.v:611).
+	//        1 = NMI ведёт в браузер esxDOS. Взаимоисключение с битом13 обязано быть в топе.
+	//   [3] MACHINE_CFG[26] = выход из MAPRAM по Prato (мод Mario 2023): запись %11xxxxxx в #E3
+	//        СБРАСЫВАЕТ MAPRAM (и ставит CONMEM). 0 = оригинал: MAPRAM снимается только сбросом.
+	//        Трогать: когда нужно перезалить ПЗУ/систему без перезапуска машины.
+	input  wire[ 3:0] dm_opt,
+	// 1 = ловушки ленты 0x04C6/0x0562 НЕ отдавать DivMMC (MACHINE_CFG[22:21] OFF, либо AUTO пока
+	// играет наш тейп-плеер - приём disable_pagein MiSTer, rtl/divmmc.v:113-114). Ноль = отдать
+	// esxDOS (.tapein/.tapeout). Считает ТОП: тут только один готовый провод.
+	input  wire       dm_pagein_off,
 
 	input  wire       clock,
 	input  wire       ce,
@@ -28,35 +77,102 @@ module memory
 	output wire       memRd,
 	output wire       memWr,
 	output wire[18:0] memA,
+	output wire[ 5:0] ram_bank,      // ПОЛНЫЙ номер банка ОЗУ текущего доступа (банки >=8 живут в DDR)
+	output wire[ 7:0] eff7_o,        // живой EFF7 - для приборной проверки страничности
 	input  wire       force_7ffd,    // ARM override of the 128K paging port
 	input  wire[ 5:0] port7ffd_in,
 	output wire[ 5:0] port7ffd_o,    // LIVE 7FFD (bit4=1 -> 48K ROM paged) - for the ROM-trap condition + IX->bank map
-	output wire[ 7:0] map_diag       // passive automapper state for the tape timing trace
+	output wire[ 7:0] map_diag,      // passive automapper state for the tape timing trace
+
+	// --- B0071: страничность ПЗУ (4 страницы по 16КБ) + трап входа в TR-DOS ---
+	input  wire       trdos_en,      // 1 = трап Beta Disk включён (MACHINE_CFG бит8). По умолчанию 0:
+	                                 //     без набора ПЗУ с TR-DOS в страницах включать нечего.
+	                                 //     Бит8, а НЕ бит5: биты 0..6 слова MACHINE_CFG у NES заняты
+	                                 //     (region[1:0], palette[5:4], sprlimit[6]), и при отказе
+	                                 //     смены ядра ZX получил бы чужой бит как «включить трап».
+	input  wire       service_en,    // 1 = в окно ПЗУ вставлена СЕРВИСНАЯ страница (MACHINE_CFG бит9).
+	                                 //     Без неё страница 3 набора недостижима вообще - 4 плитки BRAM
+	                                 //     висели бы мёртвым грузом. Действует как статический выбор:
+	                                 //     пока бит поднят, в окне сервисное ПЗУ (трап TR-DOS выше него).
+	// --- B0146: под взведённой защёлкой DOS номер страницы задаёт ПАРА {DOS, 7FFD[4]} ---
+	input  wire       dos_svc_en,    // 1 = как у настоящего Пентагона-1024 с 64-КБ BIOS: при вставленном
+	                                 //     TR-DOS сброс бита 4 порта #7FFD переключает окно с страницы
+	                                 //     TR-DOS (слот 2) на СЕРВИСНУЮ (слот 3) - так сделан вход в
+	                                 //     файловый менеджер у BIOS настоящих пентагонов (FATALL, Proteus).
+	                                 //     0 = поведение до B0146 БИТ-В-БИТ (страница 2 безусловно). Опция,
+	                                 //     а не константа, именно потому, что у двухстраничных наборов и у
+	                                 //     заводского rom128.hex слота 3 нет вовсе, и окно уехало бы в
+	                                 //     незаписанную BRAM (поле 0x00 = NOP-склон вместо машины).
+	output wire       trdos_o,       // живая защёлка DOS - в MACH_DBG
+	output wire[ 1:0] rom_page_o,    // живой номер страницы ПЗУ - в MACH_DBG
+	output wire[31:0] rom_dbg_o,     // B0147 прибор трапа: {взводов, снятий, адрес последнего взвода}
+	output wire       page3_seen_o   // B0147 липко: слот 3 хоть раз стоял в окне
 );
-assign port7ffd_o = port7FFD;
 //-------------------------------------------------------------------------------------------------
 //-------------------------------------------------------------------------------------------------
 
 reg mapOnIORQ;
-reg[5:0] mapOnIORQData;
+reg[7:0] mapOnIORQData;   // Пентагон 1024 читает ВЕСЬ байт: биты 7,6,5 - расширенные биты банка
 
 reg[5:0] port7FFD;
+// B0131: `assign port7ffd_o = port7FFD` стоял ВЫШЕ объявления регистра. Синтез это ест, а xvlog -
+// нет (ERROR [VRFC 10-3380] identifier used before its declaration), то есть модуль было НЕЧЕМ
+// проверить в симуляторе. Перенесено сюда; на логику не влияет никак.
+assign port7ffd_o = port7FFD;
+// Расширенные биты банка - ОТДЕЛЬНАЯ защёлка, а не живое декодирование 7FFD[7:5]. Так сделано
+// в эталоне, и это наблюдаемо: уход в стандартный режим (EFF7[2]=1) НЕ возвращает окно в младший
+// банк, защёлка держит последний выбор. Живое декодирование вело бы себя иначе.
+reg[2:0] page_hi;
+// Порт EFF7 (Пентагон 1024). Сброс в 0 = мегабайтное отображение включено, блокировка снята -
+// именно так стартует машина. Бит 2: 0 - мегабайт, 1 - стандартная схема ZX128 (и тогда бит 5
+// порта 7FFD снова блокирует страничность).
+reg[7:0] port_eff7;
+assign eff7_o = port_eff7;
+
+// Блокировка страничности. В 128К - как было (бит 5). На Пентагоне 1024 бит 5 работает
+// блокировкой ТОЛЬКО когда EFF7[2]=1, иначе он старший бит номера банка.
+wire pent_ext   = pent1024 & model;
+wire page_lock  = pent_ext ? (port_eff7[2] & port7FFD[5]) : port7FFD[5];
+// Декодирование EFF7 - ровно как в эталоне: пять адресных линий, A15..A12 = 1110 и A3 = 0.
+// Неполное декодирование - это свойство настоящего железа, а не наша экономия.
+// B0130 МИНА 2. Порты DivMMC #E3 (1110_0011) и #E7 (1110_0111) имеют A3 = 0, поэтому
+// OUT (#E3),A попадал ЕЩЁ И сюда: старший байт адреса при OUT (n),A равен самому A, и любое
+// A из 0xE0..0xEF писало в EFF7, а 0xE4..0xE7 ставили бит2 = УХОД ИЗ МЕГАБАЙТНОГО РЕЖИМА.
+// Это не теория: мод Prato прямо предписывает OUT 227,%11xxxxxx.
+// Различает их шестая линия A4: у настоящего #EFF7 A4 = 1, у глюковских #DFF7/#0FF7/#3FF7
+// тоже 1, у #E3/#E7/#EB - 0. Терм ЗАГЕЙТОВАН mapper: при выключенном DivMMC (наш случай
+// сегодня) выражение сворачивается в прежнее, и задокументированная НЕПОЛНАЯ дешифрация
+// настоящего Пентагона остаётся байт-в-байт такой, какой была.
+wire eff7_write = !iorq && !wr && a[15] && a[14] && a[13] && !a[12] && !a[3]
+                  && (a[4] || !mapper) && pent_ext;
 always @(posedge clock, negedge reset)
 if(!reset) begin
 	port7FFD <= 1'd0;
+	page_hi   <= 3'd0;
+	port_eff7 <= 8'd0;
 	mapOnIORQ <= 1'b0;
 end
-else if(force_7ffd && model) begin  // ARM 7FFD override ONLY in 128K. In 48K there is no paging; a stray
-	port7FFD  <= port7ffd_in;        // force (ctl_port_commit fires it together with force_border when the OSD
-	mapOnIORQ <= 1'b0;               // sets the border) must never leak stale 128K paging into the flat 48K model.
+// ARM 7FFD override ONLY in 128K. In 48K there is no paging; a stray force (ctl_port_commit fires
+// it together with force_border when the OSD sets the border) must never leak stale 128K paging
+// into the flat 48K model.
+// page_hi ОБНУЛЯЕТСЯ вместе с портом: ARM грузит образы по соглашению 128К (банки 0..7), и если
+// оставить защёлку ненулевой, окно 0xC000 будет смотреть в расширенный банк - образ просто не виден.
+else if(force_7ffd && model) begin
+	port7FFD  <= port7ffd_in;
+	page_hi   <= 3'd0;
+	mapOnIORQ <= 1'b0;
 end
 else if(ce) begin
-	if(!iorq && !wr && !a[15] && !a[1] && model && !port7FFD[5]) begin
+	if(!iorq && !wr && !a[15] && !a[1] && model && !page_lock) begin
 		mapOnIORQ <= 1'b1;
-		mapOnIORQData <= d[5:0];
+		mapOnIORQData <= d;
 	end
+	if(eff7_write) port_eff7 <= d;
 	if(mapOnIORQ) begin
-		port7FFD <= mapOnIORQData;
+		port7FFD <= mapOnIORQData[5:0];
+		// Расширенные биты защёлкиваются только в мегабайтном режиме - в стандартном они
+		// сохраняются нетронутыми (эталон: if(p1024 & ~page_reg_p1024[2])).
+		if(pent_ext && !port_eff7[2]) page_hi <= {mapOnIORQData[5], mapOnIORQData[7:6]};
 		mapOnIORQ <= 1'b0;
 	end
 end
@@ -67,26 +183,144 @@ always @(posedge clock, negedge reset)
 	if(ce) if(!iorq && !a[15] && !a[1] && !wr && model && !port7FFD[5]) port7FFD <= d[5:0];
 */
 wire      vmmPage = model & port7FFD[3];
-// The board-side mem_zx keeps the two toastrack ROMs as a 32K pair and indexes them with
-// memA[14:0]. In 128K mode, page 2/3 therefore selects 128-0/128-1 as before. The flat 48K
-// model must explicitly select page 1 (128-1 = the original 48 BASIC ROM); page 0 is the
-// 128K editor/menu and was the cause of the B004A black/corrupt 48K cold boot.
-wire[1:0] romPage = model ? { 1'b1, port7FFD[4] } : 2'b01;
+// B0071: ПЗУ - четыре ЧЕСТНЫЕ страницы по 16КБ (mem_zx индексирует memA[15:0]). Каноническая
+// раскладка, одна для всех наборов: 0 = 128-меню, 1 = 48 BASIC, 2 = TR-DOS, 3 = сервисное.
+// До B0071 mem_zx выбрасывал старший бит (индекс memA[14:0]), и romPage был прибит к
+// {1'b1, port7FFD[4]}; страницы 0/1 держат ровно то же содержимое, что держала пара тостера,
+// поэтому 128К и 48К ведут себя БАЙТ-В-БАЙТ как раньше (48К обязан явно брать страницу 1 =
+// 48 BASIC: страница 0 - это редактор 128, и именно она давала чёрный 48К в B004A).
+//
+// Трап Beta Disk (вход в TR-DOS): страница TR-DOS встаёт в окно, когда ВЫБОРКА КОМАНДЫ (M1)
+// идёт по адресу 0x3Dxx при вставленной странице 48 BASIC, и уходит на первой выборке команды
+// за пределами окна ПЗУ. Автомат ровно той же формы, что у автомаппера DivMMC ниже, но у того
+// выход - банк ОЗУ esxdos, а не страница ПЗУ. Пока набора с TR-DOS нет, trdos_en = 0 и вся
+// логика мертва: страничность в точности прежняя.
+wire      rom48 = model ? port7FFD[4] : 1'b1;      // в окне 0x0000 стоит 48 BASIC
+reg       trdos;
+// Гейт обязан ещё и ОБНУЛЯТЬ защёлку, а не только запрещать её обновление: если снять trdos_en в
+// момент, когда TR-DOS вставлен, ни ветка входа, ни ветка выхода больше не исполнятся и окно ПЗУ
+// навсегда останется на странице 2 (до сброса). А снимается гейт легко - любая правка опций машины
+// пишет MACHINE_CFG целым словом.
+// B0131 (РЕШЕНИЕ ВЛАДЕЛЬЦА 13.08). Трап 0x3Dxx физически ОДИН, а желающих двое: TR-DOS и
+// автомаппер DivMMC (тот же адрес, memory.v:167 против :283). Владелец снял спор: «при
+// включённом DivMMC бета-диск не нужен» - значит арбитраж НЕ опция, а производная от одного
+// переключателя. При mapper = 1 защёлка TR-DOS не просто перестаёт обновляться, а ОБНУЛЯЕТСЯ
+// (тем же приёмом, что и гейт trdos_en: иначе включение DivMMC в момент вставленного TR-DOS
+// заморозило бы окно ПЗУ на странице 2 до сброса - а туда как раз ложится ПЗУ esxDOS).
+wire trdos_en_eff = trdos_en & ~mapper;
+always @(posedge clock)
+if(!reset || !trdos_en_eff) trdos <= 1'b0;
+else if(!mreq && !m1) begin
+	if(a[15:8] == 8'h3D && rom48) trdos <= 1'b1;   // вход:  M1 по 0x3Dxx из 48 BASIC
+	else if(a[15] || a[14])       trdos <= 1'b0;   // выход: M1 за пределами окна ПЗУ
+end
+// 🥇 B0146 ПАРА {DOS, 7FFD[4]}, А НЕ ОДИН ФЛАГ. У настоящего Пентагона-1024 с 64-КБ BIOS
+// блок ПЗУ адресуется {A15,A14} = {~DOS, 7FFD[4]} при порядке блоков [сервис, TR-DOS, 128, 48]
+// (доказано самими дампами пяти наборов с живых машин), то есть в НАШЕЙ нумерации слотов
+// {DOS=1, 7FFD[4]=1} = слот 2 (TR-DOS), а {DOS=1, 7FFD[4]=0} = слот 3 (СЕРВИСНАЯ страница).
+// Именно этим штатные BIOS входят в свой файловый менеджер: стаб в ОЗУ ставит 7FFD[4]=1,
+// прыгает на 0x3D30 (трап вставляет TR-DOS), оттуда RET ведёт на помощник 0x3FF0 = OUT (C),A
+// с нулём в A - и окно обязано уйти на менеджера (там по 0x3FF0 12 NOP и вход 0x3FFC = DI; JP).
+// До B0146 под защёлкой стояла страница 2 БЕЗУСЛОВНО, и машина делала RET по третьему
+// байту помощника (ED 79 C9) - со стороны это выглядит как «набор ПЗУ не грузится».
+// rom48 (выше) уже учитывает модель: в 48К он константа 1, поэтому там младший бит номера
+// остаётся нулём и поведение 48К не меняется вообще. При dos_svc_en = 0 выражение
+// сворачивается в 2'd2 - сегодняшнее поведение бит-в-бит, один терм в romPage[0] и ни одного
+// в romPage[1] (конус memA тесный, см. комментарий у мультиплексора адреса ниже).
+wire[1:0] romPage = trdos      ? { 1'b1, dos_svc_en & ~rom48 }
+                  : service_en ? 2'd3
+                  : (model ? { 1'b0, port7FFD[4] } : 2'b01);
+assign trdos_o    = trdos;
+assign rom_page_o = romPage;
+// 🥇 B0147 ПРИБОР ТРАПА. Мгновенный DOS (MACH_DBG бит13) не отвечает на вопрос «взводился ли трап»:
+// защёлка уходит на первом же M1 за окном ПЗУ, а софт из ОЗУ делает такой M1 сразу, поэтому опрос
+// почти всегда попадает ПОСЛЕ снятия. Здесь липкие счётчики и адрес ПОСЛЕДНЕГО взвода - по ним
+// видно и число входов в трап, и куда именно прыгнули. Счётчики НАСЫЩАЮТСЯ: дельту после 255 не
+// мерить (та же оговорка, что у счётчика запросов в DDR).
+reg [7:0]  trap_up = 8'd0, trap_dn = 8'd0;
+reg [15:0] trap_a  = 16'd0;
+reg        page3_st = 1'b0;
+always @(posedge clock)
+if(!reset) begin
+	trap_up <= 8'd0; trap_dn <= 8'd0; trap_a <= 16'd0; page3_st <= 1'b0;
+end else begin
+	if(romPage == 2'd3) page3_st <= 1'b1;
+	if(!mreq && !m1) begin
+		if(a[15:8] == 8'h3D && rom48 && trdos_en_eff && !trdos) begin
+			if(trap_up != 8'hFF) trap_up <= trap_up + 8'd1;
+			trap_a <= a;
+		end
+		else if((a[15] || a[14]) && trdos) begin
+			if(trap_dn != 8'hFF) trap_dn <= trap_dn + 8'd1;
+		end
+	end
+end
+assign rom_dbg_o    = { trap_up, trap_dn, trap_a };
+assign page3_seen_o = page3_st;
 // v0x4A 48K fix: map the 48K top region (0xC000) to BANK 0, matching the 128K post-boot default
 // (7FFD=0) and - critically - the ARM control plane: load_sna/tier0/romtrap_ix_flat all write the
 // 0xC000 image into bank 0 by the 128K convention. The old {a[15:14],1'b0}=bank 6 mapping made every
 // injected 48K program land in memory the machine never reads (black screen); no real-48K behavior
 // depends on WHICH physical bank backs the flat RAM, so bank 0 is free compatibility.
 wire[2:0] ramPage = a[15:14] == 2'b01 ? 3'd5 : a[15:14] == 2'b10 ? 3'd2 : model ? port7FFD[2:0] : 3'd0;
+// Полный номер банка текущего доступа. Расширенные биты действуют ТОЛЬКО в окне 0xC000 - окна
+// 0x4000/0x8000 на Пентагоне жёстко прибиты к банкам 5 и 2, как в 128К. Экран тоже всегда в
+// банках 5/7 (бит 3 порта 7FFD), поэтому зеркало экрана расширенные банки не касается - но
+// сравнивать его условие надо по ВСЕМ шести битам, иначе банк 13 (младшие три бита = 5)
+// начнёт затирать зеркало.
+// B0120: недостающие старшие биты банка гасим ПОСЛЕ защёлки, а не в ней: защёлка обязана хранить
+// то, что процессор написал. Банк = {page_hi, ramPage} = {d5,d7,d6,d2:0}.
+// Каждый бит - ОДНО явное произведение, а не «И» после мультиплексора: так на бит приходится
+// ровно одна LUT6 (pent_ext, a15, a14, page_hi[i], ram_nobit[i] = пять входов), то есть маска
+// объёма ОЗУ достаётся ДАРОМ. Записанное через `? :` с общим `&` Vivado разложил в отдельные
+// вентили и добавил три LUT - при 91 % занятости этого хватило, чтобы размещение не сошлось.
+wire[2:0] bankHi;
+assign bankHi[0] = pent_ext & a[15] & a[14] & page_hi[0] & ~ram_nobit[0];
+assign bankHi[1] = pent_ext & a[15] & a[14] & page_hi[1] & ~ram_nobit[1];
+assign bankHi[2] = pent_ext & a[15] & a[14] & page_hi[2] & ~ram_nobit[2];
+assign ram_bank = {bankHi, ramPage};
 
 //-------------------------------------------------------------------------------------------------
 
-reg mapForce;
-reg mapAuto;
-reg mapOnM1;
-reg mapRam;
-reg[4:0] mapPage;
-assign map_diag = {mapForce, mapAuto, mapOnM1, mapRam, mapPage[3:0]};
+reg mapForce;              // CONMEM (#E3 бит7)
+reg mapAuto;               // automap  - маппинг активен
+reg mapOnM1;               // automap_next - будет активен со следующей выборки
+reg mapRam;                // MAPRAM (#E3 бит6), ЛИПКИЙ: снимается сбросом (или модом Prato)
+// B0131: ЧЕТЫРЕ бита страницы, а не пять. Страниц у DivMMC 16 по 8 КБ = 128 КБ (живой Sizif
+// divmmc.sv:26 `output reg [3:0] page`, живой MiSTer divmmc.v:30 `output [3:0] ram_bank`).
+// Обрезать НАДО НА ПОРТУ, а не маской в адресном мультиплексоре: memA[18:17] у нас - НОМЕР
+// РЕГИОНА, и пятый бит страницы уехал бы в memA[17], превратив регион esx (2'b10) в мёртвый
+// 2'b11 - то есть OUT (#E3),#10 отправил бы систему писать мимо всей памяти. Заодно
+// DMMC_STAT.page (прибор) и фактический адрес не могут разойтись по построению.
+reg[3:0] mapPage;
+assign map_diag = {mapForce, mapAuto, mapOnM1, mapRam, mapPage};
+
+// --- Гейт входов автомаппера: ДВА терма, как в ЖИВОМ Sizif (cpld/rtl/divmmc.sv:61-71) ---
+// «Предыдущая ВЫБОРКА КОМАНДЫ шла из окна ПЗУ» - два триггера, divmmc.sv:34-46. Первый ловит
+// область текущей выборки, второй сдвигает её на одну выборку назад (обновляется только ВНЕ M1).
+// Одного терма «в окне 48 BASIC» мало и это не вкусовщина: Пентагон стартует из 128-меню
+// (страница ПЗУ 0), и на одном терме esxDOS не завёлся бы вовсе, а RST 8 из ОЗУ под 128-ПЗУ
+// не попадал бы в API. Второй терм как раз и означает «зов пришёл из ОЗУ» - его пускаем всегда.
+reg rom_m1_acc, rom_m1_acc0;
+always @(posedge clock)
+if(!reset) begin
+	rom_m1_acc0 <= 1'b0;
+	rom_m1_acc  <= 1'b0;
+end
+else if(!mreq && !m1) rom_m1_acc0 <= (a[15:14] == 2'b00);   // идёт выборка команды
+else                  rom_m1_acc  <= rom_m1_acc0;           // между выборками - сдвиг на одну назад
+
+// 48 BASIC в окне = ИМЕННО страница 1 канонической раскладки, а не «7FFD[4]=1»: при вставленной
+// сервисной странице (бит9) или TR-DOS в окне стоит другое ПЗУ, и гейт обязан это видеть.
+wire basic48_paged = (romPage == 2'd1);
+// ВАЖНО: каждый новый терм собран так, чтобы при mapper = 0 обратиться в ЕДИНИЦУ. Тогда при
+// DIVMMC = OFF автомат входов побитно тот же, что был до B0131 (это доказывает стенд
+// tb_divmmc_map.v), а весь новый конус (rom_m1_acc, romPage-компаратор) синтез выбрасывает
+// целиком - при 4400/4400 занятых слайсах это не косметика.
+wire dm_off    = ~mapper;
+wire hook_gate = dm_off | dm_opt[0] | basic48_paged | ~rom_m1_acc;
+wire hook_tape = dm_off | ~dm_pagein_off;   // ловушки ленты 0x04C6/0x0562
+wire hook_nmi  = dm_off |  dm_opt[2];       // вход 0x0066
 
 always @(posedge clock) // if(ce)
 if(!reset) begin
@@ -97,19 +331,37 @@ if(!reset) begin
 	mapRam <= 1'b0;
 end
 else begin
-	if(!iorq && !wr && a[7:0] == 8'hE3) begin
+	// B0130 МИНА 1. Защёлка #E3 (CONMEM/MAPRAM DivMMC) обязана быть МЁРТВОЙ, пока DivMMC
+	// выключен. Без гейта OUT (#E3),#80 на живой машине поднимал mapForce, а он действовал
+	// в обход mapper (см. map ниже): окно 0x0000 уезжало на страницу ПЗУ 1 (48 BASIC), а
+	// окно 0x2000 - в мёртвый esx-регион, где mem_zx.v отдаёт FF и РАЗРЕШАЕТ туда запись.
+	// mapRam к тому же ЛИПКИЙ (снимается только сбросом), то есть одна такая запись портила
+	// машину до перезагрузки.
+	// !m1 в это условие добавлять НЕЛЬЗЯ: у T80 m1 активен НУЛЁМ, и !m1 означало бы «идёт
+	// M1», то есть OUT (#E3),A перестал бы работать вообще. Цикл подтверждения прерывания
+	// и так отсечён термом !wr; ни Sizif (cpld/rtl/divmmc.sv:80,88), ни MiSTer по M1 этот
+	// порт не гейтуют.
+	if(!iorq && !wr && a[7:0] == 8'hE3 && mapper) begin
 		mapForce <= d[7];
-		mapPage <= d[4:0];
-		mapRam <= d[6]|mapRam;
+		mapPage <= d[3:0];
+		// MAPRAM липкий по спеке (Divide_pgm_model.txt:86-88 «can be set to '1' only»).
+		// Опция [3] = мод Prato/Mario 2023: %11xxxxxx снимает MAPRAM и ставит CONMEM - иначе
+		// перезалить систему в страницу 3 можно только через холодный старт.
+		mapRam <= (dm_opt[3] && d[7] && d[6]) ? 1'b0 : (d[6] | mapRam);
 	end
 	if(!mreq && !m1) begin
-		if(a == 16'h0000 || a == 16'h0008 || a == 16'h0038 || a == 16'h0066 || a == 16'h04C6 || a == 16'h0562)
+		// Вход 0x0000 НЕ гейтуется вообще (сброс/рестарт приходит откуда угодно) - так и в
+		// живом Sizif (divmmc.sv:62), и в MiSTer (divmmc.v:111).
+		if(a == 16'h0000
+		|| ((a == 16'h0008 || a == 16'h0038) && hook_gate)
+		||  (a == 16'h0066 && hook_nmi)
+		|| ((a == 16'h04C6 || a == 16'h0562) && hook_gate && hook_tape))
 			mapOnM1 <= 1'b1; // activate automapper after this cycle
 
 		else if(a[15:3] == 13'h3FF)
 			mapOnM1 <= 1'b0; // deactivate automapper after this cycle
 
-		else if(a[15:8] == 8'h3D) begin
+		else if(a[15:8] == 8'h3D && hook_gate) begin
 			mapOnM1 <= 1'b1; // activate automapper immediately
 			mapAuto <= 1'b1;
 		end
@@ -117,8 +369,52 @@ else begin
 	if(m1) mapAuto <= mapOnM1;
 end
 
-wire map = mapForce || (mapAuto && mapper);
-wire[4:0] page = !a[13] && mapRam ? 5'd3 : mapPage;
+// B0130 МИНА 1 (вторая половина). Было mapForce || (mapAuto && mapper): бит CONMEM порта
+// #E3 подменял окно ПЗУ ДАЖЕ при mapper = 0, то есть при физически отсутствующем DivMMC.
+// Теперь при mapper = 0 весь блок автомаппера инертен по построению (синтез его выбросит).
+//
+//-------------------------------------------------------------------------------------------------
+// B0131 МАТРИЦА ПАМЯТИ DivMMC - ТРИ ВЫРАЖЕНИЯ С ЖИВОГО Sizif (cpld/rtl/divmmc.sv:161-169),
+// а не правка прежних. Прежние теряли приоритет «EPROM jumper -> MAPRAM -> CONMEM»
+// (Divide_pgm_model.txt:137-153, снизу вверх), и это не теория:
+//   * `page = !a13 && mapRam ? 3 : mapPage` давал страницу 3 в низу при ЛЮБОМ mapRam, а mapRam
+//     ЛИПКИЙ. После единственной установки MAPRAM любой OUT (#E3),#80 (CONMEM) отдавал бы
+//     в 0x0000 банк 3 вместо ПЗУ - и загрузчик точек-команд молча исполнил бы не тот код.
+//     Правильно: CONMEM ПЕРЕКРЫВАЕТ MAPRAM (терм !conmem в low_ram).
+//   * в защите записи обязателен терм !conmem: при CONMEM=1 верхнее окно «always writable»
+//     (Divide_pgm_model.txt:99-101) - иначе ломается ровно та последовательность, которой
+//     систему кладут в банк 3 ПЕРЕД установкой MAPRAM (:93-96: DI -> CALL 1FFBh -> CONMEM ->
+//     заливка -> MAPRAM -> EI).
+//
+//   low_ram    = !conmem && automap && mapram                                     -> 0x0000-1FFF
+//   high_ram   =  automap || conmem                                               -> 0x2000-3FFF
+//   wr_protect = !a15 && !a14 && (!a13 || page==3) && !conmem && automap && mapram
+//
+// Термы, НЕ зависящие от адреса, вычисляются В ЗАЩЁЛКАХ (приём memory.v:190-193): конус memA
+// имеет запас всего +2.479 нс при цене уровня ~1.6 нс, то есть два лишних уровня = отрицательный
+// путь. Задержка на такт (17.6 нс) безопасна по построению: mapAuto и так меняется в тактах
+// обновления (`if(m1)`) и в рефреше, а ближайший доступ к памяти после этого - через T-такт
+// (282 нс). Мгновенный вход 0x3Dxx по спеке допускает 100 нс - укладываемся с запасом.
+reg dm_map_q;    // маппинг активен (high_ram && DivMMC включён)
+reg dm_low_q;    // low_ram: в 0x0000-1FFF стоит ОЗУ (страница 3), а не ПЗУ DivMMC
+reg dm_wplo_q;   // ... и оно защищено от записи
+reg dm_wphi_q;   // в 0x2000-3FFF выбрана та же страница 3 под MAPRAM - тоже защищена
+always @(posedge clock) begin
+	dm_map_q  <= (mapForce | mapAuto) & mapper;
+	dm_low_q  <= ~mapForce & mapAuto & mapRam & mapper;
+	dm_wplo_q <= ~mapForce & mapAuto & mapRam & mapper & ~dm_opt[1];
+	dm_wphi_q <= ~mapForce & mapAuto & mapRam & mapper & ~dm_opt[1] & (mapPage == 4'd3);
+end
+
+wire dm_win  = (a[15:14] == 2'b00) && dm_map_q;   // окно 0x0000-3FFF отдано DivMMC
+wire dm_ram  = dm_win && (a[13] || dm_low_q);     // ... и это ОЗУ DivMMC
+wire dm_rom  = dm_win && !a[13] && !dm_low_q;     // ... а это ПЗУ DivMMC (esxDOS, 8 КБ)
+// Страница ОЗУ: в низу окна по спеке ВСЕГДА банк 3, в верху - выбранная портом.
+wire[3:0] dm_page = a[13] ? mapPage : 4'd3;
+// Запись разрешена только в ОЗУ DivMMC и только вне защиты. Низ окна под MAPRAM защищён
+// целиком, верх - когда выбрана та же страница 3 (иначе банк 3 был бы доступен на запись
+// через второе окно, и вся защита ничего не стоила бы).
+wire dm_wr   = dm_ram && !(a[13] ? dm_wphi_q : dm_wplo_q);
 
 //-------------------------------------------------------------------------------------------------
 
@@ -127,29 +423,34 @@ wire addr11 =  a[15] &&  a[14];
 
 assign cn = addr01 || (model && addr11 && ramPage[0]);
 
-`ifdef NO_SNOW
-assign vmmA1 = { vmmPage, va[12:7], va[6:0] };                            // ULA snow OFF (clean variant: always raster fetch)
-`else
-assign vmmA1 = { vmmPage, va[12:7], !rfsh && addr01 ? a[6:0] : va[6:0] }; // ULA snow ON (faithful 128 hardware, default)
-`endif
+// v0.15.145: runtime ULA snow toggle (MACHINE_CFG bit4 -> snow_off). The `ifdef NO_SNOW` compile-time
+// switch is replaced by a live mux so the OSD menu can flip snow ON/OFF without a rebuild or reset.
+assign vmmA1 = snow_off ? { vmmPage, va[12:7], va[6:0] }                            // snow OFF: clean raster fetch
+                        : { vmmPage, va[12:7], !rfsh && addr01 ? a[6:0] : va[6:0] }; // snow ON: faithful 128 hardware (default)
 assign vmmA2 = { model & ramPage[1], a[12:0] };
 
 assign memRf = !mreq && !rfsh;
 assign memRd = !mreq && !rd;
-assign memWr = !mreq && !wr && (a[15] || a[14] || (map && (a[13] || mapRam)));
+assign memWr = !mreq && !wr && (a[15] || a[14] || dm_wr);
+// ПЗУ DivMMC = СТРАНИЦА 2 (3'b100 = {romPage 2'b10, a13 = 0}), младшие 8 КБ. Было 3'b010 -
+// страница 1, то есть ПОВЕРХ 48 BASIC: готовая коллизия, esxDOS затирал бы бейсик. Страница 2
+// свободна ровно потому, что при DivMMC = ON бета-диск выключен (решение владельца 13.08) и
+// TR-DOS в неё не встаёт; заливает её ARM тем же портом 0x154, что и остальные наборы.
 assign memA
-	= a[15:14] == 2'b00 && !map                     ? { 2'b00, 1'b0, romPage, a[13:0] }
-	: a[15:14] == 2'b00 && map && !a[13] && !mapRam ? { 2'b00, 1'b0,  3'b010, a[12:0] }
-	: a[15] || a[14]                                ? { 2'b01,       ramPage, a[13:0] }
-	:                                                 { 1'b1,           page, a[12:0] };
+	= dm_rom          ? { 2'b00, 1'b0,  3'b100, a[12:0] }   // ПЗУ DivMMC (страница ПЗУ 2)
+	: dm_ram          ? { 2'b10,       dm_page, a[12:0] }   // ОЗУ DivMMC: 16 страниц по 8 КБ
+	: a[15] || a[14]  ? { 2'b01,       ramPage, a[13:0] }   // ОЗУ машины
+	:                   { 2'b00, 1'b0, romPage, a[13:0] };  // ПЗУ машины
 
 //-------------------------------------------------------------------------------------------------
 //            MEM  //             ROM
-// 18:17 16:0      // 15:14 13:0     
-//  0  0 128K rom  //  0  0  16K  48K
-//  0  1 128K ram  //  0  1  16K  esx
-//  1  0 128K esx  //  1  0  16K   +2
-//  1  1 128K ---  //  1  1  16K   +2
+// 18:17 16:0      // 15:14 13:0
+//  0  0 128K rom  //  0  0  16K 128-меню
+//  0  1 128K ram  //  0  1  16K 48 BASIC
+//  1  0 128K esx  //  1  0  16K TR-DOS / ПЗУ DivMMC (младшие 8 КБ)
+//  1  1  ---      //  1  1  16K сервисная
+// Регион esx: memA[16:13] = страница DivMMC (0..15), memA[12:0] = смещение. 2'b11 не порождается
+// НИКОГДА - страница обрезана до 4 бит на порту.
 
 //-------------------------------------------------------------------------------------------------
 endmodule

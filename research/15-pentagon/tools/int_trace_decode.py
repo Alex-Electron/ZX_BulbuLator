@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""Decode the B0050 interrupt-timing TRACE snapshot (a diagnostic bit from the second agent, 2026-07-24).
+"""Decode the B0050 interrupt-timing TRACE snapshot (диагностический бит второго агента, 2026-07-24).
 
 Packing is read directly from atlas_core/main.v:483-485 (int_dbg0/1/2_o) and the
 tuner word (ula_tune = PENT_INT reg). AXI map (ROMTRAP must be OFF):
@@ -16,10 +16,6 @@ import sys
 def s6(v):                      # signed 6-bit two's complement -> int (half-T units)
     v &= 0x3F
     return v - 64 if v & 0x20 else v
-
-def s9(v):                      # signed 9-bit two's complement -> int (half-T units, B0053)
-    v &= 0x1FF
-    return v - 512 if v & 0x100 else v
 
 SRC = {0: "legacy(pc3M5 resample, Early)", 1: "raw vduI (-1 CPU-T)",
        2: "irq_ne(nc3M5 half, -0.5 CPU-T)", 3: "reserved->legacy"}
@@ -78,18 +74,15 @@ def main(a):
     # LATER than raw (resample delay); POSITIVE = selected fell EARLIER. Measured on B0050:
     # legacy -2 (pc3M5 resample = 1 CPU-T later), half -1 (nc3M5 = 0.5T later), raw 0 (edge-
     # aligned). INT_SOURCE can only ADD delay - it never advances the edge earlier than raw=0.
-    # B0053 later proved that moving the raw edge by as much as -256 half-T crosses many ACK
-    # buckets but leaves the original timing test's Type-1 verdict unchanged. The test measures a
-    # tight loop between consecutive frame interrupts, so translating every frame edge together
-    # does not implement a real Type-1/Type-2 ULA change. The bucket remains useful evidence about
-    # T80 interrupt acceptance; it is not a detector-flip oracle.
+    # To reach Type2 the /INT edge itself must move earlier via signed IRQ_DELTA (negative);
+    # and the detector only flips when ACK crosses to a NEW bucket -> watch (ACK h, PC), not age.
     if o["raw_age"] != 0x7F and o["cpu_age"] != 0x7F:
         eff = o["cpu_age"] - o["raw_age"]
         rel = "selected==raw (edge-aligned)" if eff==0 else \
               (f"selected {-eff} half-T LATER (resample delay)" if eff<0 else
                f"selected {eff} half-T EARLIER")
         print(f"  >>> selected-vs-raw = {eff:+d} half-T ({eff/2.0:+.1f} CPU-T): {rel}")
-        print(f"  >>> ACCEPTANCE BUCKET = (h={o['h']}, PC=0x{o['pc']:04X})")
+        print(f"  >>> ACCEPTANCE BUCKET = (h={o['h']}, PC=0x{o['pc']:04X}) - detector flips when THIS changes")
     return 0
 
 if __name__ == "__main__":

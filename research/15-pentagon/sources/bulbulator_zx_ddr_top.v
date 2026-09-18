@@ -170,6 +170,7 @@ module bulbulator_zx_ddr_top
     wire        rom_ld_we_a, rom_loading_a;
     wire [31:0] mach_cfg_w;
     wire [31:0] ctl_pent_int;
+    wire [31:0] ctl_ula_tune2;   // B0180: ОЖИВЛЁН (0x1C4) - раньше в топе не был подключён вовсе
     wire [31:0] ctl_ula_tune;
     wire [8:0]  ctl_paper_h, ctl_paper_v;
     wire [31:0] ctl_joy;
@@ -305,6 +306,7 @@ module bulbulator_zx_ddr_top
     // растре, - если после B0154 какая-то демка поедет, бит27 возвращает поведение B0153
     // без пересборки ядра. Подробности у входа `io_cont_early` в atlas_core/main.v.
     (* ASYNC_REG="TRUE" *) reg [1:0] iocont_s = 2'b00;
+    (* ASYNC_REG="TRUE" *) reg [1:0] kjen_s   = 2'b00;
     // B0120: маска недостающих старших бит банка - 3 бита, тот же двухступенчатый конвейер.
     (* ASYNC_REG="TRUE" *) reg [2:0] ramnb_s0 = 3'b000, ramnb_s1 = 3'b000;
     always @(posedge spclk) begin
@@ -315,6 +317,7 @@ module bulbulator_zx_ddr_top
         bdialways_s <= {bdialways_s[0], mach_cfg_w[10]}; // B0079: временный upstream-like BDI A/B
         dossvc_s  <= {dossvc_s[0],  mach_cfg_w[25]}; // B0146 бит25 = пара {DOS, 7FFD[4]} выбирает страницу
         iocont_s  <= {iocont_s[0],  mach_cfg_w[27]}; // B0154 бит27 = окно контеншена ПОРТОВ как до B0154 (на такт раньше эталона); умолчание 0 = фаза настоящей машины
+        kjen_s    <= {kjen_s[0],    mach_cfg_w[28]}; // B0175 бит28 = джойстик Kempston ЕСТЬ; умолчание 0 = голый 48K, порты с a[5]=0 отдают плавающую шину
         saamode_s0  <= mach_cfg_w[12:11];             // B0087: SAA1099 0 AUTO / 1 ON / 2 OFF
         saamode_s1  <= saamode_s0;
         ramnb_s0    <= mach_cfg_w[16:14];             // B0120: 000 = 1024К (по умолчанию), 111 = 128К
@@ -488,8 +491,125 @@ module bulbulator_zx_ddr_top
 //  localparam [31:0] BUILD_VERSION = 32'hB01B0086; // BDI floppy activity icon bottom-right HDMI (outside machine window).
 //  localparam [31:0] BUILD_VERSION = 32'hB01B0087; // НАСТОЯЩИЙ SAA1099 (в битстриме была
 //  localparam [31:0] BUILD_VERSION = 32'hB01B0088; // SAA1099 получает РОВНО 8 МГц (был 8.0952 =
-//  localparam [31:0] BUILD_VERSION = 32'hB01B0089; // ЗАПИСЬ НА ДИСКЕТУ: буфер контроллера стал
-    localparam [31:0] BUILD_VERSION = 32'hB01B0156;  // B0155 (01.09): (1) pap_tap=9 для Sinclair 48K/128K (сведение бумаги и бордюра для SHOCK ч.2 без швов, на Пентагоне 0); (2) умолчание I/O-контеншена = vduC (выравнивание верхнего бордюра esh2_48).
+    localparam [31:0] BUILD_VERSION = 32'hB01B0196;  // B0196: снимок адреса строки помечен кадром - верхняя кромка
+//  localparam [31:0] BUILD_VERSION = 32'hB01B0195;  // B0188 real border; native CPU speed in standard tape inter-block pauses.
+                                                     // irqBeg 2/6 -> 4/8 (MiSTer ula.sv:169 hc_next==4/8).
+                                                     // Timing Tests 48K на стенде, ВСЕ ЧЕТЫРЕ фазы входа:
+                                                     // берут эталон 70 из 72 против 65; починены тесты
+                                                     // 2, 3, 17, 18, 27 ЗАНЯТЫЕ, не сломан НИ ОДИН.
+                                                     // Осталось только 34 (его не берёт и SkoolKit).
+                                                     // Заодно закрыт bph_en битом tune_en (video.v).
+//  localparam [31:0] BUILD_VERSION = 32'hB01B0182;  // B0182: фаза УЗОРА штрафа - отдельная
+                                                     // ручка, развязанная с окном бумаги.
+//  localparam [31:0] BUILD_VERSION = 32'hB01B0181;  // B0181: умолчание фазы окна памяти
+                                                     // вернулось в 0 - измерено честным стендом
+                                                     // (64 верных против 59 при фазе 4).
+//  localparam [31:0] BUILD_VERSION = 32'hB01B0180;  // B0180: у выборки команды своя фаза штрафа;
+                                                     // `ula_tune2` (0x1C4) ОЖИВЛЁН в верхнем модуле.
+//  localparam [31:0] BUILD_VERSION = 32'hB01B0179;  // B0179 (09.09): у окна занятости шины ДЛЯ ПАМЯТИ
+                                                     // теперь СВОЯ фаза, а у ввода-вывода прежняя.
+                                                     // B0176/B0177 двигали общее окно - и вместе с
+                                                     // памятью уезжал бордюр (защёлка по io с B0174):
+                                                     // верхняя полоса esh2 расщеплялась на 16 px.
+                                                     // Выборка и плавающая шина возвращены на прежнюю
+                                                     // фазу, поэтому картинка измениться не может.
+//  localparam [31:0] BUILD_VERSION = 32'hB01B0178;  // B0178: строб зеркала экрана переведён
+                                                     // на фазу ВЫБОРКИ (см. video.v, scr_we).  // B0177 (09.09): та же правка, что B0176, но
+                                                     // ЧЕРЕЗ ПРОМЕЖУТОЧНЫЙ РЕГИСТР. B0176 забракован
+                                                     // на плате: сборка чистая, тайминг закрыт, тесты
+                                                     // молчат - а символы на экране УДВОЕНЫ, потому что
+                                                     // строб вывода брал байт следующей колонки.
+                                                     // Теперь байт читается раньше в fetHoldD/fetHoldA
+                                                     // (это и есть занятие памяти, которое видят
+                                                     // контеншен и плавающая шина), а в сдвигатель
+                                                     // перекладывается в ПРЕЖНИЙ момент.
+//  localparam [31:0] BUILD_VERSION = 32'hB01B0176;  // B0176 (09.09): ФАЗА ДОСТУПА ULA К ПАМЯТИ
+                                                     // развязана с фазой ВЫВОДА и сдвинута на 2 такта
+                                                     // раньше. Восстановленная из данных функция
+                                                     // заряда: форма каноничная 6,5,4,3,2,1,0,0, сдвиг
+                                                     // ровно +2 такта. Сдвигается и сам БЛОК доступа,
+                                                     // иначе окно теряет 2 такта на строку (384 за кадр).
+                                                     // Свип: 0 -> 3 верных из 7, 1 такт -> 5, 2 такта -> 7.
+//  localparam [31:0] BUILD_VERSION = 32'hB01B0175;  // B0175 (09.09): джойстик Kempston стал ОПЦИЕЙ
+                                                     // (MACHINE_CFG бит28, умолчание 0 = интерфейса нет).
+                                                     // Конус a[5]=0 отдавал 0x00 вместо плавающей шины на
+                                                     // половине портов и валил тесты 35/36/37 Timing Tests.
+//  localparam [31:0] BUILD_VERSION = 32'hB01B0174;  // B0174 (09.09): запись в бордюр защёлкивается
+                                                     // ПОСЛЕ отработки контеншена (s+d), а не в начале
+                                                     // цикла (s). Лечит чёрную чёрточку 8x1 px слева от
+                                                     // бумаги на первой строке экрана (esh2). У живого
+                                                     // 48K её нет, у FUSE/ZEsarUX/Spectrusty есть - они
+                                                     // красят бордюр СТРОКОЙ ВЫШЕ начисления штрафа
+                                                     // (periph.c:368-373). Вне контеншена d=0 и момент
+                                                     // прежний, то есть на прочем софте не видно.
+//  localparam [31:0] BUILD_VERSION = 32'hB01B0173;  // B0173 (08.09): к задержке вывода добавлены
+                                                     // hsync/vsync. В B0172 ехали только цвет и гашение,
+                                                     // а захват равняется по синхросигналам - вся картинка
+                                                     // уезжала (прибор: 232 расходящиеся строки на любом
+                                                     // ненулевом bord_early). Теперь задерживается весь
+                                                     // видеосигнал целиком, и это по построению невидимо:
+                                                     // меняется только СРОК защёлки бордюра.
+//  localparam [31:0] BUILD_VERSION = 32'hB01B0172;  // B0172 (08.09): ручка `bord_early` - срок защёлки
+                                                     // бордюра раньше на 0..3 px с АВТОМАТИЧЕСКОЙ
+                                                     // компенсацией (фаза назад + задержка бордюра,
+                                                     // бумаги и гашения на ту же величину). Умолчание 0
+                                                     // = картинка бит-в-бит как у B0170. Плюс исправлен
+                                                     // селектор бумаги: окно ПОКАЗА, а не загрузки
+                                                     // (в B0171 последний столбец бумаги уходил бордюру).
+//  localparam [31:0] BUILD_VERSION = 32'hB01B0171;  // B0171 (08.09): возвращена РАЗДЕЛЬНАЯ задержка
+                                                     // путей бордюра и бумаги (была в B0157, удалена в
+                                                     // B0158 без приёмки). Умолчания нулевые - картинка
+                                                     // бит-в-бит как у B0170; правка даёт вторую степень
+                                                     // свободы: срок защёлки и положение цвета перестают
+                                                     // быть одной ручкой. Нужна для чёрточки в левом
+                                                     // верхнем квадрате esh2 (пара «фаза раньше +
+                                                     // ступени назад», как BORD_PHASE/BORD_DELAY 5/2
+                                                     // у Потапова).
+//  localparam [31:0] BUILD_VERSION = 32'hB01B0170;  // B0170 (08.09): умолчание окна контеншена ПОРТОВ
+                                                     // вернулось в ноль (как до B0154). Сдвиг на такт,
+                                                     // введённый в B0154 ради CONTP 14339, уводил вход в
+                                                     // HALT и двигал весь код после него на 8 px: верхняя
+                                                     // полоса квадратов в esh1/esh2 уезжала вправо.
+                                                     // esh2 против ZEsarUX: было 20 расходящихся строк
+                                                     // из 304, стало 0. Цена: CONTP 14338 вместо 14339.
+                                                     // Прежняя фаза - бит27 MACHINE_CFG.
+//  localparam [31:0] BUILD_VERSION = 32'hB01B0169;  // B0169 (08.09): бордюрная ветка гейтится ОКНОМ
+                                                     // ПОКАЗА бумаги (h_addr 12..267, v_addr<192), а не
+                                                     // флагом videoEnable. B0168 красил последние 4 px
+                                                     // бумаги в каждой строке цветом бордюра (стенд:
+                                                     // 252 px вместо 256; владелец: "правый край не
+                                                     // дорисовывается"). Эталон - MiSTer ula.sv:185.
+//  localparam [31:0] BUILD_VERSION = 32'hB01B0168;  // B0168 (08.09): защёлка бордюра взводится
+                                                     // принудительно на границе бумага->бордюр -
+                                                     // иначе при фазе != 4 между экраном и правым
+                                                     // бордюром светится протухший атрибут.
+//  localparam [31:0] BUILD_VERSION = 32'hB01B0167;  // B0167 (08.09): ручка фазы группы бордюра
+                                                     // перенесена на ЖИВОЙ провод lab-слова
+                                                     // (PENT_INT): бит3 = включить, [2:0] = фаза.
+                                                     // ula_tune2 в топе не подключён вовсе, а
+                                                     // ctl_ula_tune объявлен и висит - запись в
+                                                     // 0x1C0/0x1C4 до ядра НЕ доходит.
+//  localparam [31:0] BUILD_VERSION = 32'hB01B0166;  // B0166 (08.09): ручка фазы 8-px группы защёлки
+                                                     // бордюра ЗАМЕНЯЕТ точку защёлки, а не добавляет
+                                                     // вторую рядом со старой (в B0164 свип фаз
+                                                     // из-за этого ничего не проверял). Умолчание
+                                                     // бит-в-бит прежнее: bph_en=0 -> фаза 4.
+//  localparam [31:0] BUILD_VERSION = 32'hB01B0165;  // B0165 (07.09): (1) Sinclair 48K blanking 316..411 (48 left + 256 paper + 48 right = 352 px) + symmetric 16-px capture pad -> exact 64/256/64 px; (2) Unstretched INT pulse: irq deasserts on pe3M5, strictly 32 T.
+//  localparam [31:0] BUILD_VERSION = 32'hB01B0164;  // B0164 (03.09): (1) фаза 8-px группы защёлки
+                                                     // бордюра стала ЖИВОЙ ручкой ula_tune2[11:8]
+                                                     // (умолчание бит-в-бит прежнее); (2) хвост
+                                                     // строки захвата добивается цветом бордюра,
+                                                     // а не чёрным (была полоса 32 px справа);
+                                                     // (3) снят проброс записи процессора в
+                                                     // выборку ULA - выдуманное поведение от 03.09.
+//  localparam [31:0] BUILD_VERSION = 32'hB01B0163;  // B0163 (03.09): ОТКАТ четырёх непроверенных
+                                                     // правок B0162. Стенд: B0162 ломал READP
+                                                     // (14341..14344 вместо 14340..14343) и CONTP,
+                                                     // и уводил 53 из 121 записи бордюра SHOCK ч.2
+                                                     // из гашения в бумагу. После отката 117-118
+                                                     // из 121 в гашении = эталон ZEsarUX (0-3).
+//  localparam [31:0] BUILD_VERSION = 32'hB01B0162;  // B0162 (03.09): (1) 6,5,4,3,2,1,0,0 contention pattern + 1T lead; (2) Mask contention on rfsh; (3) Unclocked port 0xFE border latch; (4) irq_ne default.
+//  localparam [31:0] BUILD_VERSION = 32'hB01B0161;  // B0161 (03.09): (1) Removed 9px pipeline delay for crisp 1px fonts; (2) Fine 1px border on Sinclair 48K; (3) Clean direct attrOutput.
 //  localparam [31:0] BUILD_VERSION = 32'hB01B0154;  // B0154 (31.08): ФАЗЫ 48K СВЕДЕНЫ С НАСТОЯЩЕЙ МАШИНОЙ. Плавающая шина отдаётся на такт позже (READP из ulatest3 на живом 48K: данные на 14340..14343, у нас были 14339..14342) и окно контеншена ПОРТОВ - тоже на такт позже (CONTP: занято с 14339, у нас с 14338). Порог stime остался 14335, как у машины: у ветви памяти строб падает на T1, у ветви портов IORQ только на T2, поэтому окна у них РАЗНЫЕ. Старая фаза портов возвращается битом27 MACHINE_CFG. Плюс экономия логики в T80: bq 3 бита, MEMPTR прерванной INxR/OTxR через уже имеющийся вычитатель PC-1.
 //  localparam [31:0] BUILD_VERSION = 32'hB01B0153;  // B0153 (31.08): флаги ПРЕРВАННОЙ блочной команды (лишний M-цикл повтора на 5 T): YF<-PC.13, XF<-PC.11 у всех, плюс HF/PF от B и MEMPTR=PC+1 у INxR/OTxR (David Banks 2018). Закрывает 089 LDIR->NOP', 090 LDDR->NOP', 102 INIR->NOP', 103 INDR->NOP' в z80full 1.2a (было 4 из 160).
 //  localparam [31:0] BUILD_VERSION = 32'hB01B0152;  // B0152 (31.08): Q-флаг доведён по z80ccf - SET/RES больше не ставят Q (флагов не трогают), LDI/LDD/LDIR/LDDR и CPI/CPD - ставят. На плате B0151 z80ccf валил ровно 071..080 (SET/RES) и 081..084 (LDI/LDD/LDIR/LDDR), остальные 134 OK.
@@ -694,6 +814,7 @@ module bulbulator_zx_ddr_top
         .ctl_pentagon_o(ctl_pentagon), .ctl_model48_o(ctl_model48), .ctl_ula_late_o(ctl_ula_late),
         .ctl_force_atlas_o(ctl_force_atlas), .ctl_snow_off_o(ctl_snow_off),
         .ctl_mach_cfg_o(mach_cfg_w), .ctl_pent_int_o(ctl_pent_int),   // B0071: бит5 = трап TR-DOS
+        .ctl_ula_tune2_o(ctl_ula_tune2),                              // B0180: второе лабораторное слово
         // B0071: заливка ПЗУ машины с карты (0x154/0x158/0x15C)
         .ctl_fdc_ctl_o(fdc_ctl_a), .ctl_fdc_ctl_we_o(fdc_ctl_we_a),
         .ctl_fdc_data_o(fdc_data_a), .ctl_fdc_data_we_o(fdc_data_we_a), .fdc_stat_i(fdc_stat_w),
@@ -929,7 +1050,8 @@ module bulbulator_zx_ddr_top
     // descriptors or EAR routing.
     assign warp_safe2_active = 1'b0;
     assign warp_active = ((fm_s1 == 2'd2) | ((fm_s1 == 2'd3) & wav_auto_safe)) & warp_latch;
-    // 🥇 ПОКА ЖДЁМ СЛЕДУЮЩИЙ БЛОК - МАШИНА ИДЁТ В РОДНОМ ТЕМПЕ (B0129, идея владельца).
+    // B0129: native CPU speed while SYNC is holding the next standard pilot.
+    // B0189 below extends this to the recorded pause BEFORE that pilot.
     //
     // `warp_latch` отвечает на вопрос «мы внутри загрузки» и обязан держаться ЧЕРЕЗ паузы: гейт по
     // мгновенному окну детектора когда-то давал дребезг 8x<->1x ПОСРЕДИ блока, один бит читался мимо,
@@ -947,18 +1069,36 @@ module bulbulator_zx_ddr_top
     // по `corr_read`) отпускал варп только через 600 мс тишины - здесь же отпускание МГНОВЕННОЕ и
     // детерминированное, потому что момент конца блока мы ЗНАЕМ, а не угадываем.
     //
-    // Почему это безопасно: `sync_hold` меняется ТОЛЬКО на границе блока (`tape_block_start`), внутри
-    // блока SYNC_ACTIVE держит его поднятым - «never truncate a started block». То есть скорость
-    // меняется ровно тогда, когда лента заведомо стоит, а не между двумя чтениями бита. Плюс сама
+    // Почему это безопасно: внутри помеченного блока SYNC_ACTIVE держит sync_hold поднятым —
+    // «never truncate a started block». Скорость меняется на границе блока/паузы,
+    // а не между двумя чтениями бита. Плюс сама
     // смена уже защёлкивается на границе такта (`if (ne_sel) cpuw_active <= cpuwarp_req`).
     //
     // Область действия узкая и намеренно: только процессорный FAST (fmode=1) на ПОМЕЧЕННЫХ
-    // стандартных блоках ПЗУ. Турбо и кастомные загрузчики идут с `tape_sync_rom`=0 или в
-    // SYNC_CUSTOM - у них `tape_streaming` всегда 1, поведение не меняется. Целоядерные режимы
+    // стандартных блоках ПЗУ. Турбо и кастомные загрузчики начинаются собственным маркером блока
+    // либо используют SYNC_CUSTOM; B0189 сохраняет их непрерывный режим. Целоядерные режимы
     // (fmode 2/3, только через JTAG) НЕ трогаем: у них смена темпа тянет за собой ULA и видеотакт,
     // там есть рукопожатие `warp_ack`, и дёргать его на каждой границе блока незачем.
+    // B0189: replay permission is NOT acceleration permission. Recorded pauses
+    // are unmarked and must keep advancing, but code after LD-BYTES must already
+    // run at native CPU/ULA ratio. SHOCK measures the frame here, between loading
+    // shock.0 and shock.2; accelerating that detector selects its 128K routine on
+    // a 48K machine. Remember block class across its unmarked trailing pause.
+    // A genuine custom block (bit29 start, bit30 clear) clears the context;
+    // raw WAV/MP3 never enters it, and the existing custom-TAP fallback bypasses
+    // it. Neither EAR advancement nor whole-core SAFE4 is changed.
+    // BEGIN STANDARD_PAUSE_WARP_POLICY (also exercised by regression bench)
+    reg sync_standard_context = 1'b0;
+    always @(posedge spclk or negedge sp_reset_n) begin
+        if (!sp_reset_n) sync_standard_context <= 1'b0;
+        else if (!trun_s[1]) sync_standard_context <= 1'b0;
+        else if (tape_block_start) sync_standard_context <= tape_sync_rom;
+    end
+    wire cpuwarp_tape_allowed = tape_streaming &
+        (~sync_effective | ~sync_standard_context | tape_sync_rom | (sync_state == SYNC_CUSTOM));
+    // END STANDARD_PAUSE_WARP_POLICY
     wire cpuwarp_req   = ((fm_s1 == 2'd1) | ((fm_s1 == 2'd3) & ~wav_auto_pending & ~wav_auto_safe)) & warp_latch
-                         & tape_streaming;
+                         & cpuwarp_tape_allowed;
     // DEMAND TAPE (option SYNC LOADER): the ARM marks standard-ROM pulses with descriptor bit30.
     // Recorded pauses and all turbo/custom pulses are unmarked and always replay continuously.  At the
     // first marked pilot pulse we wait for the core's exact passive PC=0x056B fetch; arbitrary port-FE
@@ -1230,10 +1370,9 @@ module bulbulator_zx_ddr_top
 `else
     wire tape_cpu_tick = pe3M5_core;
 `endif
-    // Один предикат «лента движется» на два потребителя: собственно продвижение ленты и разрешение
-    // варпа (см. комментарий у cpuwarp_req). Раньше он был здесь выражением на месте - вынесен в
-    // именованный провод, чтобы у ленты и у скорости процессора не могло разъехаться понимание того,
-    // идёт загрузка или нет. Именно такое расхождение и стоило нам SHOCK.TAP.
+    // Replay stays continuous through recorded pauses. B0189 deliberately uses
+    // the narrower cpuwarp_tape_allowed predicate for CPU acceleration: a moving
+    // tape is not proof that the guest is still executing its loading loop.
     assign tape_streaming = (~sync_effective | ~tape_sync_rom | sync_hold | (sync_state == SYNC_CUSTOM));
     wire tape_advance = tape_cpu_tick & tape_warp_ready & tape_streaming;
     /* B0046 A/B uses the player's genuine idle transition only to return the
@@ -1464,12 +1603,19 @@ module bulbulator_zx_ddr_top
     (* ASYNC_REG="TRUE" *) reg [31:0] pint_s1 = 32'h00EF0146, pint_s2 = 32'h00EF0146, pint_s3 = 32'h00EF0146;
     reg [31:0] pint_q = 32'h00EF0146;
     reg [31:0] pint_active = 32'h00EF0146;
+    (* ASYNC_REG="TRUE" *) reg [31:0] t2_s1 = 32'd0, t2_s2 = 32'd0;
+    reg [31:0] t2_s3 = 32'd0, t2_q = 32'd0, t2_active = 32'd0;
     reg pint_vsync_d = 1'b0;
     always @(posedge spclk) begin
         pint_s1 <= ctl_pent_int; pint_s2 <= pint_s1; pint_s3 <= pint_s2;
         if (pint_s2 == pint_s3) pint_q <= pint_s2;
         pint_vsync_d <= vid_vsync;
         if (vid_vsync && !pint_vsync_d) pint_active <= pint_q;
+        // B0180: второе лабораторное слово - тот же приём (два регистра + сверка + защёлка по кадру),
+        // чтобы ручка менялась АТОМАРНО и ровно на границе кадра, а не посреди строки.
+        t2_s1 <= ctl_ula_tune2; t2_s2 <= t2_s1; t2_s3 <= t2_s2;
+        if (t2_s2 == t2_s3) t2_q <= t2_s2;
+        if (vid_vsync && !pint_vsync_d) t2_active <= t2_q;
     end
 
     // ---- BulbuLator screen mirror: raw ZX screen tapped off the ULA fetch (main.v scr_cap*) ----
@@ -1504,6 +1650,7 @@ module bulbulator_zx_ddr_top
         // и связь вне `ifndef` уронила бы обе ветви на синтезе МОЛЧА (эта мина уже стоила шести дней,
         // см. B0148 ниже про четыре связи карты).
         .io_cont_early(iocont_s[1]),
+        .kj_en(kjen_s[1]),            // B0175: та же мина, что у io_cont_early - порт есть ТОЛЬКО у Atlas
         .ram_nobit(ram_nobit_sp), // B0120: каких старших бит банка у машины НЕТ (MACHINE_CFG [16:14])
         .mem_wait(zx_mem_wait),
         .ram_bank(ram_bank_core),
@@ -1537,6 +1684,7 @@ module bulbulator_zx_ddr_top
 `endif
         .ula_late(ula_late_sp),
         .ula_tune(pint_active),        // B0053: PENT_INT is free on native48 and becomes a frame-atomic JTAG timing tuner
+        .ula_tune2(t2_active),         // B0180: ОЖИВЛЁН - раньше вход висел и все ручки на нём были мертвы НА ПЛАТЕ
         .pent_int_v(pint_active[24:16]),
         .pent_int_h(pint_active[8:0]),
         .paper_h(paper_h_sp),

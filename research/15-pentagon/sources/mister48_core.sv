@@ -15,6 +15,13 @@ module mister48_core
     input  wire       model,
     input  wire       pentagon,
     input  wire       ula_late,
+    /* 🥇 Жалоба владельца 13.08: «переключатель ULA SNOW не реагирует ни на одной машине».
+       На этой машине он был мёртв ПО ПОСТРОЕНИЮ: топ отрезал провод (`ifndef MISTER48_CORE`), а
+       сюда в ULA подавалась константа `.snow_ena(1'b1)`. При этом ULA снег УМЕЕТ, и именно в том
+       режиме, в котором мы её держим: `cores/zx-mister/rtl/ula.sv:200-201` — «Snow effect for
+       ULA-48 only. ULA-128 has no snow bug», условие `mZX & ~m128 & ... & snow_ena`, а мы подаём
+       `mZX=1, m128=0`. То есть не хватало ровно провода. */
+    input  wire       snow_off,    // 1 = снег ВЫКЛЮЧЕН (чистая выборка), 0 = как настоящая 48К (умолчание)
     input  wire[31:0] ula_tune,
     input  wire       warp_nc,
     input  wire[8:0]  pent_int_v,
@@ -284,7 +291,7 @@ module mister48_core
         .tmx_avail(1'b0),
         .mode512(mode512),
 
-        .snow_ena(1'b1),
+        .snow_ena(~snow_off),   /* было 1'b1 - константа, из-за неё пункт меню ничего не делал */
         .mZX(1'b1),
         .m128(1'b0),
         .page_scr(1'b0),

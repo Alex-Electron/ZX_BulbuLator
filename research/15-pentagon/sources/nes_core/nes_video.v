@@ -16,6 +16,8 @@ module nes_video (
     input  wire [5:0] color,
     input  wire [8:0] cycle,
     input  wire [8:0] scanline,
+    input  wire [7:0] h_off,     // v160 picture-in-window pan: 64 = centered (PAPER_H reg, menu Picture X)
+    input  wire [7:0] v_off,     // 24 = centered (PAPER_V reg, menu Picture Y)
 
     output wire       wr_ce,     // 1 for exactly one clk per new PPU dot
     output wire       hsync,
@@ -24,15 +26,23 @@ module nes_video (
     output wire       r,
     output wire       g,
     output wire       b,
-    output wire       i
+    output wire       i,
+    output wire [7:0] pix8      // v161: raw palette index for the true-colour 8bpp path
 );
+    assign pix8 = {2'b00, color};
     // new-dot detector
     reg [8:0] cyc_d = 9'd0;
     always @(posedge clk) cyc_d <= cycle;
     assign wr_ce = (cycle != cyc_d);
 
-    // visible window
-    wire vis = (cycle >= 9'd1) && (cycle <= 9'd256) && (scanline <= 9'd239);
+    // visible window, pannable by +/-64/+/-24 around the PAPER center (owner's "picture inside the
+    // machine window" knob): shifting the SAMPLING window pans the captured picture without touching
+    // the machine's own timing. Off-window pixels sample whatever the PPU drives there (edge junk ok).
+    wire signed [10:0] ho    = $signed({3'b000, h_off}) - 11'sd64;
+    wire signed [10:0] vo    = $signed({3'b000, v_off}) - 11'sd24;
+    wire signed [10:0] cyc_s = $signed({2'b00, cycle});
+    wire signed [10:0] sl_s  = $signed({2'b00, scanline});
+    wire vis = (cyc_s >= 11'sd1 + ho) && (cyc_s <= 11'sd256 + ho) && (sl_s >= vo) && (sl_s <= 11'sd239 + vo);
     assign blank = ~vis;
 
     // hsync during the horizontal blanking gap; vsync during the vertical blank band.

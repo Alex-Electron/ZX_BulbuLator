@@ -8,6 +8,11 @@ module main
 	input  wire       mem_wait, // 1 = память не готова (расширенный банк в DDR) -> ТАКТ ОЖИДАНИЯ процессора
 	input  wire       snow_off, // 1 = ULA snow OFF (clean raster fetch); 0 = faithful 128 snow (default) - MACHINE_CFG bit4
 	input  wire       io_cont_early, // B0154: 1 = окно контеншена ПОРТОВ как до B0154, на такт РАНЬШЕ
+	input  wire       kj_en,        // B0175: джойстик Kempston ЕСТЬ (MACHINE_CFG бит28). На голом
+	                                //        48K интерфейса нет, и порты с a[5]=0 обязаны отдавать
+	                                //        плавающую шину - иначе тесты 35/36/37 Timing Tests 48K
+	                                //        не сходятся: их тело грузит регистр B ПРЯМО С ШИНЫ и
+	                                //        делает его старшим байтом порта для следующих чтений.
 	                                 // (наследие; MACHINE_CFG бит27). Умолчание 0 = фаза настоящей машины:
 	                                 // CONTP из ulatest3 на живом 48K показывает занятость с такта 14339,
 	                                 // у нас до B0154 было 14338. Порог stime (память) при этом не двигается
@@ -27,7 +32,8 @@ module main
 	                                //   не трогает, поэтому порог stime (14335) остаётся на месте.
 	input  wire       pentagon, // 1 = Pentagon: 448x320 raster + NO memory contention (paging stays per `model`)
 	input  wire       ula_late, // 1 = requested Sinclair ULA Type 2/Late profile
-	input  wire[31:0] ula_tune, // B0053 native-48 sweep: EN/FREEZE/EPOCH/signed IRQ+ULA half-T deltas/INT source
+	input  wire[31:0] ula_tune, // B0157 primary live 48K timing controls
+	input  wire[31:0] ula_tune2, // B0157 floating-bus/memory-contention/border-mode controls
 	input  wire       warp_nc,  // 1 = CPU-only warp active: suppress memory contention so the 8x CPU is not stalled by 1x-ULA-timed wait-states (fixes WAV/turbo loads on contended 128K; visual during warp is don't-care)
 	input  wire[8:0]  pent_int_v, // Pentium INT line (runtime-tunable)
 	input  wire[8:0]  pent_int_h, // Pentium INT start hc (runtime-tunable)
@@ -163,11 +169,30 @@ module main
 );
 //-------------------------------------------------------------------------------------------------
 
+wire m1;   // M1_n процессора (АКТИВЕН НИЗКИМ). Объявлен здесь, потому что ниже его
+           // читает `vduC_acc` - выбор окна штрафа для выборки команды (B0180).
 reg mreqt23iorqtw3;
 always @(posedge clock) if(pc3M5) mreqt23iorqtw3 <= mreq & ioFE;
 
+/* B0183 ПРИБОР: ПРИВЯЗКА `cpuck` К СЧЁТЧИКУ ULA (порт эталона MiSTer).
+   `cpuck` у нас - СВОБОДНО БЕГУЩИЙ делитель: пока штрафов нет, его фаза относительно растра ничем
+   не закреплена. Каждый штраф защёлкивает процессор в сетку окна, поэтому ошибается РОВНО ОДИН
+   доступ за кадр - первый занятый после долгого свободного бега по бордюру. Измерено на стенде
+   (тест 3 занятый, CMON): он получает штраф 6 при каноническом 4, все остальные 2929 штрафов кадра
+   канонические. Эти 2 такта за кадр и дают dR=-1..-2 в тестах 2, 3, 17, 18, 27 занятых.
+   Эталон (cores/zx-mister/rtl/ula.sv:255-263):
+       wire next_clk = hc_next[0] | (mZX & ulaContend & (memContend | ioContend));
+       if(ce_7mn) CPUClk <= next_clk;
+   то есть БЕЗ штрафа CPUClk РАВЕН чётности счётчика, а не переключается сам по себе.
+   Ручка: ula_tune2[22] = привязка включена, [23] = полярность (эталон берёт hc_next, у нас под рукой
+   hCount, поэтому полярность выбирается измерением). Умолчание 0 = поведение прежнее в точности. */
+wire[8:0]  vdu_dbg_h, vdu_dbg_v;
+wire ck_lock_en = ula_tune2[22];
+wire ck_lock_ph = ula_tune2[23];
+wire ck_lock_v  = ck_lock_ph ? ~vdu_dbg_h[0] : vdu_dbg_h[0];
 reg cpuck;
-always @(posedge clock) if(ne7M0) cpuck <= !(cpuck && contend);
+always @(posedge clock) if(ne7M0) cpuck <= ck_lock_en ? (ck_lock_v | ~contend)
+                                                      : !(cpuck && contend);
 
 // B0154: окно занятости шины для ветви ВВОДА-ВЫВОДА можно задержать на такт (две ступени по ne7M0 =
 // 2 px = 1 T) независимо от ветви ПАМЯТИ. При io_cont_late = 0 выражение тождественно прежнему -
@@ -177,9 +202,62 @@ reg [7:0] vduC_io_sr = 8'h00;
 always @(posedge clock) if(ne7M0) begin
     vduC_io_sr <= {vduC_io_sr[6:0], vduC};
 end
+// Historical bit27 contract: 1 = raw/early vduC (B0153), 0 = delayed tap2 (B0154).
+// 🥇 B0158: умолчание окна контеншена ПОРТОВ вернулось на такт позже (наша C2, принятая на живой
+// машине: CONTP из ulatest3 даёт первый занятый такт 14339, ранняя фаза давала 14338). В B0157
+// умолчание было 3'd0 = сырое раннее окно, то есть поведение B0153, и приёмка не выполнялась.
+// Бит27 MACHINE_CFG (`io_cont_early`) снова живой: он возвращает раннюю фазу для A/B с хоста -
+// именно этим переключателем 31.08 доказали, что регрессию даёт C2, а не C1.
+// ⚠ tap = 2, а НЕ 1: одна ступень регистра тактируется по ne7M0, то есть даёт ПОЛТАКТА (1 px).
+// У B0154 задержка была двумя ступенями = 2 px = ровно 1 такт. Стенд поймал это до сборки:
+// с tap 1 первый занятый такт CONTP совпадал, а длительности стопа - нет (5/2 вместо 6/3).
+// B0170: УМОЛЧАНИЕ ОКНА КОНТЕНШЕНА ПОРТОВ ВЕРНУЛОСЬ В НОЛЬ (как было до B0154).
+// B0154 сдвинул это окно на такт позже ради приёмочного CONTP (первый занятый такт 14339 вместо
+// 14338). Цена вскрылась только 08.09 и оказалась велика: бордюрные строки контеншена не имеют,
+// но общий заряд за кадр от этого сдвига меняется, вход в HALT уезжает, а выход из HALT квантован
+// по 4 такта - и весь код после него прыгает на 8 пикселей. На экране это верхняя полоса квадратов,
+// уехавшая вправо (жалобы владельца по esh1_48 и esh2_48).
+// ИЗМЕРЕНО, а не предположено:
+//   * бисект по ядрам на карте: B0153 даёт одну пару переходов (правильно), B0154 - две,
+//     разошедшиеся на 8 px. Владелец подтвердил глазом: на B0153 esh1 идёт правильно;
+//   * A/B битом 27 на живой плате, три цикла подряд: позднее окно = 11 правильных строк + 10
+//     сдвинутых, раннее = 21 правильная и НИ ОДНОЙ сдвинутой (число строк сохраняется);
+//   * esh2_48 честным кадром против ZEsarUX: позднее окно - 20 расходящихся строк из 304,
+//     раннее - 0 из 304, совпадение 100 %;
+//   * заряд контеншена при этом остаётся каноническим 6,5,4,3,2,1,0,0 (стенд, по одному доступу
+//     в кадре, NT=1, отдельный прогон на каждый такт окна - свипы с NT>1 тут врут).
+// ЧЕМ ПОДТВЕРЖДЕНО СНАРУЖИ: у Потапова (vertohod/ep4spectrum, `source/video.v:542-545`) io_base = 0
+// на ВСЕХ машинах, а прежние 32 counts на 48K/128K он называет ротацией окна ввода-вывода и убрал
+// как дефект. То есть к нулю пришли независимо и с двух сторон.
+// ЦЕНА, ЗАПИСАННАЯ ЧЕСТНО: CONTP становится 14338 вместо принятого 14339 (стенд, зонд MODE 1).
+// Прежняя фаза осталась переключателем: `io_cont_early = 0` (бит27 MACHINE_CFG снят) даёт tap 2.
+// Когда нужна прежняя: если понадобится воспроизвести приёмку CONTP 14339..14344 в том виде,
+// в каком она снималась до 08.09. Для демок и для картинки нужен НОЛЬ.
 wire [2:0] io_cont_tap = tune_en ? ula_tune[6:4] : (io_cont_early ? 3'd2 : 3'd0);
+wire [2:0] mem_cont_tap = tune_en ? ula_tune2[4:2] : 3'd0;
 wire vduC_io = (io_cont_tap == 3'd0) ? vduC : vduC_io_sr[io_cont_tap - 1];
-wire contend = (pentagon | warp_nc) ? 1'b1 : !(cpuck && mreqt23iorqtw3 && ((vduC && memC) || (vduC_io && !ioFE)));  // Pentagon: NO contention; warp_nc: suppress it while the CPU-only warp runs 8x (1x-ULA wait-states would misalign and corrupt coarse WAV edges)
+// B0179: база для ПАМЯТИ - отдельное окно `cn_mem` со своей фазой (video.v). Ручка
+// `mem_cont_tap` осталась дополнительной задержкой поверх него для лаборатории.
+reg [7:0] vduC_mem_sr = 8'h00;
+always @(posedge clock) if(ne7M0) vduC_mem_sr <= {vduC_mem_sr[6:0], vduC_mem_raw};
+wire vduC_mem = (mem_cont_tap == 3'd0) ? vduC_mem_raw : vduC_mem_sr[mem_cont_tap - 1];
+wire vduC_m1  = vduC_m1_raw;   // B0180: у выборки команды своя фаза (video.v, ula_tune2[20:16])
+/* 🥇 B0180 У ВЫБОРКИ КОМАНДЫ И У ДАННЫХ ФАЗА ШТРАФА РАЗНАЯ.
+   Найдено СОСТАВОМ провалов, а не рассуждением: свип фазы окна памяти показал, что при 1 такте
+   валятся тесты 3, 5, 13, 14, 20 (`NOP`, `LD r,r`, `EXX`, `BIT b,r`, `SET/RES b,r` - команды почти
+   без обращений к данным, один M1) и все с dR = -1, а при 2 тактах валятся 9, 11, 23, 24
+   (`LD HL,(nn)`, `PUSH/CALL`, `(IX+n)` - по несколько доступов к данным) и все с dR = +1.
+   То есть одна фаза не может удовлетворить обе группы: они тянут в разные стороны.
+   `m1` активен НИЗКИМ (`M1_n`), поэтому выборка команды = `~m1`. */
+/* ⚠ ПЕТЛЮ РАЗРЫВАЕМ РЕГИСТРОМ. `contend` комбинационно питает `pc3M5` (:247), который тактирует
+   процессор, поэтому заводить в `contend` его же выход `m1` напрямую нельзя - получается
+   комбинационное кольцо, и xsim роняет элаборацию невнятным «Failed to compile generated C file».
+   Берём копию на МАСТЕР-такте: задержка 17 нс против такта в 285 нс, то есть на решение о штрафе
+   она не влияет, а кольцо разрывает. */
+reg  m1_d = 1'b1;
+always @(posedge clock) m1_d <= m1;
+wire vduC_acc = (~m1_d) ? vduC_m1 : vduC_mem;
+wire contend = (pentagon | warp_nc) ? 1'b1 : !(cpuck && mreqt23iorqtw3 && ((vduC_acc && memC) || (vduC_io && !ioFE)));  // Pentagon: NO contention; warp_nc: suppress it while the CPU-only warp runs 8x (1x-ULA wait-states would misalign and corrupt coarse WAV edges)
 
 // ТАКТЫ ОЖИДАНИЯ ПАМЯТИ. Ложатся ровно туда же, где живёт контеншен ULA: гасится разрешение
 // такта ПРОЦЕССОРА (обе фазы - T80 защёлкивает данные на nc3M5), а ULA и видео идут своим
@@ -203,21 +281,74 @@ wire cpu_ten_raw = pe3M5 & contend & ~mem_wait;   // такт, который Б
 // CPU-visible interrupt is then exactly one T earlier relative to the display/contention phase,
 // matching Fuse/Spectrusty late-timing coordinates.  vduI is generated synchronously in this same
 // spclk domain; this is a phase selection, not an asynchronous clock-domain crossing.
+// B0165: strictly 32 T interrupt duration on 48K / 128K.
+// Arrival edge is sampled on pc3M5/nc3M5 (preserving exact legacy entry phase for stime 14335,
+// READP 14340..14343, CONTP 14339..14344).
+// Deassertion edge is sampled on free-running pe3M5/ne3M5 so that memory/IO contention
+// does not artificially stretch /INT input to 46..48 T.
 reg irq = 1'b1;
 reg irq_ne = 1'b1;
-always @(posedge clock) if(pc3M5) irq <= vduI;
-always @(posedge clock) if(nc3M5) irq_ne <= vduI;
+always @(posedge clock) begin
+    if(!vduI) begin
+        if(pc3M5) irq <= 1'b0;
+    end else begin
+        if(pe3M5) irq <= 1'b1;
+    end
+end
+always @(posedge clock) begin
+    if(!vduI) begin
+        if(nc3M5) irq_ne <= 1'b0;
+    end else begin
+        if(ne3M5) irq_ne <= 1'b1;
+    end
+end
 
-wire[1:0] int_sel_req = tune_en ? ula_tune[8:7] : (ula_late ? 2'd1 : 2'd0);
-wire[1:0] int_sel = int_sel_req == 2'd3 ? 2'd0 : int_sel_req; // reserved source fails safe to legacy
+// 🥇 B0158: умолчание источника прерывания ВЕРНУТО К ОПЦИИ МАШИНЫ. В B0157 здесь стояло жёсткое
+// 2'd1 (= Late, сырой vduI без переопроса), и это стоило трёх эталонных чисел сразу: шкала тестов
+// Бобровского привязана К ПРЕРЫВАНИЮ, поэтому прерывание на такт раньше читается как «всё на такт
+// позже». Измерено стендом /tmp/ula1 по живому коду: порог stime 14335 -> 14336, данные плавающей
+// шины 14340..14343 -> 14341..14344, окно контеншена памяти +1 такт. Плюс опция машины
+// `ULA timing = EARLY (TYPE 1)` перестала на что-либо влиять - ядро всегда было Late.
+// B0162: default Sinclair ULA to irq_ne (2'd2) to eliminate master-clock sampling edge race
+/* 🥇 B0175 ПЕРЕОПРОС ПРЕРЫВАНИЯ ТАКТОМ ПРОЦЕССОРА СТОИТ ЧЕТЫРЁХ ТАКТОВ НА ВЫХОДЕ ИЗ HALT.
+   Настоящий Z80 опрашивает /INT в ПОСЛЕДНЕМ такте команды, а в HALT команды идут по сетке 4 такта.
+   `irq <= vduI` по `pc3M5` отдаёт сигнал на такт позже: если граница сетки приходится ровно на тот
+   такт, где /INT только что стал активен, выборка его НЕ ВИДИТ и берётся следующая граница —
+   то есть плюс целый цикл NOP. У нас это ровно так и было: /INT активен с T=0, ближайшая граница
+   на T=1, подтверждение начиналось на T=5 вместо T=1.
+   ИЗМЕРЕНО НА СТЕНДЕ (Timing Tests 48K, живое RTL): с переопросом тело теста стартует на такте 253
+   от прерывания, эталон 247..249. Разложение цепочки монитором TMON: подтверждение INT 7,
+   обработчик F5F5 24, пусковая C0F3 59, тело DDDD 253; при этом сам обработчик ровно 35 T, а
+   пусковая ровно 194 T — то есть весь промах сидел в первом звене.
+   БЕЗ переопроса семь тестов из восьми в классе «сдвиг t0» встают на эталон точно
+   (3, 5, 12, 15, 19, 20 незанятые и 5 занятый).
+   ЧТО ИМЕННО СТОИТ ТЕПЕРЬ: `vduI`, зарегистрированный МАСТЕР-тактом (56.67 МГц), то есть задержка
+   1/16 такта процессора вместо целого. Сырой `vduI` — комбинационный (`video.v: assign irq =
+   !irqActive` от компараторов счётчиков), и вешать его прямо на вход T80 на закрытом тайминге
+   рискованно; регистр мастер-такта снимает этот риск, не возвращая задержку на T-состояние.
+   ⚠ ЧТО БЫЛО ЗАПИСАНО ПРОТИВ И ПОЧЕМУ СНЯТО: B0158 вернул переопрос, потому что без него уезжали
+   три ОДИНОЧНЫХ приёмочных числа (stime, READP, окно контеншена). Это наши собственные пробы со
+   своей шкалой, привязанной к прерыванию; набор из 74 троек с ДВУМЯ независимыми таблицами
+   ожиданий — свидетельство сильнее. Тест 0 (детектор Early/Late) при этом отдаёт эталонную тройку
+   TYPE1, то есть шкала теста к машине привязывается верно.
+   ⚠ И ЗАОДНО РАЗВЯЗАНЫ ДВЕ РАЗНЫЕ ВЕЩИ: вариация Ferranti Early/Late — это сдвиг РАСТРА на такт
+   (`ulaShift`, video.v), переопрос прерывания к ней отношения не имеет. Раньше опция машины
+   `ULA timing` дёргала оба, теперь только растр.
+   Лаборатория (`ula_tune[8:7]`): 0 = регистр мастер-такта (умолчание), 1 = сырой `vduI`,
+   2 = `irq_ne` (переопрос по противоположной фазе), 3 = прежний `irq` по `pc3M5`. */
+reg vduI_m = 1'b1;
+always @(posedge clock) vduI_m <= vduI;
+wire[1:0] int_sel = tune_en ? ula_tune[8:7] : 2'd0;
 wire cpu_irq = int_sel == 2'd1 ? vduI
              : int_sel == 2'd2 ? irq_ne
-             : irq;
+             : int_sel == 2'd3 ? irq
+             : vduI_m;
 
 wire rfsh;
 wire mreq;
 wire iorq;
-wire m1;
+// wire m1; - объявление перенесено ВЫШЕ (см. B0180): его использует `vduC_acc`,
+//           а неявная сеть плюс повторное объявление роняли элаборацию xsim.
 wire rd;
 wire wr;
 
@@ -255,7 +386,31 @@ reg[2:0] border;
 
 always @(posedge clock)
 	if(force_border) border <= border_in;                          // ARM override (raw clock)
-	else if(pe7M0) if(!ioFE && !wr && !nemo_sup) { speaker, mic, border } <= q[4:0];
+	// 🥇 B0174 ЗАПИСЬ В БОРДЮР ЗАЩЁЛКИВАЕТСЯ ПОСЛЕ ОТРАБОТКИ КОНТЕНШЕНА, А НЕ В НАЧАЛЕ ЦИКЛА.
+	// Это лечит чёрную чёрточку 8x1 px вплотную слева к бумаге на ПЕРВОЙ строке экрана (esh2_48,
+	// строка 54, x 57..64). У настоящего 48K её нет; у FUSE, ZEsarUX и Spectrusty - есть, и у нас
+	// была по той же причине.
+	// МЕХАНИКА. Цикл ввода-вывода занимает такты [s, s+3+d], где d - штраф контеншена. Эталонное
+	// правило настоящей машины (WoS «48K reference»): положение цвета на экране задаётся КОНЦОМ
+	// команды минус три, то есть s+d - ПОСЛЕ отработки ожидания. Мы же защёлкивали на s, потому что
+	// во время контеншена процессор заморожен, а IORQ/WR держатся весь растянутый цикл, и первый же
+	// pe7M0 брал значение. Ошибка ровно на d тактов.
+	// ПОЧЕМУ ВИДНО ТОЛЬКО ОДНУ СТРОКУ. Такт 14335 - единственный в строке, где ОДНОВРЕМЕННО
+	// красится последняя 8-пиксельная группа бордюра и начисляется максимальный штраф 6. Запись,
+	// попавшая на него, у нас ложилась вплотную слева к бумаге, а у настоящей машины уезжает на
+	// шесть тактов внутрь бумаги, где бордюра не видно, и бордюр остаётся прежним. Дальше по кадру
+	// штрафы сбивают 224-тактовый цикл демки, и попаданий в 14335 больше нет.
+	// ПОДТВЕРЖДЕНО ТРЕМЯ НЕЗАВИСИМЫМИ ИСТОЧНИКАМИ:
+	//   * FUSE 1.6.0, periph.c:368-373 - `writeport_internal` (красит бордюр) стоит СТРОКОЙ ВЫШЕ,
+	//     чем начисление штрафа `ula_contend_port_late`; то же у ZEsarUX (operaciones.c) и Spectrusty;
+	//   * правило WoS: «OUT, заканчивающийся на такте 14339..14342, меняет бордюр ровно в позиции
+	//     байта 16384» - то есть отсчёт от КОНЦА команды;
+	//   * разбор Потапова (ep4spectrum 4f902f7): на первом контендед-такте кадра исполняется второй
+	//     байт `ED 71` (OUT (C),0, чёрный), то есть T0+9 = 14335.
+	// ЧТО ИМЕННО ИЗМЕНИЛОСЬ: добавлено `contend` - защёлка берёт значение на первом НЕОСТАНОВЛЕННОМ
+	// такте цикла записи, то есть на s+d. Вне контеншена d = 0 и момент прежний, поэтому на всём
+	// остальном софте правка обязана быть невидимой.
+	else if(pe7M0 && contend) if(!ioFE && !wr && !nemo_sup) { speaker, mic, border } <= q[4:0];
 	/* B0112: у NEMO все командные порты ЧЁТНЫЕ, то есть попадают в окно #FE. Без подавления
 	   `OUT (#10)` мигал бы бордюром на каждом байте сектора - в железе это делает /IORQCE. */
 
@@ -263,8 +418,10 @@ always @(posedge clock)
 
 wire       vduI;
 wire       vduC;
+wire       vduC_mem_raw;   // B0179: окно занятости для ПАМЯТИ (своя фаза)
+wire       vduC_m1_raw;    // B0180: окно занятости для ВЫБОРКИ КОМАНДЫ (своя фаза)
 wire[12:0] vduA;
-wire[8:0]  vdu_dbg_h, vdu_dbg_v;
+// объявление vdu_dbg_h/vdu_dbg_v поднято ВЫШЕ (к cpuck): его читает ck_lock_v
 wire[ 7:0] vduD = vmmD;
 wire[ 7:0] vduQ;
 wire       vdu_scr_we;                    // BulbuLator: ULA screen-fetch strobe (from video)
@@ -273,12 +430,14 @@ assign scr_capD  = vduD;                  // = vmmD: byte from the displayed ban
 assign scr_capWe = vdu_scr_we;
 assign border_o  = border;                // live ULA border colour (declared below at reg[2:0] border)
 
+
 video Video
 (
 	.model  (model  ),
 	.pentagon(pentagon),
 	.ula_late(ula_late),
 	.ula_tune(ula_tune),
+	.ula_tune2(ula_tune2),
 	.pent_int_v(pent_int_v),
 	.pent_int_h(pent_int_h),
 	.paper_h(paper_h),
@@ -288,6 +447,8 @@ video Video
 	.border (border ),
 	.irq    (vduI   ),
 	.cn     (vduC   ),
+	.cn_mem (vduC_mem_raw),
+	.cn_m1  (vduC_m1_raw),
 	.a      (vduA   ),
 	.d      (vduD   ),
 	.q      (vduQ   ),
@@ -389,7 +550,7 @@ wire       trdos_live;              // живая защёлка DOS: наруж
 wire saa_deaf = (saa_mode == 2'd1) ? 1'b0
               : (saa_mode == 2'd2) ? 1'b1
               :                      (trdos_live | bd_busy);
-wire saaCs = !(!iorq && !wr && a[7:0] == 8'hFF && !saa_deaf);
+wire saaCs = !(!iorq && m1 && !wr && a[7:0] == 8'hFF && !saa_deaf);
 wire saaA0 = a[8];
 
 wire[7:0] saaD = q;
@@ -720,7 +881,13 @@ usd_bulb uSD                       /* B0138: форк с поддержкой Z-
 
 //-------------------------------------------------------------------------------------------------
 
-wire ioDF   = !(!iorq && !a[5]);                   // kempston
+/* 🥇 B0175 ДЖОЙСТИК KEMPSTON - ОПЦИЯ, А НЕ ЧАСТЬ МАШИНЫ. Конус `a[5]=0` накрывает ПОЛОВИНУ портов,
+   и без гейта каждое такое чтение получало 0x00 вместо плавающей шины. Измерено на стенде
+   (Timing Tests 48K, тест 36, один кадр): из 1659 чтений 831 отдал джойстик, и только 117 - байт
+   экрана. Тело тестов 35/36/37 грузит регистр B с шины и делает его старшим байтом порта, поэтому
+   подмена меняет класс контеншена порта и валит все три теста. Модель без конуса воспроизводит
+   эталонные тройки всех трёх тестов, с конусом - ровно наши числа. Умолчание 0 = интерфейса нет. */
+wire ioDF   = !(!iorq && m1 && !a[5] && kj_en);          // kempston (опция MACHINE_CFG бит28)
 /* 🥇 B0137 ПОРТ КАРТЫ СУЩЕСТВУЕТ, ТОЛЬКО ПОКА DivMMC ВКЛЮЧЁН. Было без гейта - и модуль uSD
    стоял в ядре безусловно. Последствие поймано владельцем 14.08 на Wild Player: при ВЫКЛЮЧЕННОМ
    DivMMC плеер опрашивал #EB, получал не чистую шину, а остаток сдвигового регистра, решал, что
@@ -732,7 +899,7 @@ wire ioEB   = !(!iorq && m1 && a[7:0] == 8'hEB && mapper);   // usd
 /* B0138: порты Z-Controller. Тот же движок и та же карта, другой транспорт. Терм m1 - по той же
    причине, что и у #EB: в подтверждении прерывания порт отвечать не должен. */
 wire ioZC   = !(!iorq && m1 && zc_en && (a[7:0] == 8'h57 || a[7:0] == 8'h77));
-wire ioFE   = !(!iorq && !a[0]);                   // ula
+wire ioFE   = !(!iorq && m1 && !a[0]);                   // ula
 	assign tape_sample = ~ioFE & wr;   // port-FE access that is NOT a write = a READ (loader sampling the ear bit)
 	assign tape_sample_strobe = tape_sample & nc3M5; // T80's CEN_n / DI latch phase
 	assign tape_di_bit = ear | speaker;              // exact d[6] for the port-FE mux below
@@ -835,7 +1002,7 @@ assign int_dbg0_o = {ack_seq, trace_valid, missed_raw_window, trace_source,
                      trace_raw_seen};
 assign int_dbg1_o = {trace_v, trace_h, trace_raw_age, trace_cpu_age};
 assign int_dbg2_o = {trace_pc, trace_r, trace_raw_seq};
-wire ioFFFD = !(!iorq && a[15] && a[14] && !a[1]); // psg
+wire ioFFFD = !(!iorq && m1 && a[15] && a[14] && !a[1]); // psg
 
 // B0075 ДИСКОВОД. Приоритет ВЫШЕ встроенных портов, и это не вкусовщина: порт #1F - это И
 // джойстик Kempston (ioDF: !a[5]), И регистр состояния контроллера дискет. На настоящей машине их

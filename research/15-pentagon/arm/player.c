@@ -57,6 +57,56 @@ static void rb_push(int16_t l, int16_t r){
     rb_w++;                                            /* index bump AFTER the data write (SPSC ordering) */
 }
 
+/* ---------------- General Sound: ЖИВОЙ источник, а не файл ----------------
+   GS - звуковая КАРТА машины, а не проигрыватель: его выход обязан СУММИРОВАТЬСЯ с AY (фабрика,
+   0x78 бит1 = режим суммы), а не скрещиваться. И очередь ему нужна МЕЛКАЯ: файловое кольцо здесь
+   не годится вовсе - оно глубиной 10.9 с, и карта отвечала бы на команды с многосекундной
+   задержкой. 4096 сэмплов = 85 мс: хватает пережить отрисовку навигатора и чтение с карты. */
+#define GSB_LEN  4096u
+#define GSB_MASK (GSB_LEN-1u)
+static volatile uint32_t gsb_buf[GSB_LEN];
+static volatile uint32_t gsb_w = 0, gsb_r = 0;
+static volatile int      gsb_on = 0;
+unsigned player_gs_room(void){
+    uint32_t used = gsb_w - gsb_r;
+    return (used >= GSB_LEN-1u) ? 0u : (GSB_LEN-1u-used);
+}
+/* v0.15.299: сколько сэмплов ЛЕЖИТ в очереди - это запас прочности звука, и по нему насос решает,
+   можно ли вообще отвлекаться на протокол. Потребитель (прерывание раз в 1 мс) вычерпывает очередь
+   с постоянной скоростью, поэтому «сколько лежит» = «на сколько миллисекунд хватит». */
+unsigned player_gs_used(void){ return (unsigned)(gsb_w - gsb_r); }
+void player_gs_push(int16_t l, int16_t r){
+    if((gsb_w - gsb_r) >= GSB_LEN-1u) return;          /* полна: сэмпл выбрасываем, время не двигаем */
+    gsb_buf[gsb_w & GSB_MASK] = ((uint32_t)(uint16_t)r << 16) | (uint16_t)l;
+    gsb_w++;                                            /* индекс ПОСЛЕ данных (порядок SPSC) */
+}
+void player_gs_enable(int on){ if(!on) gsb_r = gsb_w; gsb_on = on ? 1 : 0; }
+int  player_gs_on(void){ return gsb_on; }
+/* v0.15.297: пустая очередь = карта НЕ УСПЕЛА посчитать. ЦАП получает тишину, а её
+   виртуальное время стоит - это и есть «музыка замирает» и «9 МГц вместо 12». Считаем
+   и сэмплы тишины, и сами эпизоды: по эпизодам видно период, по сэмплам - длительность. */
+volatile uint32_t g_gs_under = 0, g_gs_ungap = 0;
+static int g_gs_uwas = 0;
+static uint32_t gsb_pop(void){                          /* 0 = тишина (очередь пуста) */
+    if(gsb_w == gsb_r){ g_gs_under++; if(!g_gs_uwas){ g_gs_uwas = 1; g_gs_ungap++; } return 0u; }
+    g_gs_uwas = 0;
+    { uint32_t s = gsb_buf[gsb_r & GSB_MASK]; gsb_r++; return s; }
+}
+/* 🥇 v0.15.298 ЧАСЫ ДЛЯ КАРТЫ И ЕЁ ПРИБОРА - ЭТО ЦАП. Фабрика вычерпывает эту очередь ровно
+   47996 раз в секунду, причём в прерывании: ни длина прохода главного цикла, ни открытый диалог
+   на это не влияют. Поэтому «сколько времени прошло» считаем ВЫЧЕРПАННЫМИ СЛОТАМИ, а не таймером:
+   player_gs_done - сэмплы, которые карта успела отдать (их и слышно), player_gs_slots - все слоты,
+   включая закрытые тишиной. Их отношение и есть честная доля номинального темпа 12 МГц, а разница
+   - то время, которое карта задолжала реальному (его отрабатывает догон в gs_render). */
+unsigned player_gs_done(void){ return (unsigned)gsb_r; }
+unsigned player_gs_slots(void){ return (unsigned)(gsb_r + g_gs_under); }
+static int16_t gsb_sat16(int v){ return (v > 32767) ? (int16_t)32767 : (v < -32768) ? (int16_t)-32768 : (int16_t)v; }
+static uint32_t gsb_add(uint32_t a, uint32_t b){        /* сложение с насыщением, как у звука ленты */
+    int al = (int16_t)(a & 0xFFFFu), ar = (int16_t)(a >> 16);
+    int bl = (int16_t)(b & 0xFFFFu), br = (int16_t)(b >> 16);
+    return ((uint32_t)(uint16_t)gsb_sat16(ar+br) << 16) | (uint16_t)gsb_sat16(al+bl);
+}
+
 /* ---------------- consumer / transport state ---------------- */
 static volatile int  a_gain = 0, a_target = 0;   /* Q8 fade gain, ramps 1 step/sample (~5.3 ms full swing) */
 static volatile int  c_on = 0;                   /* consumer enabled (track active) */
@@ -94,9 +144,14 @@ void player_audio_irq(int ok){ audio_irq_on = ok; }
    not click; g_samples (the elapsed clock) counts only REAL emitted samples. Format-agnostic: PCM is PCM,
    so MP3/WAV/PSG and any future lossless codec all drain through this same path. */
 void player_isr_tick(void){
-    if(!c_on) return;
+    if(!c_on){
+        /* v265: General Sound без файлового плеера - ОБЫЧНЫЙ случай (карта играет в машине, а
+           оболочка ничего не проигрывает). Тогда ЦАП кормим прямо из его очереди. */
+        if(gsb_on){ for(int b=260; b>0 && !(AUDIO_STAT & 0x2u); b--) AUDIO_FIFO = gsb_pop(); }
+        return;
+    }
     if(pace_hold){                                           /* paused & fully faded: hold DAC at silence */
-        for(int b=260; b>0 && !(AUDIO_STAT & 0x2u); b--) AUDIO_FIFO = 0;
+        for(int b=260; b>0 && !(AUDIO_STAT & 0x2u); b--) AUDIO_FIFO = gsb_on ? gsb_pop() : 0;
         return;
     }
     { uint32_t c=rb_count(); if(c<g_rb_min) g_rb_min=c; }    /* telemetry: ring low-water mark */
@@ -117,7 +172,7 @@ void player_isr_tick(void){
             s = 0;
             if(g_samples && !prod_done) g_underruns++;                     /* ignore the pre-roll before the 1st real sample and EOF drain */
         }
-        AUDIO_FIFO = s;
+        AUDIO_FIFO = gsb_on ? gsb_add(s, gsb_pop()) : s;   /* v265: GS складывается с музыкой оболочки */
     }
     if(g_paused && a_gain==0) pace_hold = 1;                 /* fade-out finished -> freeze until resume */
 }
@@ -523,7 +578,10 @@ int player_suspended(void){ return g_suspended; }
 
 /* ---------------- PRODUCER: main-loop pump (decode into the ring; consumer feeds the fabric) ---------------- */
 void player_pump(void){
-    if (!audio_irq_on && (g_playing || g_idle_muxup)) player_isr_tick();          /* polled fallback: consume inline too */
+    /* v0.15.298: в опросном запасном пути карта General Sound тоже обязана вычерпываться. Условие
+       смотрело только на файловый плеер, а карта играет и БЕЗ него (обычный случай) - без прерывания
+       её очередь не двигалась бы вовсе, то есть время карты стояло бы намертво. */
+    if (!audio_irq_on && (g_playing || g_idle_muxup || gsb_on)) player_isr_tick();  /* polled fallback: consume inline too */
     if (g_idle_muxup){                             /* between tracks: mux up, feeding silence */
         XTime now; XTime_GetTime(&now);
         if ((uint64_t)(now - g_idle_t0) > (uint64_t)COUNTS_PER_SECOND/4u)  /* 250 ms grace = playlist end */

@@ -11,7 +11,9 @@
 module hybrid_zx_core
 (
     input  wire       model,
+    input  wire       snow_off,
     input  wire       pentagon,
+    input  wire       force_atlas,
     input  wire       ula_late,
     input  wire[31:0] ula_tune,
     input  wire       warp_nc,
@@ -83,7 +85,7 @@ module hybrid_zx_core
     output wire[2:0]   border_o
 );
 
-    wire use_mister = ~model & ~pentagon;
+    wire use_mister = ~model & ~pentagon & ~force_atlas;
 
     wire a_blank, a_hsync, a_vsync, a_r, a_g, a_b, a_i;
     wire [10:0] a_laudio, a_raudio;
@@ -122,7 +124,11 @@ module hybrid_zx_core
     wire [2:0] m_border;
 
     main atlas_i (
-        .model(model), .pentagon(pentagon), .ula_late(ula_late), .ula_tune(ula_tune),
+        .model(model), .snow_off(snow_off), .pentagon(pentagon), .ula_late(ula_late), .ula_tune(ula_tune),
+        .dos_svc_en(1'b0),   // B0146: у гибрида ROM_PAGES=2, слота 3 нет - тем же приёмом прибиваем
+                              //        вход в ноль, иначе он остался бы висящим и X пролез бы в номер страницы
+        .svc_nmi_en(1'b0),   // B0101: у гибрида магической кнопки нет - вход прибит в ноль,
+                              //        иначе он остался бы висящим и X пролез бы в защёлку страницы
         .warp_nc(warp_nc), .pent_int_v(pent_int_v), .pent_int_h(pent_int_h),
         .paper_h(paper_h), .paper_v(paper_v), .mapper(mapper),
         .reset(reset), .nmi(nmi),

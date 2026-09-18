@@ -47,7 +47,10 @@ module osd_ddr_rd #(
     input  wire        en,              // DDR-OSD enable (synced from OSD_CTRL bit1)
     output reg  [23:0] osd_rgb,         // pixel RGB (valid when osd_active)
     output reg  [7:0]  osd_a,           // pixel alpha 0..255
-    output reg         osd_active       // 1 = composite this pixel (in-window, line resident, alpha!=0)
+    output reg         osd_active,      // 1 = composite this pixel (in-window, line resident, alpha!=0)
+
+    input  wire        quiesce_i,       // v158 QUIESCE: stop starting NEW row fetches - safe PL reload
+    output wire        idle_o           // 1 = reader idle
 );
     localparam integer BEATS   = 16;               // 16-beat = 128B INCR bursts
     localparam integer FBURSTS = WPR/BEATS;        // bursts per row (CW=512 => 256/16 = 16)
@@ -72,8 +75,17 @@ module osd_ddr_rd #(
         nr_s1 <= need_row; nr_s2 <= nr_s1; nr_s3 <= nr_s2;
         if (nr_s2 == nr_s3) nr_stable <= nr_s2;
     end
-    wire [9:0] want0 = nr_stable;
-    wire [9:0] want1 = (nr_stable + 10'd1 < CH[9:0]) ? nr_stable + 10'd1 : nr_stable;
+    // 🥇 B0125 ЖЕЛАЕМЫЕ СТРОКИ - В РЕГИСТР. Инкремент с клэмпом стоял в начале критического конуса
+    // (два уровня LUT6), а дальше шли четыре сравнения тегов по 10 бит, свёртка и большое И условия
+    // пуска - всего девять уровней до разрешения записи ar_addr. Замер на этом конусе: 9.4 нс, из них
+    // ЛОГИКА 2.4 нс, а ТРАССИРОВКА 7.0 нс - три четверти. Поэтому директивами размещения и полировки
+    // он не лечится в принципе (проверено: четыре директивы phys_opt и переразводка не сдвинули
+    // -0.219 нс ни на пикосекунду). Лечится только сокращением ЧИСЛА УРОВНЕЙ.
+    // Задержка на такт безобидна: бюджет строки 22.2 мкс против 10 нс такта.
+    wire [9:0] want0_c = nr_stable;
+    wire [9:0] want1_c = (nr_stable + 10'd1 < CH[9:0]) ? nr_stable + 10'd1 : nr_stable;
+    reg  [9:0] want0 = 10'd0, want1 = 10'd0;
+    always @(posedge clk) begin want0 <= want0_c; want1 <= want1_c; end
 
     // base pinned once per frame (latched the cycle after frame_kick) + base_valid gate
     reg        fk_d, base_valid;
@@ -90,14 +102,24 @@ module osd_ddr_rd #(
     reg [9:0] buf_row [0:1];
     reg [1:0] buf_valid;
 
-    wire b0_is0 = buf_valid[0] && (buf_row[0]==want0);
-    wire b0_is1 = buf_valid[0] && (buf_row[0]==want1);
-    wire b1_is0 = buf_valid[1] && (buf_row[1]==want0);
-    wire b1_is1 = buf_valid[1] && (buf_row[1]==want1);
-    wire have0    = b0_is0 | b1_is0;
-    wire have1    = b0_is1 | b1_is1;
-    wire b0_spare = !(b0_is0 | b0_is1);
-    wire b1_spare = !(b1_is0 | b1_is1);
+    // B0125: биты попадания тега - в регистр. Четыре сравнения по 10 бит уходят из конуса пуска
+    // в собственный конус длиной один уровень.
+    reg m00 = 1'b0, m01 = 1'b0, m10 = 1'b0, m11 = 1'b0;
+    always @(posedge clk) begin
+        m00 <= buf_valid[0] && (buf_row[0]==want0);
+        m01 <= buf_valid[0] && (buf_row[0]==want1);
+        m10 <= buf_valid[1] && (buf_row[1]==want0);
+        m11 <= buf_valid[1] && (buf_row[1]==want1);
+    end
+    wire have0    = m00 | m10;
+    wire have1    = m01 | m11;
+    wire b0_spare = !(m00 | m01);
+    wire b1_spare = !(m10 | m11);
+    // 🥇 СЧЁТЧИК ПОКОЯ - обязателен вместе с регистровыми битами попадания. Они отстают на такт от
+    // обновления buf_valid/buf_row, поэтому сразу после дозаполнения строки автомат увидел бы ещё
+    // старое «буфер свободен» и затребовал ТУ ЖЕ строку повторно, обнулив только что заполненный
+    // буфер. Держим пуск два такта после возврата в RD_IDLE - за это время снимок догоняет.
+    reg [1:0] settle = 2'd0;
 
     localparam RD_IDLE=1'b0, RD_AR=1'b1;
     reg        rstate, tgt;
@@ -124,18 +146,19 @@ module osd_ddr_rd #(
     always @(posedge clk) begin
         if (!resetn) begin
             rstate<=RD_IDLE; ar_valid<=1'b0; ar_addr<=32'd0; ar_issued<=10'd0; words_rcvd<=10'd0;
-            outstanding<=3'd0; buf_valid<=2'b00; tgt<=1'b0;
+            outstanding<=3'd0; buf_valid<=2'b00; tgt<=1'b0; settle<=2'd0;
             buf_row[0]<=ROW_NONE; buf_row[1]<=ROW_NONE;
         end else begin
             case (rstate)
             RD_IDLE: begin
                 ar_valid<=1'b0; outstanding<=3'd0; ar_issued<=10'd0; words_rcvd<=10'd0;
-                if (base_valid && !have0 && (b0_spare || b1_spare) && (addr0_row_q == want0)) begin
+                if (settle != 2'd0) settle <= settle - 2'd1;
+                if (settle == 2'd0 && !quiesce_i && base_valid && !have0 && (b0_spare || b1_spare) && (addr0_row_q == want0)) begin
                     tgt <= b0_spare ? 1'b0 : 1'b1;  tgt_row <= want0;
                     if (b0_spare) begin buf_valid[0]<=1'b0; buf_row[0]<=ROW_NONE; end
                     else          begin buf_valid[1]<=1'b0; buf_row[1]<=ROW_NONE; end
                     ar_addr <= addr0_q; rstate <= RD_AR;
-                end else if (base_valid && !have1 && (b0_spare || b1_spare) && (addr1_row_q == want1)) begin
+                end else if (settle == 2'd0 && !quiesce_i && base_valid && !have1 && (b0_spare || b1_spare) && (addr1_row_q == want1)) begin
                     tgt <= b0_spare ? 1'b0 : 1'b1;  tgt_row <= want1;
                     if (b0_spare) begin buf_valid[0]<=1'b0; buf_row[0]<=ROW_NONE; end
                     else          begin buf_valid[1]<=1'b0; buf_row[1]<=ROW_NONE; end
@@ -154,6 +177,7 @@ module osd_ddr_rd #(
                 endcase
                 if (words_rcvd==LBW[9:0]-10'd1 && r_hs) begin
                     buf_row[tgt]<=tgt_row; buf_valid[tgt]<=1'b1; rstate<=RD_IDLE;
+                    settle <= 2'd2;      // B0125: дать регистровым битам попадания догнать buf_*
                 end
             end
             endcase
@@ -191,5 +215,6 @@ module osd_ddr_rd #(
         osd_a      <= a1;
         osd_rgb    <= rgb1;
     end
+    assign idle_o = (rstate==RD_IDLE);   // v158
 endmodule
 //-------------------------------------------------------------------------------------------------

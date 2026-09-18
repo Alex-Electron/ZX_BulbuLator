@@ -1,6 +1,19 @@
 # Шаг 15 — Пентагон (семейство машин) — точность и живой тюнинг
 
-Languages: [English](README.md) · **Русский**
+Языки: [English](README.md) · **Русский**
+
+## Текущее состояние
+
+Боевое ядро **B0195**, прошивка **v0.15.440**. Ниже в этом файле описан шаг 15 таким, каким он
+задумывался; полное описание того, что работает сейчас, вынесено в отдельные документы:
+
+- [Оболочка БульбаНавигатор](docs/NAVIGATOR.ru.md) — холст, каркас окон, браузер, кассетная
+  станция, проигрыватель, настройки, файловая служба для хоста.
+- [Машины и что в них исправлено](docs/MACHINES.ru.md) — геометрия кадра, тайминги, бордюр
+  Пентагона, загрузка ленты, ПЗУ, и что осталось открытым.
+- [Что умеет эмуляция](docs/EMULATION.ru.md) — память, накопители, звук, ввод, видео.
+- [Сверка трекера с кодом](docs/ISSUES_AUDIT.ru.md) — что уже сделано, что частично, что нет.
+
 
 ![ZX-BulboNavigator: файловый менеджер с полноцветным интерфейсом в стиле DOS Navigator, работающий на управляющей плоскости ARM поверх живого экрана Spectrum](images/navigator-step14.jpg)
 
@@ -152,15 +165,27 @@ Languages: [English](README.md) · **Русский**
 sources/osd_ddr_rd.v               DDR->HDMI true-colour OSD reader (AXI-HP1)
 sources/osd_compositor.v           per-pixel alpha compositor + independent banner (transparent PAUSE)
 sources/tape_player.v              machine-agnostic PULSE tape replay (T-state lock-step, FIFO drain-on-stop)
-sources/bulbulator_zx_ddr_top.v    top level: colour OSD + tape station wired in (VERSION 0xB01B0017)
-sources/axi_ctl.v                  control plane: DDR-OSD + tape registers
+sources/bulbulator_zx_ddr_top.v    top level: colour OSD + tape station wired in (VERSION 0xB01B0195)
+sources/axi_ctl.v                  control plane: DDR-OSD, tape, machine and video registers
 arm/loader_main.c                  the ZX-BulboNavigator (browser, dialogs, menus, tape station, options)
 arm/player.c                       universal music player (AY/PCM, mux, non-blocking ring)
 arm/mp3dec.c                       shared MP3 source (music + tape), with whole-file RAM preload
 arm/vga866.h                       CP866 VGA 8x16 font (ASCII + box-drawing + Cyrillic)
 arm/lscript.ld                     linker script: D-cache + non-cacheable DDR canvas window
-arm/loader.elf                     prebuilt ARM app (firmware tag v0.14.92)
-bulbulator_zx_loader.bit           prebuilt bitstream (0xB01B0017)
+arm/loader.elf                     prebuilt ARM app (firmware tag v0.15.440)
+bulbulator_zx_loader.bit           prebuilt bitstream (0xB01B0195)
+arm/tv_ui.c                        declarative Turbo Vision / DOS Navigator window framework
+arm/gs_arm.c                       General Sound: secondary Z80 card service
+arm/divmmc_card.c                  DivMMC / esxDOS card and folder mode
+arm/nes_rom.c                      NES cartridge parser
+arm/rom_ident.c                    ROM set identification by page content
+arm/net_kvm.c                      web remote panel (blocked on Ethernet pinout)
+sources/atlas_core/video.v         machine video: frame geometry, blanking, border latch, INT position
+sources/fb_line_disp.v             HDMI line reader with the frame tag (top-edge fix)
+docs/NAVIGATOR.ru.md               shell: full feature description
+docs/MACHINES.ru.md                machines: every fix with its evidence
+docs/EMULATION.ru.md               what the emulation can do today
+docs/ISSUES_AUDIT.ru.md            tracker vs. code
 flash/BOOT.BIN                     ready SD image (FSBL + bitstream + loader app)
 ```
 

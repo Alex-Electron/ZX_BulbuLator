@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""Multi-frame snow analyser (a request from the second agent 2026-07-24: "сравнивать несколько
+"""Multi-frame snow analyser (по запросу второго агента 2026-07-24: "сравнивать несколько
 последовательных frame captures, а не один screenshot").
 
 Takes N >= 2 screen-mirror .bin dumps of the SAME running program (captured a few

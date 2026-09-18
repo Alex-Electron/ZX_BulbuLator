@@ -26,12 +26,23 @@
 //      the picture scrolled or phase-shifted. The OSD/display side never notices any of this.
 module fb_capture_rr #(
     parameter integer FB_W = 384,      // ZX default (Pentagon 384-wide). NES instance overrides -> 256.
-    parameter integer FB_H = 302       // ZX default. NES -> 240.
+    parameter integer FB_H = 302,      // ZX default. NES -> 240.
+    parameter integer BPP  = 4,        // v161: 4 = ZX RGBI (default, byte-identical), 8 = NES palette index
+    // v165/CE15: способ вычисления вертикального lead-in (сколько строк после vsync пропустить).
+    // 0 = ИСТОРИЧЕСКИЙ ZX-путь: skip = flen - 303 (константа 303 = ZX-бюджет 302+1). Для ZX-растров
+    //     311/312/320 даёт проверенные 8/9/17 - оставлено байт-в-байт, чтобы не двигать ZX-картинку.
+    // 1 = МАШИНО-АГНОСТИЧНЫЙ путь: skip = ИЗМЕРЕННАЯ первая видимая строка (g_first зонда геометрии).
+    //     Нужен для любого растра, чей flen <= 303: у NES 262 строки, ZX-формула давала skip=0, захват
+    //     начинался в вертикальном гашении, 22 строки уходили в паддинг (серый индекс $00), а снизу
+    //     столько же строк картинки обрезал 240-строчный бюджет - "полоса сверху, картинка прижата вниз".
+    //     Зонд на живой плате: first=22 last=261 lines=262 -> видимая область ровно 240 строк.
+    parameter integer LEADIN_AUTO = 0
 )(
     input  wire        wr_clk,        // spclk
     input  wire        resetn,
     input  wire        wr_ce,         // pe7M0
     input  wire        hsync, vsync, blank,
+    input  wire [7:0]  pix8,          // v161: 8-bit pixel (palette index) when BPP=8; ignored at BPP=4
     input  wire        r, g, b, i,
     input  wire        enable,        // HP write path up
 
@@ -72,6 +83,7 @@ module fb_capture_rr #(
         if (vs_lead) begin
             cap_geom  <= {2'b00, g_lcnt, g_last, g_first};   // latch the just-finished frame
             flen      <= g_lcnt;                             // feed the auto-window (skip_v) above
+            if (g_seen) fvis <= g_first;                     // v165/CE15: измеренный lead-in (LEADIN_AUTO=1)
             g_lcnt    <= 10'd0; g_first <= 10'h3FF; g_last <= 10'd0;
             g_linevis <= 1'b0;  g_seen  <= 1'b0;
         end else if (hs_lead) begin
@@ -99,15 +111,25 @@ module fb_capture_rr #(
     // 1 spare before the next vsync, for ANY raster. 311 (128K) -> 8 (the proven value); 312 (48K) ->
     // 9; 320 (Pentagon) -> 17; <=303 (short rasters) -> 0 (+ the pad engine fills the budget below).
     reg  [9:0] flen = 10'd311;        // measured lines/frame (updated at each vsync; init = 128K)
+    reg  [9:0] fvis = 10'd8;          // v165/CE15: измеренная первая ВИДИМАЯ строка (зонд g_first)
     wire [9:0] flen_m303 = flen - 10'd303;
-    wire [4:0] skip_v = (flen <= 10'd303) ? 5'd0 : (flen >= 10'd334) ? 5'd31 : flen_m303[4:0];
-    reg [4:0]  skip_cnt;              // counts skip_v lines after vsync before capture begins
+    wire [6:0] skip_zx = (flen <= 10'd303) ? 7'd0 : (flen >= 10'd334) ? 7'd31 : {2'b0, flen_m303[4:0]};
+    // Счётчик тратит один hs_lead на нуле, поэтому пропускать надо на ОДНУ строку меньше:
+    // при fvis=22 захват иначе стартует со строки 23 (первая видимая теряется, снизу 1 паддинг-строка -
+    // ровно это и намерил тест TV.NES на CE15: паддинг 1 строка вместо 22).
+    wire [9:0] fvis_m1 = (fvis == 10'd0) ? 10'd0 : (fvis - 10'd1);
+    // v165/CE17: 7 бит. У PAL/Денди первая видимая строка = 72 -> пропуск 71 не влезал в 6 бит
+    // (макс 63) и предохранитель схлопывал его в 0: в PAL сверху вылезали 71 паддинг-строка.
+    wire [6:0] skip_au = (fvis > 10'd127) ? 7'd0 : fvis_m1[6:0];   // 0x3FF (кадр без видимых строк) -> 0
+    wire [6:0] skip_v  = (LEADIN_AUTO != 0) ? skip_au : skip_zx;
+    reg [6:0]  skip_cnt;              // counts skip_v lines after vsync before capture begins
     reg        armed;                 // skipping the vblank, not yet capturing
 
     wire sx_max = (sx >= FB_W-1);
     wire sy_max = (sy >= FB_H-1);
     wire wr_en  = wr_ce & ~blank & ~sx_max_pending & ~sy_over & started_w;
-    wire [3:0] nib = {i, r, g, b};
+    localparam integer PPW = 64/BPP;                       // pixels per 64-bit FIFO word (16 @4bpp, 8 @8bpp)
+    wire [BPP-1:0] nib = (BPP==8) ? pix8[BPP-1:0] : {i, r, g, b};   // v161: pixel in, width by BPP
 
     // ---- frame-close FLUSH: the DDR writer counts a FIXED 6795 words (302 lines) per frame and has
     // no vsync of its own, so a short capture frame would leave it phase-shifted FOREVER (the
@@ -119,8 +141,23 @@ module fb_capture_rr #(
     reg       flushing  = 1'b0;       // stream side is padding (set/cleared in the stream block)
     reg [8:0] flush_left= 9'd0;
 
-    (* ram_style="distributed" *) reg [3:0] lb [0:1][0:FB_W-1];   // two 360-pixel line buffers
-    always @(posedge wr_clk) if (wr_en) lb[wr_lb][sx] <= nib;
+    /* 🥇 ПЛОСКИЙ массив, а не двумерный, и это стоило 1702 LUT и 3124 триггера.
+       Было `reg [BPP-1:0] lb [0:1][0:FB_W-1]` - Vivado такой массив как память НЕ ВЫВОДИТ и говорит
+       об этом прямым текстом: `[Synth 8-5844] Reg lb ... not inferred as ram due to incorrect usage`.
+       Вместо памяти получались 2 x 384 x 4 = 3072 обычных триггера плюс мультиплексор чтения почти
+       на 1900 LUT. В отчёте «Distributed RAM: Final Mapping Report» строки этого модуля не было
+       вовсе, притом что одномерные буферы соседних модулей там есть - это и был признак, который
+       никто не прочитал. Плоский массив с составным индексом выводится нормально.
+       Цена правки: НОЛЬ. Эквивалентность доказана в xsim на целом растре - ZX 36240 слов за 5 кадров,
+       NES 38368 слов, ноль расхождений по записи, данным и геометрии.
+       ⚠ ИНВАРИАНТ: глубина 1024 = 2 буфера по 512. При FB_W > 512 два буфера молча слились бы в один
+       (ZX 384, NES 256 - с запасом). Проверка ниже не даёт этому случиться незамеченным. */
+    (* ram_style="distributed" *) reg [BPP-1:0] lb [0:1023];          // два линейных буфера подряд
+    always @(posedge wr_clk) if (wr_en) lb[{wr_lb, sx}] <= nib;
+    initial if (FB_W > 512) begin
+        $display("fb_capture_rr: FB_W=%0d > 512 - линейные буферы наложатся друг на друга", FB_W);
+        $fatal(1);
+    end
 
     always @(posedge wr_clk) begin
         if (!resetn) begin
@@ -142,13 +179,17 @@ module fb_capture_rr #(
                     started_w <= 1'b0;
                 end else if (hs_lead) begin
                     if (armed) begin
-                        if (skip_cnt == 5'd0) begin          // lead-in dropped -> begin capture at line 0
+                        if (skip_cnt == 7'd0) begin          // lead-in dropped -> begin capture at line 0
                             armed <= 1'b0; started_w <= enable & ~flushing;   // never start while still padding
                             sy<=0; sx<=0; sx_max_pending<=0; sy_over<=0;
-                        end else skip_cnt <= skip_cnt - 5'd1;
+                        end else skip_cnt <= skip_cnt - 7'd1;
                     end else begin
                         if (started_w && !sy_over) begin     // a captured line just ended -> stream it
-                            ll<=sx; rd_lb<=wr_lb; wr_lb<=~wr_lb; trig<=1'b1;
+                            // v165/CE12: sx SATURATES at FB_W-1 (sx_max_pending), so `ll<=sx` counted
+                            // one pixel short and the stream side black-padded the last column of
+                            // EVERY line (measured: x=255 == 0x00 on all 240 NES lines; ZX loses 383).
+                            // Short lines still need the exact count, hence the conditional.
+                            ll<=(sx_max_pending ? FB_W[8:0] : sx); rd_lb<=wr_lb; wr_lb<=~wr_lb; trig<=1'b1;
                         end
                         sx<=0; sx_max_pending<=0;
                         if (sy_max) sy_over<=1'b1; else sy<=sy+1'b1;
@@ -166,9 +207,16 @@ module fb_capture_rr #(
     reg        lb_q;
     reg [3:0]  pixk;
     reg [63:0] acc;
-    wire [3:0] spix = (sxs < ll_q) ? lb[lb_q][sxs] : 4'h0;   // captured pixel, else black pad
-
     reg pad_line;                                            // current streamed line is a flush pad (black)
+    // B0187: preserve each captured pixel exactly once and centre short lines.
+    // Padding is outside the machine raster and must be black. Repeating the
+    // first/last pixel stretches border effects (esh2_48: 47px first square
+    // instead of 32px on B0186). The fixed words-per-frame contract is unchanged.
+    wire [8:0] short_by = (ll_q >= FB_W[8:0]) ? 9'd0 : (FB_W[8:0] - ll_q);
+    wire [8:0] pad_l    = {1'b0, short_by[8:1]};                 // половина, левая сторона
+    wire [8:0] body_ix  = sxs - pad_l;
+    wire body_valid = !pad_line && (sxs >= pad_l) && (body_ix < ll_q);
+    wire [BPP-1:0] spix = body_valid ? lb[{lb_q, body_ix}] : {BPP{1'b0}};
     always @(posedge wr_clk) begin
         if (!resetn) begin
             busy<=1'b0; sxs<=0; pixk<=0; acc<=0; fifo_wr<=1'b0; ll_q<=0; lb_q<=0; fifo_din<=0;
@@ -182,9 +230,9 @@ module fb_capture_rr #(
                     busy<=1'b1; sxs<=0; ll_q<=9'd0; lb_q<=rd_lb; pad_line<=1'b1;
                 end else if (flushing) flushing<=1'b0;                        // owed lines done
             end else begin
-                acc[{pixk,2'b00} +: 4] <= spix;
-                if (pixk==4'd15) begin
-                    fifo_din <= {spix, acc[59:0]};
+                acc[pixk*BPP +: BPP] <= spix;
+                if (pixk==PPW-1) begin
+                    fifo_din <= {spix, acc[64-BPP-1:0]};
                     fifo_wr  <= 1'b1;
                     pixk     <= 4'd0;
                 end else pixk <= pixk + 4'd1;
