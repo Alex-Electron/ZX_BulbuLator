@@ -35,6 +35,12 @@ HDMI_SHA=fbade3d11a58b885a6084ec75eae25339623355d
 VLIB_URL=https://github.com/Alex-Electron/vivado-library.git
 VLIB_SHA=f4613fff005b098065fd5d619a2b88e55720a423
 VLIB_SUB=ip/rgb2dvi
+# Official MiSTer ZX Spectrum core. Step 15's optional native-48 backend uses
+# only rtl/ula.sv plus rtl/T80; the MiSTer framework/top is deliberately not
+# compiled. Keep the whole small repository pinned so the corresponding GPL
+# source and its notices are available beside every reproducible build.
+MISTER_ZX_URL=https://github.com/MiSTer-devel/ZX-Spectrum_MISTer.git
+MISTER_ZX_SHA=9388aac649c881140c061fab85d5cf37336cf802
 # -----------------------------------------------------------------------------
 
 # Clone-or-fetch a small repo and detach onto the pinned commit (fetches all
@@ -65,6 +71,7 @@ clone_sparse_pinned() {
 echo "Fetching cores into $CORES and deps into $DEPS ..."
 clone_pinned        "$ZX_URL"   zx             "$ZX_SHA"
 clone_pinned        "$HDMI_URL" hdmi           "$HDMI_SHA"
+clone_pinned        "$MISTER_ZX_URL" zx-mister "$MISTER_ZX_SHA"
 clone_sparse_pinned "$VLIB_URL" vivado-library "$VLIB_SHA" "$VLIB_SUB"
 
 echo "Done. A step can now be assembled and built:"

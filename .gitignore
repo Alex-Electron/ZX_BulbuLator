@@ -8,11 +8,15 @@
 /deps/
 build/
 
-# Fetched ROM (run a step's get_rom.sh). The Spectrum ROM is redistributable for
-# emulation but we still fetch it rather than ship it in the repo.
+# Fetched ROM (run a step's get_rom.sh) — build inputs, regenerated, never committed.
 rom128.hex
 combined128.rom
 *.rom
+
+# Шаг 15: наборы ПЗУ выложены НАМЕРЕННО, вместе с описанием происхождения
+# (research/15-pentagon/roms/PROVENANCE.md: кто автор, откуда взято, что мы меняли).
+!research/15-pentagon/roms/*.ROM
+!research/15-pentagon/roms/*.BIN
 
 # Build artifacts of the .z80 snapshot injector (zxinj): the embedded blob is
 # generated from your own snapshot, the ELF is compiled. Snapshots aren't shipped.
@@ -21,6 +25,8 @@ zxinj/snapshot.z80
 zxinj/zxinj.elf
 # Generated PCAP "armoured train" input (bootgen -process_bitstream bin from the .bit).
 *.bit.bin
+# Шаг 15: готовые ядра публикуются НАМЕРЕННО — это то, что кладётся на карту памяти.
+!research/15-pentagon/bitstreams/*.bit.bin
 
 # Vivado / Vitis build artifacts.
 # This repo commits only sources and prebuilt bitstreams; the full projects are

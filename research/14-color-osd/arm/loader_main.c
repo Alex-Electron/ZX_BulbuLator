@@ -63,6 +63,13 @@ unsigned player_progress(void);   /* 0..100 playback progress */
 #define KBD_DATA   (*(volatile uint32_t*)(GP0+0x54))  /* [9]=release_flag(1=break) [8]=empty [7:0]=code; read pops */
 #define KBD_STATUS (*(volatile uint32_t*)(GP0+0x58))  /* bit0 = FIFO empty */
 #define KBD_HB     (*(volatile uint32_t*)(GP0+0x5C))  /* any write = deadman heartbeat */
+#define KBD_TX     (*(volatile uint32_t*)(GP0+0xB0))  /* Step 15: W byte -> PS/2 host TX (LEDs/typematic/resend) */
+#define KBD_TXSTAT (*(volatile uint32_t*)(GP0+0xB4))  /* Step 15: R bit0=busy, bit1=last device-ACK */
+#define KBD_DIAG   (*(volatile uint32_t*)(GP0+0xB8))  /* Step 15: R {resend_cnt[31:16], parity_err_cnt[15:0]} */
+#define MACHINE_CFG (*(volatile uint32_t*)(GP0+0xBC))  /* Step 15: W bit0 = Pentagon timing (CDC'd to the core) */
+#define PENT_INT    (*(volatile uint32_t*)(GP0+0xC4))  /* Step 15: W {v[24:16], hc[8:0]} = Pentium INT position tuner */
+#define PAPER_H     (*(volatile uint32_t*)(GP0+0xC8))  /* live paper h start (left border) */
+#define PAPER_V     (*(volatile uint32_t*)(GP0+0xCC))  /* live paper v start (top border) */
 #define MACHINE_ID (*(volatile uint32_t*)(GP0+0x60))  /* loaded-core identity ([15:0]=code) */
 /* Step 14: DDR-backed TRUE-COLOUR OSD (ARGB8888 canvas read by osd_ddr_rd over HP1; OSD_CTRL bit1=EN) */
 #define OSD_DDR_BASE (*(volatile uint32_t*)(GP0+0x94))  /* DDR byte address of the ARGB canvas */
@@ -528,7 +535,7 @@ static void browser_status(const char* s){   /* transient feedback (MOUNT/READ/F
 /* Title screen (shown when the OSD opens with F12): just the name, centred, scale 2. */
 /* Firmware build tag shown on the F12 splash (bump per milestone). The PL core VERSION
    (0x4000_0000) is shown live too, so the splash states exactly which firmware + bitstream run. */
-#define BULB_FW "v0.14.92"
+#define BULB_FW "v0.15.116"
 static char hexnib(uint32_t v){ return (v<10) ? ('0'+v) : ('A'+v-10); }
 /* Single source of truth for the version line ("v0.13 core 0xB01B0013"): the ARM firmware tag
    BULB_FW + the live PL core VERSION read from register 0x00. Used by BOTH the F12 splash
@@ -615,6 +622,12 @@ static int   opt_foldermark = 0;        /* folder tag style: 0=[brackets] 1=icon
 static int   opt_scrdelay    = 1;        /* marquee START delay: 0=0ms 1=300ms 2=500ms 3=1000ms */
 static int   opt_dim         = 80;       /* OSD panel dimming/opacity %% (5%% steps) */
 static int   opt_vol         = 100;      /* HDMI output volume %% (5%% steps); 100 = unity */
+static int   g_mute          = 0;        /* KP* global mute: 1 = whole audio mix silenced (music + machine + tape); runtime-only, not saved */
+static int   opt_defmachine  = 0;        /* Step 15: default machine to boot (index into CH_MACHINE / MACHINE_TAG); boot + live switch wired when the proven Pentagon core is imported */
+static int   opt_pintv       = 239;      /* Step 15: Pentagon INT line (runtime tuner; reference default 239) */
+static int   opt_pinth       = 326;      /* Step 15: Pentagon INT start hc (runtime tuner; reference default 326) */
+static int   opt_paper_h     = 64;       /* live: h offset for paper start (left border width for wider Pentium look) */
+static int   opt_paper_v     = 24;       /* live: v offset for paper start (top border height for logo position) */
 static int   opt_x           = 320;      /* navigator (DN canvas) left X0 in 1280x720 (0..640, step 8) */
 static int   opt_y           = 160;      /* navigator top Y0 (0..320, step 8) */
 static int   opt_pl_x        = 504;      /* player window left X0 (0..1024, step 8); default centres the 275-wide window */
@@ -644,6 +657,12 @@ static void update_banner(void);     /* fwd */
 static void render_browser(void);    /* fwd */
 static const char* const CH_NOYES[] = {"NO","YES"};
 static const char* const CH_LAUNCH[]= {"MACHINE","MUSIC"};
+/* Step 15 scaffold: the machine list. ZX 128K runs today; the Pentagon rows are placeholders until the
+   proven Pentagon core is imported (then opt_defmachine drives the boot machine + a live switch). CH_MACHINE
+   = display labels; MACHINE_TAG = stable ini keys (index reordering must not break saved configs). */
+static const char* const CH_MACHINE[]  = {"ZX 128K", "PENTAGON 1024K"};
+static const char* const MACHINE_TAG[] = {"zx128",   "pent1024"};
+#define N_MACHINES 2
 static const char* const CH_012[] = {"0","1","2"};
 /* ---- pause/now-playing BANNER state (independent overlay) ---- */
 static char  g_app_path[180] = "";       /* full SD path of the last-loaded snapshot (game/demo) */
@@ -746,7 +765,9 @@ static void sd_scan(void){               /* mount once + read curpath into flist
         if(f_mount(&g_fs,"0:/",1)!=FR_OK){ sd_unmount(); return; }   sd_mounted=1;
         if(f_opendir(&dir, curpath) != FR_OK){ sd_unmount(); return; }   /* really gone -> NO CARD */
     }
+    int _kbscan=0;
     while(fcount < MAXFILES && (rr=f_readdir(&dir, &fno)) == FR_OK && fno.fname[0]){
+        if((_kbscan++ & 63)==0) KBD_HB=1;                     /* Step 15: pet the deadman during a big dir walk so the OSD key gate never drops mid-scan */
         if(!opt_showhidden){                                  /* hide hidden/system + dotfiles (macOS .DS_Store, ._x, .Trashes, .Spotlight junk) */
             if(fno.fattrib & (AM_HID|AM_SYS)) continue;
             if(fno.fname[0]=='.') continue;
@@ -1350,9 +1371,10 @@ static void tape_close_src(void){ if(g_wt_open){ f_close(&g_wtf); g_wt_open=0; }
    g_dbg[0]=ISR ticks (proves the 1ms timer fires)  [1]=ring STARVATIONS (FIFO had room but pulse
    ring was empty = underrun)  [2]=min pulse-ring free (0 => producer overran)  [3]=pulses produced
    [4]=pulses delivered to fabric  [5]=tape_on  [6]=tape_fmt  [7]=source EOF  [8]=played_T>>10
-   [9]=total_T>>10  [10]=decode/refill calls  [11]=guard-maxed passes.
+   [9]=total_T>>10  [10]=decode/refill calls  [11]=guard-maxed passes
+   [16]=FNV-1a hash of produced pulse words  [17]=FNV-1a hash of words written to the fabric.
    g_autotrig: poke non-zero via JTAG to auto-start the hard-coded test load (no keypress needed). */
-volatile uint32_t g_dbg[16] __attribute__((used)) = {0,0,0xFFFFFFFFu,0,0,0,0,0,0,0,0,0,0,0,0,0};
+volatile uint32_t g_dbg[18] __attribute__((used)) = {0,0,0xFFFFFFFFu,0,0,0,0,0,0,0,0,0,0,0,0,0,2166136261u,2166136261u};
 volatile int      g_autotrig __attribute__((used)) = 0;
 volatile char     g_autodir[96]  __attribute__((used)) = "0:/loadtest/TurboLoadmp3";  /* JTAG-pokeable self-test target dir */
 volatile char     g_autoname[64] __attribute__((used)) = "aliens.mp3";                /* ...and filename (any .wav/.mp3/.tap) */
@@ -1391,6 +1413,7 @@ void tape_isr_feed(void){                         /* called from the 1 ms timer 
     while((pr_w != pr_r) && !(TAPE_STATUS & 1u)){
         uint32_t e = pr_buf[pr_r & PR_MASK];
         TAPE_FIFO = e; pr_r++;
+        g_dbg[17] = (g_dbg[17] ^ e) * 16777619u;
         g_tape_played_T += (e & 0xFFFFFFu);
         g_dbg[4]++;                                /* pulses delivered to fabric */
     }
@@ -1401,7 +1424,9 @@ static void tape_stop(void){
     g_tape_on = 0; g_tape_drain = 0; g_phase = 0; TAPE_CTRL &= ~3u; AUDIO_CTRL = 0; tape_close_src(); }   /* hard stop (abort): release ear + machine audio back */
 static void tape_done(void){ g_phase = 0; g_tape_drain = 1; }   /* end of tape: stop producing; drain ring+FIFO then release */
 static void tape_push_pulse(uint32_t dur){
-    pr_buf[pr_w & PR_MASK] = ((uint32_t)g_ear_lvl<<31) | (dur & 0xFFFFFFu);
+    uint32_t e = ((uint32_t)g_ear_lvl<<31) | (dur & 0xFFFFFFu);
+    g_dbg[16] = (g_dbg[16] ^ e) * 16777619u;
+    pr_buf[pr_w & PR_MASK] = e;
     pr_w++;                                        /* index bump AFTER the data write (SPSC ordering) */
     g_ear_lvl ^= 1; g_tape_elapsed_T += dur;
     g_dbg[3]++;                                    /* pulses produced (min occupancy tracked in the ISR) */
@@ -1533,6 +1558,7 @@ static void tape_start(void){
     XTime_GetTime(&g_tape_t0);
     { int i=0; for(; flist[bcursor][i]&&i<NAMELEN; i++) g_tape_name[i]=flist[bcursor][i]; g_tape_name[i]=0; }
     g_app_path[0]=0; g_app_stopped=0;                 /* tape is shown in the upper "now playing" field -> clear the playlist app line */
+    g_dbg[16]=2166136261u; g_dbg[17]=2166136261u;       /* produced-vs-delivered pulse word fingerprints */
     pr_r = pr_w; g_tape_feed = 1; g_tape_primed = 0;                     /* fresh pulse ring + arm the ISR feeder */
     TAPE_CTRL = opt_tapesound ? 0x3u : 0x7u;          /* run + ear_mux (+ mute bit2 if TAPE SOUND = NO) */
     tape_load_seg();
@@ -1886,6 +1912,9 @@ static void cfg_set(const char* k, const char* v){
     else if(!cicmp(k,"pause_on_music")) opt_pausemusic = !cicmp(v,"yes")?1:0;
     else if(!cicmp(k,"launch_snd")) opt_launchsnd = !cicmp(v,"music")?1:0;
     else if(!cicmp(k,"boot_nav")) opt_bootnav = !cicmp(v,"no")?0:1;
+    else if(!cicmp(k,"defmachine")){ opt_defmachine=0; for(int i=0;i<N_MACHINES;i++) if(!cicmp(v,MACHINE_TAG[i])){ opt_defmachine=i; break; } }   /* Step 15: default boot machine (by tag) */
+    else if(!cicmp(k,"pint_v")){ int d=0; for(const char*p=v;*p>='0'&&*p<='9';p++) d=d*10+(*p-'0'); if(d<0)d=0; if(d>319)d=319; opt_pintv=d; }
+    else if(!cicmp(k,"pint_h")){ int d=0; for(const char*p=v;*p>='0'&&*p<='9';p++) d=d*10+(*p-'0'); if(d<0)d=0; if(d>446)d=446; opt_pinth=d; }
 }
 static void config_load(void){
     if(!sd_mounted){ if(f_mount(&g_fs,"0:/",1)!=FR_OK) return; sd_mounted=1; }
@@ -1934,6 +1963,9 @@ static int config_save(void){                  /* 1 = written OK, 0 = failed (ca
     p=appstr(o,p,"player_y=");     p=appstr(o,p,plyb); o[p++]='\r'; o[p++]='\n';
     p=appstr(o,p,"tape_snd=");     o[p++]=opt_tapesound?'1':'0'; o[p++]='\r'; o[p++]='\n';
     p=appstr(o,p,"tapemute=");     o[p++]=opt_tapemute?'1':'0'; o[p++]='\r'; o[p++]='\n';
+    { int m=(opt_defmachine>=0&&opt_defmachine<N_MACHINES)?opt_defmachine:0; p=appstr(o,p,"defmachine="); p=appstr(o,p,MACHINE_TAG[m]); o[p++]='\r'; o[p++]='\n'; }  /* Step 15: default boot machine */
+    { char b[8]; itoa_u(opt_pintv,b); p=appstr(o,p,"pint_v="); p=appstr(o,p,b); o[p++]='\r'; o[p++]='\n'; }
+    { char b[8]; itoa_u(opt_pinth,b); p=appstr(o,p,"pint_h="); p=appstr(o,p,b); o[p++]='\r'; o[p++]='\n'; }
     p=appstr(o,p,"timemode=");     o[p++]=opt_timemode?'1':'0'; o[p++]='\r'; o[p++]='\n';
     p=appstr(o,p,"showhidden=");   o[p++]=opt_showhidden?'1':'0'; o[p++]='\r'; o[p++]='\n';
     p=appstr(o,p,"mp3_tape=");     o[p++]=opt_mp3tape?'1':'0'; o[p++]='\r'; o[p++]='\n';
@@ -1992,9 +2024,26 @@ static void apply_dim(void){                             /* %% -> alpha 0..255, 
     if(browser_on && !g_menu_open) render_browser();     /* so a change needs a repaint to become visible */
     else if(osd_on) g_alpha_dirty = 1;                   /* under an open menu: menu_value_changed repaints live */
 }
-static void apply_vol(void){ VOL_REG = ((unsigned)opt_vol*255u)/100u;   /* %% -> gain 0..255, live */
-    if(browser_on && !g_menu_open) draw_topstatus(); }   /* live Vol:NN% in the top-right */
+static void apply_vol(void){ VOL_REG = g_mute ? 0u : ((unsigned)opt_vol*255u)/100u;   /* %% -> gain 0..255, live; mute kills the WHOLE mix (machine + player + tape share this final gain) */
+    if(browser_on && !g_menu_open) draw_topstatus(); }   /* live Vol:NN% / Vol:MUTE in the top-right */
 static void apply_pos(void){ DDR_OSD_POS = ((unsigned)opt_y<<16) | (unsigned)opt_x; }  /* Window X/Y -> navigator (DN canvas) position, live */
+/* Step 15: apply the selected machine model. Owner rule: a model change is NEVER live - it always
+   cold-reboots the machine (the F11 RESET+wipe path), like a real machine swap. At boot we only set
+   the register (the machine cold-starts anyway). index 1 = Pentagon 1024K -> Pentagon timing bit. */
+static void apply_pint(void){ PENT_INT = ((unsigned)opt_pintv<<16) | (unsigned)opt_pinth; }  /* Pentagon INT tuner: live (settle-latched in fabric) */
+static void apply_paper(void){ PAPER_H = (unsigned)opt_paper_h; PAPER_V = (unsigned)opt_paper_v; }  /* live paper offsets for border/logo tuning */
+static void apply_machine(void){
+    static int applied = -1;                       /* -1 = boot-time apply (no extra reset needed) */
+    MACHINE_CFG = (opt_defmachine==1) ? 1u : 0u;
+    if (g_menu_open) return;                       /* do not live-reset while user is tweaking in menu; prevents breaking current border/output */
+    if(applied >= 0 && applied != opt_defmachine){ /* changed from the menu -> F11-style cold reboot */
+        machine_reset();                           /* RESET+wipe (NOTE: ends HALTED - it is the snapshot-inject primitive) */
+        apply_halt();                              /* release per halt_src (normally 0) - without this the machine hangs black */
+        g_app_stopped = 0; g_app_path[0] = 0; update_banner();   /* old app is gone with the wipe */
+    }
+    applied = opt_defmachine;
+    if(browser_on && !g_menu_open) draw_topstatus();   /* live machine label in the top-right */
+}
 static void apply_tape_snd(void){ if(g_tape_on){ if(opt_tapesound) TAPE_CTRL &= ~4u; else TAPE_CTRL |= 4u; } }  /* live tape-sound mute */
 static void apply_tapemute(void){ if(g_tape_on) AUDIO_CTRL = opt_tapemute ? 1u : 0u; }  /* live: mute/unmute the machine beeper during a load */
 static void hidden_changed(void){    /* Show-hidden toggled: re-read the directory with the new filter */
@@ -2030,6 +2079,9 @@ static menu_item opt_items[] = {
     {"ON LAUNCH", ITEM_CHOICE, &opt_launchsnd, CH_LAUNCH, 2, 0},   /* [17] program launched while music plays: MACHINE=suspend music (machine sound) / MUSIC=keep music (machine muted) */
     {"BOOT NAV",  ITEM_CHOICE, &opt_bootnav,   CH_NOYES,  2, 0},   /* [18] show the navigator at boot (NO = boot to the machine, F12 opens it) */
     {"TAPE MUTE", ITEM_CHOICE, &opt_tapemute,  CH_NOYES,  2, 0, apply_tapemute},   /* [19] mute the machine beeper while a tape loads */
+    {"DEF MACHINE", ITEM_CHOICE, &opt_defmachine, CH_MACHINE, N_MACHINES, 0, apply_machine},   /* [20] Step 15: default machine; onchange drives MACHINE_CFG (Pentagon timing) live */
+    {"PENT INT V", ITEM_RANGE, &opt_pintv, 0, 1, 0, apply_pint, 319, ""},   /* [21] Step 15: Pentagon INT line tuner (live; tune against a reference border test) */
+    {"PENT INT H", ITEM_RANGE, &opt_pinth, 0, 2, 0, apply_pint, 446, ""},   /* [22] Step 15: Pentagon INT hc tuner (2 clk = 1 T-state per step) */
 };
 /* (no opt_menu instance any more: opt_items[] feed the Options > Settings nested dropdown directly) */
 
@@ -2100,6 +2152,9 @@ static Menu m_tape = { mi_tape, 7, 0 };
 static const MenuItem mi_settings[] = {
   /* (no "Sort" here: sorting lives in the Files menu - Sort mode + Reverse) */
   /* (Play mode lives in the Play menu; ALL tape/MP3 params live in the Tape menu - no duplication here) */
+  {"Default machine",0,0,NULL, NULL, &opt_items[20]},   /* Step 15: which machine boots by default (scaffold) */
+  {"Pentagon INT V", 0,0,NULL, NULL, &opt_items[21]},   /* Step 15: INT-position tuner (arrows nudge live) */
+  {"Pentagon INT H", 0,0,NULL, NULL, &opt_items[22]},
   {"Show hidden",    0,0,NULL, NULL, &opt_items[16]},   /* macOS .DS_Store/._* junk toggle */
   {"Scroll speed",   0,0,NULL, NULL, &opt_items[1]},
   {"Scroll delay",   0,0,NULL, NULL, &opt_items[2]},
@@ -2111,7 +2166,7 @@ static const MenuItem mi_settings[] = {
   {"Window X",       0,0,NULL, NULL, &opt_items[8]},    /* navigator (DN canvas) position */
   {"Window Y",       0,0,NULL, NULL, &opt_items[9]},
 };
-static Menu m_settings = { mi_settings, 10, 0 };
+static Menu m_settings = { mi_settings, 13, 0 };
 
 static const MenuItem mi_opts[] = {
   {"~S~ettings",     0,           0, NULL, &m_settings},    /* nested dropdown (DN-style, no buttons) */
@@ -2167,6 +2222,7 @@ static void bg_pump(void) {
    a >1.5 s silence auto-releases a key (self-heals a genuinely lost break). Machine-agnostic ARM layer. */
 static uint8_t g_kd[256];
 static XTime   g_kd_t[256];
+static volatile uint32_t g_kbd_diag __attribute__((used)) = 0;   /* Step 15: PS/2 {resend<<16 | parity_err} mirror (JTAG) */
 #define KD_STALE (COUNTS_PER_SECOND*3u/2u)     /* 1.5 s: longer than any typematic gap, so only a real
                                                   re-press (or a lost break) re-arms a held key */
 static int kbd_note(uint32_t code, int release){
@@ -2176,6 +2232,54 @@ static int kbd_note(uint32_t code, int release){
     int was = g_kd[code] && ((uint64_t)(now - g_kd_t[code]) < (uint64_t)KD_STALE);
     g_kd[code]=1; g_kd_t[code]=now;
     return !was;                               /* 1 = rising edge (fresh press, not typematic repeat) */
+}
+/* ---- Step 15: PS/2 HOST TX (LEDs / typematic / resend). The fabric ps2_tx does the hardware-timed
+   handshake; we just write the byte and wait for busy to drop. Audio is pumped throughout so a
+   periodic LED update never starves the sound ring, and the deadman is kicked so the key gate holds. */
+static void kbd_tx_byte(uint32_t b){
+    uint32_t g=0; while((KBD_TXSTAT & 1u) && g++<2000000u){ player_pump(); }     /* wait until the TX is idle */
+    KBD_TX = b;
+    g=0; while(!(KBD_TXSTAT & 1u) && g++<200000u){ }                              /* wait for it to start */
+    g=0; while((KBD_TXSTAT & 1u) && g++<2000000u){ player_pump(); KBD_HB=1u; }    /* wait for it to finish */
+}
+/* Step 15: pull ONE specific device response byte out of the RX FIFO, discarding anything else, with a
+   bounded spin timeout. Audio is pumped and the deadman kicked while we wait. 1 = seen, 0 = timed out. */
+static int kbd_wait_byte(uint32_t want, uint32_t spins){
+    uint32_t g=0;
+    while(g++ < spins){
+        uint32_t d = KBD_DATA;                       /* atomic pop+read; bit8 = empty */
+        if(!(d & 0x100u)){                           /* a byte is present */
+            if((d & 0xFFu) == want) return 1;        /* the one we wanted */
+            /* else: some other byte (echo/noise/ACK) - drop it and keep looking */
+        }
+        player_pump(); KBD_HB = 1u;
+    }
+    return 0;
+}
+/* Step 15: set the keyboard LEDs, WAITING for the device ACK (0xFA) after each byte. That ACK-wait is
+   what keeps the device's command FSM in sync: 0xED (LED cmd) -> 0xFA -> bitmap -> 0xFA. Without it a
+   single lost bitmap byte leaves the keyboard waiting forever for its argument (the old pause desync).
+   Short timeouts so a mute device never blocks. bit0 Scroll, bit1 Num, bit2 Caps. */
+static void kbd_set_leds(uint32_t mask){
+    kbd_tx_byte(0xEDu);                                                           /* "set LEDs" command */
+    kbd_wait_byte(0xFAu, 12000u);                                                 /* wait for the 0xED ACK (usually ~1ms) so the device is ready for the argument; capped TIGHT so a rare slow ACK is an imperceptible blip, not a visible ~0.3s stall */
+    kbd_tx_byte(mask & 0x07u);                                                    /* the LED bitmap (no second ACK-wait: the device is never left waiting after it, so no desync risk) */
+}
+/* Step 15: keyboard bring-up, the way a PC does it at boot. Our 4k7 pull-ups and the keyboard's +5V
+   are permanently powered, independent of the FPGA - so a JTAG/PCAP reconfig restarts the fabric but
+   NOT the keyboard, which can be left in any state (mid-command especially, after a bad bitstream).
+   We reset it: 0xFF -> ACK 0xFA -> BAT 0xAA (the device flashes its own LEDs here) -> a short blink of
+   our own = "keyboard ready" -> 0xF4 (enable scanning). Every wait is bounded, so a missing or mute
+   keyboard just falls through to plain RX and nothing blocks. */
+static void kbd_init(void){
+    kbd_tx_byte(0xFFu);                  /* 0xFF = reset */
+    kbd_wait_byte(0xFAu,  400000u);      /* command ACK */
+    kbd_wait_byte(0xAAu, 6000000u);      /* self-test passed (BAT ~500 ms; generous timeout, exits early on 0xAA) */
+    kbd_set_leds(0x07u);                 /* our confirmation: all three LEDs on briefly... */
+    { uint32_t d=0; while(d++<4000000u){ player_pump(); KBD_HB=1u; } }
+    kbd_set_leds(0x00u);                 /* ...then off */
+    kbd_tx_byte(0xF4u);                  /* 0xF4 = enable scanning (default, but be explicit) */
+    kbd_wait_byte(0xFAu,  400000u);      /* ACK */
 }
 /* PS/2 set-2 scancode -> printable ASCII (US layout) for dialog text entry. 0 = not a text key.
    Machine-agnostic: this is the ARM keyboard layer, no core knows about it. */
@@ -2287,8 +2391,8 @@ static void draw_topstatus(void){
     char v[40]; version_str(v); int vl=slen(v); x -= vl;
     dn_puts(x,0,v,DNK_MENU_FG,DNK_MENU_BG); x -= 2;
     char vb[16]; int p=0; const char* vp="Vol:"; for(int i=0;vp[i];i++) vb[p++]=vp[i];
-    char nb[8]; itoa_u(opt_vol,nb); for(int i=0;nb[i];i++) vb[p++]=nb[i]; vb[p++]='%'; vb[p]=0;
-    int bl=slen(vb); x -= bl; dn_puts(x,0,vb,DNK_MENU_FG,DNK_MENU_BG); x -= 2;
+    char nb[8]; itoa_u(g_mute?0:opt_vol,nb); for(int i=0;nb[i];i++) vb[p++]=nb[i]; vb[p++]='%'; vb[p]=0;  /* muted -> Vol:0% */
+    int bl=slen(vb); x -= bl; dn_puts(x,0,vb, g_mute?FG(4):DNK_MENU_FG, DNK_MENU_BG); x -= 2;             /* red when muted, no glyph (the speaker lives on the on-screen banner) */
     const char* mt=machine_type(); int ml=slen(mt); x -= ml;
     dn_puts(x,0,mt,DNK_MENU_FG,DNK_MENU_BG); x -= 2;
     int halted = (IJ_STAT & 1u);   /* HALT_ACK: machine frozen (manual pause / pause-on-music / SD freeze) */
@@ -3826,27 +3930,47 @@ static void render_banner(void){         /* shown when (music playing) OR (pause
 /* Compact PAUSE sign on the independent banner plane - shown whenever the machine is user-visibly
    paused: manual Pause (halt_src bit0) OR the PAUSE-MUS auto-halt when a track starts (bit1). NOT the
    transient SD-op tape freeze (bit2). (v0.14.15: bit1 added - music-pause now raises the plashka.) */
+/* Crossed-out speaker for the banner plane (setpix into the selected buffer), sized to match the PAUSE
+   sign. rx = right edge, by = top, H = height: a right-flaring cone + a 2px diagonal slash that
+   overhangs both ends so it reads as "muted". */
+static void draw_mute_icon(int rx,int by,int H){
+    int cy=by+H/2, x0=rx-16;
+    for(int y=cy-4;y<=cy+4;y++) for(int x=x0;x<=x0+5;x++) setpix(x,y);            /* magnet box */
+    for(int c=0;c<=10;c++){ int hh=4+(c*(H/2-4))/10; int x=x0+6+c;                /* cone flaring right */
+        for(int y=cy-hh;y<=cy+hh;y++) setpix(x,y); }
+    for(int y=by-4;y<=by+H+4;y++){ int x=(x0-4)+(y-(by-4)); setpix(x,y); setpix(x+1,y); }  /* 2px diagonal slash */
+}
+/* On-screen banner plane, shown over the running machine even when the navigator window is closed
+   (independent plane, top-right corner). Raised whenever the machine is user-visibly paused (halt_src
+   bit0 manual Pause / bit1 PAUSE-MUS auto-halt; NOT the transient SD freeze bit2) AND/OR the audio is
+   globally muted (KP*). PAUSE = two bars + "PAUSE"; mute = a crossed-out speaker left of it (or at the
+   right if only muted). */
 static void render_pause_sign(void){
-    if(halt_src & 3u){
-        ban_select(); ban_clear();
-        /* Big PAUSE indicator on the transparent banner plane, at the screen's top-right (over the game too,
-           since the banner is an independent plane): two bars + "PAUSE", BOTH the same height (24 px). */
-        int sc=3, H=8*sc, bw=8, gap=8;
-        int barsW=2*bw+gap, txtW=5*8*sc, grp=barsW+12+txtW;
-        int gx=BAN_W-grp-8, by=(BAN_H-H)/2;
+    int paused = (halt_src & 3u) ? 1 : 0;
+    if(!paused && !g_mute){ BAN_CTRL = 0; return; }          /* neither -> hide the plane */
+    ban_select(); ban_clear();
+    int sc=3, H=8*sc, by=(BAN_H-H)/2;
+    int muterx = BAN_W-16;                                   /* default: mute icon at the right */
+    if(paused){
+        int bw=8, gap=8, barsW=2*bw+gap, txtW=5*8*sc, grp=barsW+12+txtW;
+        int gx=BAN_W-grp-8;
         for(int y=by;y<by+H;y++){
             for(int x=gx;x<gx+bw;x++) setpix(x,y);
             for(int x=gx+bw+gap;x<gx+2*bw+gap;x++) setpix(x,y);
         }
         draw_text(gx+barsW+12, by, sc, "PAUSE");             /* same 24 px height as the bars */
-        osd_select();
-        ban_blit();
-        BAN_POS = (16u<<16) | 1008u;                         /* top-right corner (Y0=16; plane right edge ~ screen x 1264) */
-        BAN_CTRL = 1;
-    } else BAN_CTRL = 0;
+        muterx = gx - 10;                                    /* mute icon sits to the left of the PAUSE sign */
+    }
+    if(g_mute) draw_mute_icon(muterx, by, H);
+    osd_select();
+    ban_blit();
+    BAN_POS = (16u<<16) | 1008u;                             /* top-right corner (Y0=16; plane right edge ~ screen x 1264) */
+    BAN_CTRL = 1;
 }
-static const char* machine_name(void){ switch(MACHINE_ID & 0xFFFFu){ default: return "ZX SPECTRUM 128K"; } }
-static const char* machine_type(void){ switch(MACHINE_ID & 0xFFFFu){ default: return "ZX 128K"; } }
+/* Step 15: within the ZX family (MACHINE_ID stays 0x...5A58) the MODEL is the ARM-selected machine
+   (opt_defmachine drives MACHINE_CFG); label accordingly. Cross-family cores will key off MACHINE_ID. */
+static const char* machine_name(void){ return (opt_defmachine==1) ? "PENTAGON 1024K" : "ZX SPECTRUM 128K"; }
+static const char* machine_type(void){ return (opt_defmachine==1) ? "PENT 1024" : "ZX 128K"; }
 static void update_banner(void){         /* on state change: refresh ALL dynamic player-window regions */
     ban_scroll = 0; ban_last_scroll = 0; ban_scroll_started = 0;
     render_pause_sign();                   /* banner plane = machine-pause sign only (track/app info live in the DDR windows) */
@@ -3963,6 +4087,8 @@ void main(void){
     osd_clear(); osd_blit();          /* clean buffer, overlay starts off */
     close_osd();                      /* F12 opens it */
     config_load();                    /* mount SD + read 0:/bulbulator.ini (defaults if absent) */
+    apply_pint();                     /* Step 15: Pentagon INT position (tuned value from ini, or 239/326) */
+    apply_machine();                  /* Step 15: apply the saved default machine (Pentagon timing bit) at boot */
     apply_dim();                      /* push the loaded dimming level to OSD_OP */
     apply_vol();                      /* push the loaded volume level to VOL_REG */
     /* Step 14 DDR true-colour OSD bring-up: draw the Winamp-classic canvas + enable the layer. */
@@ -3974,8 +4100,13 @@ void main(void){
     player_audio_irq(audio_irq_init());   /* Step 14.3b: 1 ms audio-consumer ISR (0 = polled fallback) */
     cache_selftest();                 /* opt-in (0:/CACHETEST.BIN): verify D-cache+SD reads are clean */
 
+    /* Step 15: bring the keyboard up to a known state (reset -> BAT -> enable). Fixes the "dead after
+       flash until I power-cycle the keyboard" case: the device keeps running across an FPGA reconfig
+       (its power is separate), so we reset it ourselves. The LED blink here doubles as "ready". */
+    kbd_init();
+
     /* Flush scancodes buffered before this controller came up (keys pressed during PL config /
-       ARM reload), so the OSD always starts closed regardless of pre-boot key activity. */
+       ARM reload) plus the init's own ACK/BAT bytes, so the OSD always starts closed. */
     while(!(KBD_DATA & 0x100u)) { /* pop+discard until empty */ }
 
     /* Force clean state for tuner and player after reflash (prevents stuck tuner or auto-play) */
@@ -4002,6 +4133,17 @@ void main(void){
        rising edge, nav keys repeat on every make; the same table backs the modal get_keysym_blocking. */
     for(;;){
         KBD_HB = 1;                   /* pet the deadman every iteration (single write per pass) */
+        g_kbd_diag = KBD_DIAG;        /* Step 15: mirror PS/2 parity-error + auto-resend counters (JTAG-readable) */
+        /* Step 15: while the machine is PAUSED, statically light ONLY the right (Scroll) LED - a single
+           command on entering pause, off on leaving. NO chase/blink: repeated LED commands loaded the
+           PS/2 line (RX is gated during each host TX) and cost ~20% of keypresses during pause. One
+           command per state change keeps the line free, so keys stay crisp and resume is reliable. */
+        { static int g_led_paused=-1;
+          int _paused = (halt_src & 3u) ? 1 : 0;
+          if(_paused != g_led_paused){                       /* pause state changed -> one LED command, once */
+              g_led_paused = _paused;
+              kbd_set_leds(_paused ? 0x01u : 0x00u);         /* 0x01 = Scroll = right LED on when paused; all off when running */
+          } }
         if(g_autotrig){ g_autotrig=0; autoload_tape((const char*)g_autodir, (const char*)g_autoname); }  /* JTAG self-test (pokeable path) */
         player_pump();                /* feed the audio FIFO when a music file is playing (no-op otherwise) */
         if(player_active() && !g_tape_on && browser_on){    /* music: DN status line (name / M:SS/M:SS / progress bar), updated on change */
@@ -4069,10 +4211,11 @@ void main(void){
         if(code==SC_F7){ if(rising && browser_on) mkdir_selected(); continue; }         /* F7: make directory */
         if(code==SC_F11){ if(rising){ g_app_stopped=1; update_banner(); } continue; }  /* hard reset marker */
         if(code==SC_KPPLUS ){ if(g_kd[0x12]||g_kd[0x59]){ if(rising && browser_on) select_by_mask(1); }         /* Shift+KP+ : select by mask */
-                              else if(!release){ opt_vol+=5; if(opt_vol>100)opt_vol=100; apply_vol(); } continue; }  /* KP+ : volume up (hold ramps) */
+                              else if(!release){ opt_vol+=5; if(opt_vol>100)opt_vol=100; if(g_mute){g_mute=0; update_banner();} apply_vol(); } continue; }  /* KP+ : volume up (unmutes) */
         if(code==SC_KPMINUS){ if(g_kd[0x12]||g_kd[0x59]){ if(rising && browser_on) select_by_mask(0); }         /* Shift+KP- : unselect by mask */
-                              else if(!release){ opt_vol-=5; if(opt_vol<0)  opt_vol=0;   apply_vol(); } continue; }  /* KP- : volume down */
-        if(code==SC_KPMUL  ){ if((g_kd[0x12]||g_kd[0x59]) && rising && browser_on) invert_selection(); continue; } /* Shift+KP* : invert selection */
+                              else if(!release){ opt_vol-=5; if(opt_vol<0)  opt_vol=0;   if(g_mute){g_mute=0; update_banner();} apply_vol(); } continue; }  /* KP- : volume down (unmutes) */
+        if(code==SC_KPMUL  ){ if(g_kd[0x12]||g_kd[0x59]){ if(rising && browser_on) invert_selection(); }        /* Shift+KP* : invert selection */
+                              else if(rising){ g_mute^=1; apply_vol(); update_banner(); } continue; }           /* KP* : global mute toggle (machine + player + tape) + on-screen speaker */
 
         if(release) continue;                       /* below: makes only */
         switch(code){

@@ -30,8 +30,8 @@ module bulbulator_zx_ddr_top
 
     input  wire [3:0] btn,            // P19 / T19 / U20 / U19, active-low
     input  wire       ear_in,         // J19, tape audio in (LVCMOS33, PULLDOWN)
-    input  wire       ps2_clk,        // G19 (DATA2-07), PS/2 keyboard clock
-    input  wire       ps2_data,       // H20 (DATA2-08), PS/2 keyboard data
+    inout  wire       ps2_clk,        // G19 (DATA2-07), PS/2 keyboard clock  (Step 15: now bidirectional / open-drain for host TX)
+    inout  wire       ps2_data,       // H20 (DATA2-08), PS/2 keyboard data   (Step 15: bidirectional; RX unchanged, TX drives low)
 
     output wire       led_lock,       // D18: Spectrum MMCM locked
     output wire       led_heart       // H18: heartbeat (alive indicator)
@@ -169,20 +169,77 @@ module bulbulator_zx_ddr_top
     reg [1:0] ps2c_s = 2'b11, ps2d_s = 2'b11;        // 2-FF sync of the async pins
     always @(posedge spclk) begin ps2c_s <= {ps2c_s[0], ps2_clk}; ps2d_s <= {ps2d_s[0], ps2_data}; end
 
-    wire       ps2_strb, ps2_make;
+    wire       ps2_strb, ps2_make, ps2_perr;
     wire [7:0] ps2_code;
     ps2 ps2_i (
         .clock(spclk), .ce(pe3M5),
         .ps2Ck(ps2c_s[1]), .ps2D(ps2d_s[1]),
-        .strb(ps2_strb), .make(ps2_make), .code(ps2_code)
+        .strb(ps2_strb), .make(ps2_make), .code(ps2_code), .perr(ps2_perr)
     );
+
+    //---- Step 15: PS/2 HOST TX (LEDs / typematic / resend). ARM writes KBD_TX (0xB0). The write strobe
+    //     is CDC'd fclk100->spclk (toggle + 3-FF + edge; the KBD_INJECT idiom) and ps2_tx runs the whole
+    //     host->device handshake hardware-timed. CLK/DATA are now inout open-drain: drive low or release
+    //     to Hi-Z (the board's 4k7 pull-up returns them high). RX is paused while ps2tx_busy so the bits
+    //     WE drive are not mis-decoded as incoming frames. ----
+    wire [7:0] ctl_kbd_tx_data;   wire ctl_kbd_tx_we;
+    reg  ktx_tog_a = 1'b0;
+    always @(posedge fclk100) if (ctl_kbd_tx_we) ktx_tog_a <= ~ktx_tog_a;
+    (* ASYNC_REG="TRUE" *) reg [2:0] ktx_sync = 3'd0;
+    always @(posedge spclk) ktx_sync <= {ktx_sync[1:0], ktx_tog_a};
+    wire ktx_pulse = ktx_sync[2] ^ ktx_sync[1];
+    (* ASYNC_REG="TRUE" *) reg [7:0] ktx_d0 = 8'd0, ktx_d1 = 8'd0;
+    always @(posedge spclk) begin ktx_d0 <= ctl_kbd_tx_data; ktx_d1 <= ktx_d0; end
+
+    wire ps2c_low, ps2d_low, ps2tx_busy, ps2tx_done, ps2tx_ack;
+    // AUTO-RESEND: a parity/framing error (ps2_perr) asks the keyboard to resend the last byte (0xFE)
+    // as soon as the TX is free -> the lost make/break is recovered (fixes the occasional dropped key).
+    // An ARM send (ktx_pulse: LEDs) wins a tie; the resend then fires on the next free cycle.
+    reg  resend_req = 1'b0;
+    // AUTO-RESEND DISABLED (stability): it fired on the keyboard's power-up/BAT frames right after a
+    // reconfig and disrupted the device (dead-until-power-cycle). parity errors are still COUNTED
+    // (KBD_DIAG) so we can measure them. To be re-enabled behind a post-reset startup grace + a robust
+    // guard so it never touches the device before it is up.
+    wire resend_launch = 1'b0;
+    always @(posedge spclk or negedge aresetn) begin
+        if (!aresetn)                            resend_req <= 1'b0;
+        else if (pe3M5 && ps2_perr && ~ps2tx_busy) resend_req <= 1'b1;   // ONLY a real keyboard frame - never our own TX bits (else self-resend loop)
+        else if (resend_launch)                  resend_req <= 1'b0;
+    end
+    wire       tx_start = ktx_pulse | resend_launch;
+    wire [7:0] tx_byte  = ktx_pulse ? ktx_d1 : 8'hFE;
+    ps2_tx ps2tx_i (
+        .clk(spclk), .rst_n(aresetn),
+        .start(tx_start), .tx_data(tx_byte),
+        .ps2c_in(ps2c_s[1]), .ps2d_in(ps2d_s[1]),
+        .clk_low(ps2c_low), .data_low(ps2d_low),
+        .busy(ps2tx_busy), .done(ps2tx_done), .ackok(ps2tx_ack)
+    );
+    // Diagnostic counters (KBD_DIAG 0xB8): how often frames drop, and how often we recover them.
+    reg [15:0] perr_cnt = 16'd0, resend_cnt = 16'd0;
+    always @(posedge spclk or negedge aresetn) begin
+        if (!aresetn) begin perr_cnt <= 16'd0; resend_cnt <= 16'd0; end
+        else begin
+            if (pe3M5 && ps2_perr && ~ps2tx_busy && perr_cnt != 16'hFFFF) perr_cnt   <= perr_cnt   + 16'd1;
+            if (resend_launch                     && resend_cnt != 16'hFFFF) resend_cnt <= resend_cnt + 16'd1;
+        end
+    end
+    (* ASYNC_REG="TRUE" *) reg [31:0] diag_s0 = 32'd0, diag_s1 = 32'd0;
+    always @(posedge fclk100) begin diag_s0 <= {resend_cnt, perr_cnt}; diag_s1 <= diag_s0; end
+    wire [31:0] kbd_diag_aclk = diag_s1;
+    assign ps2_clk  = ps2c_low ? 1'b0 : 1'bz;   // open-drain: pull low or release (Hi-Z)
+    assign ps2_data = ps2d_low ? 1'b0 : 1'bz;
+    (* ASYNC_REG="TRUE" *) reg [1:0] txbusy_s = 2'd0, txack_s = 2'd0;   // TX status -> aclk for KBD_TXSTAT (0xB4)
+    always @(posedge fclk100) begin txbusy_s <= {txbusy_s[0], ps2tx_busy}; txack_s <= {txack_s[0], ps2tx_ack}; end
+    wire kbd_tx_busy_aclk = txbusy_s[1];
+    wire kbd_tx_ack_aclk  = txack_s[1];
 
     // Pause key = E1 14 77 (make) / E1 F0 14 F0 77 (break) is ARM-owned (intercepted from the always-
     // tap FIFO). Suppress its whole byte run from the Z80 matrix AND the hotkey latches, so a resume
     // can never leak Symbol-Shift (0x14) into the core or stick a reset-combo flag. Anchor on 0xE1
     // (no other set-2 key emits it); eat up to 4 following bytes (covers make 14 77 + break F0 14 F0 77).
     reg [2:0] pse = 3'd0;
-    always @(posedge spclk) if (pe3M5 && ps2_strb) begin
+    always @(posedge spclk) if (pe3M5 && ps2_strb && ~ps2tx_busy) begin
         if (ps2_code == 8'hE1) pse <= 3'd4;
         else if (pse != 3'd0)  pse <= pse - 3'd1;
     end
@@ -193,7 +250,7 @@ module bulbulator_zx_ddr_top
     // ctrl_h/alt_h/del_h permanently stuck and silently arm Ctrl+Alt+Del. Normal press/release still
     // works: a held key sets its latch on make; F0+code clears it (and the per-key make=1 agrees).
     reg ctrl_h = 1'b0, alt_h = 1'b0, del_h = 1'b0, ins_h = 1'b0, f11_h = 1'b0;
-    always @(posedge spclk) if (pe3M5 && ps2_strb && ~pause_byte) begin
+    always @(posedge spclk) if (pe3M5 && ps2_strb && ~pause_byte && ~ps2tx_busy) begin
         if (ps2_code == 8'hF0) begin ctrl_h<=1'b0; alt_h<=1'b0; del_h<=1'b0; ins_h<=1'b0; f11_h<=1'b0; end
         else case (ps2_code)
             8'h14: ctrl_h <= ~ps2_make;   // Ctrl (also Symbol Shift in the matrix)
@@ -324,6 +381,8 @@ module bulbulator_zx_ddr_top
     wire [31:0]  ctl_ban_wdata;
     wire [31:0]  ctl_ban_pos;
     wire [7:0]   ctl_vol;
+    wire         ctl_pentagon;                  // 0xBC MACHINE_CFG bit0: Pentagon timing (aclk)
+    wire [31:0]  ctl_pent_int;                  // 0xC4 PENT_INT: {v[24:16], hc[8:0]} INT-position tuner (aclk)
     wire         ctl_player_en, ctl_audio_we;   // machine-agnostic ARM audio player (mux + FIFO push)
     wire [31:0]  ctl_audio_data;
     wire         aud_full, aud_empty;
@@ -343,7 +402,7 @@ module bulbulator_zx_ddr_top
         cap_geom_s1<=cap_geom_sp; cap_geom_s2<=cap_geom_s1; cap_geom_s3<=cap_geom_s2;
         if (cap_geom_s2==cap_geom_s3) cap_geom_f<=cap_geom_s2;
     end
-    axi_ctl #(.VERSION(32'hB01B0017)) ctl (
+    axi_ctl #(.VERSION(32'hB01B0023)) ctl (
         .aclk(fclk100), .aresetn(aresetn),
         .s_awid(gp0_awid), .s_awaddr(gp0_awaddr), .s_awlen(gp0_awlen),
         .s_awvalid(gp0_awvalid), .s_awready(gp0_awready),
@@ -372,6 +431,9 @@ module bulbulator_zx_ddr_top
         .halt_ack(halt_ack), .ram_busy(ram_busy), .reset_busy(reset_busy_aclk),
         .ctl_reset(ctl_reset),
         .ctl_kbd_inject(ctl_kbd_inject), .ctl_kbd_inject_we(ctl_kbd_inject_we), .memwr_cnt(memwr_sync),
+        .ctl_kbd_tx_data(ctl_kbd_tx_data), .ctl_kbd_tx_we(ctl_kbd_tx_we),
+        .kbd_tx_busy(kbd_tx_busy_aclk), .kbd_tx_ack(kbd_tx_ack_aclk), .kbd_diag(kbd_diag_aclk),
+        .ctl_pentagon(ctl_pentagon), .ctl_pent_int(ctl_pent_int),
         .cap_geom(cap_geom_f)
     );
 
@@ -444,7 +506,7 @@ module bulbulator_zx_ddr_top
     //     and the FIFO is immune to ZX-side resets - the ARM owns the keys. Overflow (.full unused)
     //     is silently dropped: safe, the ARM drains far faster (MHz) than PS/2 fills (~10 keys/s).
     async_fifo #(.DW(9), .AW(5)) kbd_fifo_i (
-        .wr_clk(spclk),  .wr_rst_n(aresetn),  .wr_en(ps2_strb & pe3M5),
+        .wr_clk(spclk),  .wr_rst_n(aresetn),  .wr_en(ps2_strb & pe3M5 & ~ps2tx_busy),
         .din({ps2_make, ps2_code}), .full(),
         .rd_clk(fclk100), .rd_rst_n(aresetn), .rd_en(kbd_fifo_rd),
         .dout(kbd_fifo_dout), .empty(kbd_fifo_empty), .rd_count()
@@ -553,7 +615,7 @@ module bulbulator_zx_ddr_top
     // Merge synthetic Alt chord + real PS/2 keyboard + the 4 buttons (synthetic wins, then PS/2).
     // ZX matrix adapter for the gate: while the OSD is open (gate_on) the real PS/2 is suppressed
     // here so the ARM owns the keys; the Alt chord (syn_*) and the 4 buttons stay live.
-    wire       ps2_to_core = ps2_strb & ~gate_on & ~pause_byte;   // ARM-owned Pause never reaches the matrix
+    wire       ps2_to_core = ps2_strb & ~gate_on & ~pause_byte & ~ps2tx_busy;   // ARM-owned Pause never reaches the matrix; our own TX bits never leak either
     wire       kb_strb = arm_strb | syn_strb | ps2_to_core | kbd_strb;                                    // ARM inject wins (bypasses the gate)
     wire       kb_make = arm_strb ? arm_make : (syn_strb ? syn_make : (ps2_to_core ? ps2_make : kbd_make));
     wire [7:0] kb_code = arm_strb ? arm_code : (syn_strb ? syn_code : (ps2_to_core ? ps2_code : kbd_code));
@@ -570,8 +632,24 @@ module bulbulator_zx_ddr_top
     wire [18:0] memA_core;
     wire [7:0]  memD, memQ_core;
 
+    // Step 15: Pentagon model select - CDC ctl_pentagon (aclk) -> spclk (2-FF). This time on the
+    // CONSTRAINED base (clocks + groups in the XDC), so the mux is a timed path, not a lottery.
+    (* ASYNC_REG="TRUE" *) reg [1:0] pentagon_s = 2'b00;
+    always @(posedge spclk) pentagon_s <= {pentagon_s[0], ctl_pentagon};
+    wire pentagon_sp = pentagon_s[1];
+    // PENT_INT tuner bus: multi-bit, changes rarely -> 3-FF + settle-latch (the osd_pos idiom)
+    (* ASYNC_REG="TRUE" *) reg [31:0] pint_s1 = 32'h00EF0146, pint_s2 = 32'h00EF0146, pint_s3 = 32'h00EF0146;
+    reg [31:0] pint_q = 32'h00EF0146;
+    always @(posedge spclk) begin
+        pint_s1 <= ctl_pent_int; pint_s2 <= pint_s1; pint_s3 <= pint_s2;
+        if (pint_s2 == pint_s3) pint_q <= pint_s2;
+    end
+
     main core_i (
         .model  (1'b1),
+        .pentagon(pentagon_sp),
+        .pent_int_v(pint_q[24:16]),
+        .pent_int_h(pint_q[8:0]),
         .mapper (1'b0),
         .reset  (sp_reset_n),
         .nmi    (nmi_pulse),
@@ -723,7 +801,10 @@ module bulbulator_zx_ddr_top
 
     // AXI-HP0 read (per-LINE) + line-buffered scanout -> rgb24. Phase 1a: replaces fb_loader + the
     // whole-frame display BRAM (frees ~11 BRAM36). cap_en is re-sourced from .live (above).
-    fb_line_disp ddrdisp (
+    fb_line_disp #(
+        .SRC_W(384), .STRIDE(384), .CROP_W(384), .HMARGIN(256), .SX0(0),
+        .CROP_H(302), .VMARGIN(58)
+    ) ddrdisp (
         .clk(fclk100), .resetn(core_resetn),
         .disp_base(disp_base), .frame_kick(frame_kick_d),
         .ar_addr(hp_araddr), .ar_id(hp_arid), .ar_len(hp_arlen), .ar_size(hp_arsize),
@@ -766,21 +847,44 @@ module bulbulator_zx_ddr_top
         .x0(odpos_q[10:0]), .y0(odpos_q[26:16]), .en(oden_s[1]),
         .osd_rgb(osd_ddr_rgb), .osd_a(osd_ddr_a), .osd_active(osd_ddr_active)
     );
-    // per-pixel alpha blend of the DDR OSD over the 1bpp-OSD output: osd*a + under*(255-a) >>8
-    wire [7:0]  od_ia = 8'd255 - osd_ddr_a;
-    wire [15:0] od_r = osd_ddr_rgb[23:16]*osd_ddr_a + rgb24_osd[23:16]*od_ia;
-    wire [15:0] od_g = osd_ddr_rgb[15:8] *osd_ddr_a + rgb24_osd[15:8] *od_ia;
-    wire [15:0] od_b = osd_ddr_rgb[7:0]  *osd_ddr_a + rgb24_osd[7:0]  *od_ia;
-    wire [23:0] rgb24_ddr = osd_ddr_active ? { od_r[15:8], od_g[15:8], od_b[15:8] } : rgb24_osd;
+    // ---- Step 15 timing fix: the compositing chain (1bpp OSD -> DDR-OSD alpha -> banner -> hdmi)
+    // was ONE combinational cone (~21 logic levels, 18.2 ns in a 13.468 ns pixel period - the first
+    // constrained build exposed it at WNS -5.06; it had silently been the dot/stripe artefact source
+    // for the project's whole life). Split into pipeline stages. Every layer's decision + pixels are
+    // delayed TOGETHER, so intra-layer alignment is exact; the only global effect is the whole
+    // picture (fb + all overlays uniformly) shifting right by 2 px - invisible next to borders. ----
+    reg [10:0] cx_d1 = 11'd0, cx_d2 = 11'd0, cy_d1 = 11'd0, cy_d2 = 11'd0;
+    always @(posedge clk_pixel) begin cx_d1<=cx; cx_d2<=cx_d1; cy_d1<=cy; cy_d2<=cy_d1; end
+
+    // stage A: register the 1bpp-OSD composite (cuts window-compare + LUTRAM + panel blend out of the cone)
+    reg [23:0] rgb24_osd_q = 24'd0;
+    always @(posedge clk_pixel) rgb24_osd_q <= rgb24_osd;
+
+    // DDR-OSD layer: +1 delay to stay aligned with the stage-A register (its own 2-stage contract holds)
+    reg        od_act_d1 = 1'b0; reg [7:0] od_a_d1 = 8'd0; reg [23:0] od_rgb_d1 = 24'd0;
+    always @(posedge clk_pixel) begin
+        od_act_d1 <= osd_ddr_active; od_a_d1 <= osd_ddr_a; od_rgb_d1 <= osd_ddr_rgb;
+    end
+
+    // stage B: per-pixel alpha blend of the DDR OSD over the 1bpp-OSD output, REGISTERED:
+    // osd*a + under*(255-a) >>8  (the 6 multiplies now live alone in one pixel period)
+    wire [7:0]  od_ia = 8'd255 - od_a_d1;
+    wire [15:0] od_r = od_rgb_d1[23:16]*od_a_d1 + rgb24_osd_q[23:16]*od_ia;
+    wire [15:0] od_g = od_rgb_d1[15:8] *od_a_d1 + rgb24_osd_q[15:8] *od_ia;
+    wire [15:0] od_b = od_rgb_d1[7:0]  *od_a_d1 + rgb24_osd_q[7:0]  *od_ia;
+    reg [23:0] rgb24_ddr_q = 24'd0;
+    always @(posedge clk_pixel)
+        rgb24_ddr_q <= od_act_d1 ? { od_r[15:8], od_g[15:8], od_b[15:8] } : rgb24_osd_q;
 
     // Independent status BANNER, composited OVER the OSD output (visible regardless of osd_enable).
-    // Chain: rgb24 -> osd_i -> rgb24_osd -> banner_i -> rgb24_ovl -> hdmi. (banner_compositor in osd_compositor.v)
+    // Runs on the 2-cycle-delayed coordinates so its window tracks the pipelined underlay.
+    // Chain: rgb24 -> osd_i -> [reg A] -> DDR-OSD blend [reg B] -> banner_i -> rgb24_ovl -> hdmi.
     wire [23:0] rgb24_ovl;
     banner_compositor banner_i (
         .clk_pixel(clk_pixel), .aclk(fclk100),
         .ban_enable_a(ctl_ban_enable), .ban_we(ctl_ban_we),
         .ban_waddr(ctl_ban_waddr), .ban_wdata(ctl_ban_wdata), .ban_pos_a(ctl_ban_pos),
-        .cx(cx), .cy(cy), .rgb_in(rgb24_ddr), .rgb_out(rgb24_ovl)
+        .cx(cx_d2), .cy(cy_d2), .rgb_in(rgb24_ddr_q), .rgb_out(rgb24_ovl)
     );
 
     //=============================================================================================
