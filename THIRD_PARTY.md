@@ -49,7 +49,7 @@ Service** by *Mr Gluk*; **Proteus** / **FATALL** / the PentoGraf sets by PentoGr
 authors; **esxDOS** by the esxDOS team; **General Sound** card firmware by the General Sound
 developers. If you hold rights to any of these and want a file removed, open an issue.
 
-## Chiptune playback engines (selected 2026-08-09, see [`research/15-pentagon/CHIPTUNE_OSS.md`](research/15-pentagon/CHIPTUNE_OSS.md))
+## Chiptune playback engines (selected 2026-08-09, see [`research/15-pentagon/CHIPTUNE_ENGINE.md`](research/15-pentagon/CHIPTUNE_ENGINE.md))
 
 Every entry below was built for the real target — `arm-none-eabi-gcc 14.2.1`, bare-metal newlib,
 `-mcpu=cortex-a9 -mfpu=vfpv3 -mfloat-abi=hard` — before being selected. All licences are
@@ -70,7 +70,7 @@ GPL-2.0-or-later compatible; none of them raises the firmware above GPL-2.0-or-l
 | **sndh-player / AtariAudio** ([arnaud-carre/sndh-player](https://github.com/arnaud-carre/sndh-player)) — Atari ST `.sndh` (YM2149 + MK68901 + STE DAC), carries Musashi 68000 | SNDH player (planned, last in order) | **MIT** (Musashi: MIT, © Karl Stenerud) | © 2025 Arnaud Carré | @ `19c814b` | planned |
 | **pt3_lib** ([deater/vmw-meter](https://github.com/deater/vmw-meter) `ay-3-8910/pt3/`) — 6 KB PT3-only replay, fallback for the ayfly fork | fallback PT3 | GPL-2.0 / BSD (dual) | © Vince Weaver | @ `886a6ca` | fallback, not yet vendored |
 
-Deliberately **rejected** (details and measurements in `CHIPTUNE_OSS.md`): TinySID (redistribution
+Deliberately **rejected** (details and measurements in `CHIPTUNE_ENGINE.md`): TinySID (redistribution
 forbidden), WebSid / Tiny'R'Sid (CC BY-NC-SA, NonCommercial — GPL-incompatible), DUMB (extra
 "clause 4"), hxcmod (no SPDX), libvgm (no repo-level licence file), `kss-drivers` (third-party
 binaries), ZXTune (LGPL-3.0 would force GPL-3 distribution), libresidfp / reSIDfp (768 KB of tables
