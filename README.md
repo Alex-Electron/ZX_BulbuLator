@@ -65,33 +65,46 @@ DDR3 holds the triple-buffered framebuffer the ARM and the video path share. The
 7020 boards roughly triple the fabric (53,200 LUTs, 140 BRAM blocks, 220 DSP) —
 room for bigger machines, though the build still targets the 7010 everyone has.
 
-## What it should do
+## What works, and what is still planned
 
-The cores: ZX Spectrum 48K, 128K and Pentagon 1024 all run today, each measured against the real
-machine (Step 15); NES/Dendy runs as a second platform. C64 and other machines are on the roadmap.
+### Working on the board today
 
-For input there is a PS/2 keyboard on two FPGA pins, Kempston and Sinclair
-joysticks, and Dendy / Sega gamepads.
+**Machines.** ZX Spectrum 48K, 128K and Pentagon 1024 on one core, each measured against the real
+machine rather than eyeballed (Step 15); NES/Dendy as a second platform on its own core.
 
-Sound covers the AY-3-8912 / YM2149F, Turbo Sound (two AY chips), General Sound,
-and the beeper, with output over I²S and HDMI audio.
+**Sound.** Six sources, all of them audible: the beeper, AY-3-8912 / YM2149F, Turbo Sound (a second AY),
+SAA1099 at exactly 8 MHz, SpecDrum, and **General Sound — a secondary Z80 with its own RAM and a
+four-channel DAC, playing music**. Output over I²S and HDMI audio, with a per-source peak meter, because
+silence proves nothing.
 
-Tracked post-Step-15 expansion plans:
+**Storage.** TR-DOS / Beta Disk through a WD1793 — reading, **writing** and `FORMAT` — with `.trd` and
+`.scl` images; NEMO-IDE reading `.hdf` byte for byte; DivMMC / esxDOS as an image or a folder;
+Z-Controller. Disk images can be browsed from the navigator.
 
-- [General Sound emulation](https://github.com/Alex-Electron/ZX_BulbuLator/issues/83):
-  classic GS compatibility with a secondary Z80, private RAM/ROM and four PCM channels.
-- [Pentagon hardware Multicolor / 16-colour mode](https://github.com/Alex-Electron/ZX_BulbuLator/issues/84):
-  hardware multicolor plus the optional `#EFF7` 16-colour extension, isolated from the normal video path.
+**Input.** A PS/2 keyboard on two FPGA pins, the Kempston joystick, a Kempston mouse (including a
+numeric-keypad mode for software that is mouse-only), and per-machine joystick mapping with a
+button-capture wizard.
 
-Storage is where it gets fun. Virtual `.trd` / `.scl` disks through a WD1793
-TR-DOS, DivMMC / ESXDOS, and the part I most want to build: routing the WD1793
-signals out to GPIO through a 3.3V→5V level shifter so a real floppy drive can
-hang off the board.
+**Tape.** `.tap`, `.tzx`, `.wav` and `.mp3`, with instant loading through a ROM trap and warp up to 8×.
 
-Video is VGA and HDMI with CRT-style scanlines; the expansion shield for that is
-already built and working. And since the EBAZ4205 has on-board Ethernet, the ARM
-side can run an FTP server so games drop in over the network instead of going
-back and forth on an SD card.
+**Video.** HDMI 720p50 with per-machine integer upscale, per-side crop and pan.
+
+### Planned
+
+- **Real floppy drive** — routing the WD1793 signals out to GPIO through a 3.3 V → 5 V level shifter, so
+  a physical drive can hang off the board. The part I most want to build.
+- **Networking** ([Step 16](https://github.com/Alex-Electron/ZX_BulbuLator/issues/82)) — a web remote panel with the live screen, keyboard
+  and an SD file manager. The firmware side is written; this board's Ethernet hangs off FPGA pins rather
+  than the processor's, so it needs a bitstream that routes the controller out to the PHY.
+- **[ULAplus and the 64-colour palette](https://github.com/Alex-Electron/ZX_BulbuLator/issues/84)** —
+  an exact optional replacement-ULA, isolated from the normal video path.
+- **More machines** — C64 first, then ATM Turbo.
+- **More sound formats** — tracker and register-dump chiptunes, and the YM2203 of TurboSound-FM.
+- **Sinclair Interface 2 and Sega / Dendy gamepads.**
+- **Save states** — snapshots load today, but cannot yet be written back.
+
+Where the references disagree with each other, the answer is a switch in the machine settings rather
+than a decision made on your behalf; Pentagon's port `#FF` is the standing example.
 
 The longer list, including the ideas pulled from MiST / MiSTer / TSConf (OSD
 menu, save states, tape emulation, ROM switcher, soft-USB, fast-forward), is in
