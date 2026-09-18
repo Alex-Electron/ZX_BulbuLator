@@ -18,7 +18,8 @@ If you've enjoyed the project, it would be really nice of you to buy me a cup of
 A hardware ZX Spectrum emulator on a Xilinx Zynq SoC: bring up an open ZX Spectrum
 core on the cheap, easy-to-find EBAZ4205 board, reworking it for the Xilinx
 architecture along the way. The published build runs on the open **Atlas `zx`**
-core; the MiST / MiSTer cores stay as a fallback for the machines Atlas doesn't cover.
+core; the MiSTer 48K core sits beside it as a separate bitstream — a cross-check backend for the
+48K machine, not a machine Atlas is missing.
 
 ![EBAZ4205 board wired to the HDMI/audio and buttons expansion shield](docs/images/board.jpg)
 
@@ -32,8 +33,9 @@ and running.*
 HDMI. The full build is [Step 6](research/06-zx-spectrum-128/).*
 
 The biggest change from the original cores is memory. MiST drives an external
-SDRAM controller; here the Spectrum RAM sits in on-chip BRAM and is reached over
-AXI, which takes a lot of timing and routing pain off the table on this board.
+SDRAM controller; here the Spectrum's own 128 KB sits in on-chip BRAM wired straight
+into the core, while the Pentagon's extended banks 8-63 live in the PS DDR3 and are
+reached over AXI — which takes a lot of timing and routing pain off the table.
 
 This repo is a working notebook and an idea record. It fills up as things get
 checked on real hardware.
@@ -59,23 +61,28 @@ but pricier) — see [`docs/HARDWARE.md`](docs/HARDWARE.md) for details.
 | Power | 5–12 V |
 | Factory boot | NAND; we strap it to boot from SD instead |
 
-The memory layout is the interesting part on this board. The Spectrum's RAM lives
-in the on-chip Block RAM, which the current build fills (60/60), while the 256 MB
-DDR3 holds the triple-buffered framebuffer the ARM and the video path share. The
-7020 boards roughly triple the fabric (53,200 LUTs, 140 BRAM blocks, 220 DSP) —
-room for bigger machines, though the build still targets the 7010 everyone has.
+The memory layout is the interesting part on this board. The Spectrum's first 128 KB
+lives in the on-chip Block RAM, which the current build all but fills (58.5 of 60
+blocks), while the 256 MB DDR3 carries the Pentagon's extended banks and the
+triple-buffered framebuffer the ARM and the video path share. The 7020 boards give
+about three times the LUTs and flip-flops (53,200 LUTs, 220 DSP) but only a bit over
+twice the Block RAM (140 blocks) — and Block RAM is the resource this design runs out
+of first. The build still targets the 7010 everyone has.
 
 ## What works, and what is still planned
 
 ### Working on the board today
 
-**Machines.** ZX Spectrum 48K, 128K and Pentagon 1024 on one core, each measured against the real
-machine rather than eyeballed (Step 15); NES/Dendy as a second platform on its own core.
+**Machines.** ZX Spectrum 48K, 128K and Pentagon 1024 on one core; a MiSTer 48K backend as a separate
+cross-check bitstream; NES/Dendy as a second platform on its own core. The two Sinclair machines are
+measured rather than eyeballed — their timing suites pass in full. Pentagon's paging, ROM sets, disk
+and its fine two-pixel border are all working and checked against reference screens, but its timing
+acceptance has not been run yet.
 
 **Sound.** Six sources, all of them audible: the beeper, AY-3-8912 / YM2149F, Turbo Sound (a second AY),
 SAA1099 at exactly 8 MHz, SpecDrum, and **General Sound — a secondary Z80 with its own RAM and a
-four-channel DAC, playing music**. Output over I²S and HDMI audio, with a per-source peak meter, because
-silence proves nothing.
+four-channel DAC, playing music**. Output goes out as HDMI audio, with a per-source peak meter, because
+silence proves nothing. An external DAC is still on the wish list.
 
 **Storage.** TR-DOS / Beta Disk through a WD1793 — reading, **writing** and `FORMAT` — with `.trd` and
 `.scl` images; NEMO-IDE reading `.hdf` byte for byte; DivMMC / esxDOS as an image or a folder;
@@ -104,7 +111,9 @@ button-capture wizard.
 - **Save states** — snapshots load today, but cannot yet be written back.
 
 Where the references disagree with each other, the answer is a switch in the machine settings rather
-than a decision made on your behalf; Pentagon's port `#FF` is the standing example.
+than a decision made on your behalf: the SAA1099 gate on port `#FF`, the service ROM page under TR-DOS
+and the port-contention phase are all switches for exactly that reason. What a Pentagon returns when
+you *read* port `#FF` is next in line — the clones disagree, so it will become an option too.
 
 The longer list, including the ideas pulled from MiST / MiSTer / TSConf (OSD
 menu, save states, tape emulation, ROM switcher, soft-USB, fast-forward), is in
@@ -138,11 +147,13 @@ adds a machine-agnostic music player and [Step 14](research/14-color-osd/) turns
 true-colour DOS Navigator-style file manager.
 
 [**Step 15**](research/15-pentagon/) is where the platform became a *family*: one core carries
-**ZX Spectrum 48K, 128K and Pentagon 1024**, and each was measured against the real machine rather than
-eyeballed. Timing Tests pass in full on 48K (port tests included) and on 128K; the Z80 passes
-`z80full`, `z80ccf` and `z80memptr`; contention, border timing and the interrupt position match the
-hardware. Storage grew up — TR-DOS reads *and writes*, NEMO-IDE reads `.hdf` byte for byte, DivMMC /
-esxDOS works — and General Sound plays music. Prebuilt cores ship in
+**ZX Spectrum 48K, 128K and Pentagon 1024**, and the two Sinclair machines were measured against the
+real thing rather than eyeballed. Timing Tests pass in full on 48K (port tests included) and on 128K;
+the Z80 passes `z80full`, `z80ccf` and `z80memptr`; contention, border timing and the interrupt
+position match the hardware. Pentagon's timing acceptance is still to be run. Storage grew up — TR-DOS reads *and writes*, NEMO-IDE reads `.hdf` byte for byte, DivMMC /
+esxDOS works — and General Sound plays music. Along the way four ROM dumps that have circulated for decades turned out to be corrupted — 18 bytes
+rotted out of a TR-DOS page, one of which silently killed directory writes — and the sets here are
+repaired, with every byte of the repair documented. Prebuilt cores ship in
 [`research/15-pentagon/bitstreams/`](research/15-pentagon/bitstreams/) and the ROM sets, with full
 provenance, in [`research/15-pentagon/roms/`](research/15-pentagon/roms/).
 

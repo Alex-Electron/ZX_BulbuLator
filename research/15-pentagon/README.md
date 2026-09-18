@@ -4,7 +4,7 @@ Languages: **English** · [Русский](README.ru.md)
 
 Production state: core **B0196**, firmware **v0.15.440**. Everything below was checked on real hardware.
 
-![The ZX-BulboNavigator: a true-colour, DOS Navigator-style file manager running on the ARM control plane over the live Spectrum screen](images/navigator-step14.jpg)
+![The ZX-BulboNavigator: a true-colour, DOS Navigator-style file manager running on the ARM control plane over the live Spectrum screen](../14-color-osd/images/navigator-step14.jpg)
 
 *The ZX-BulboNavigator over a running ZX Spectrum 128K core. A true-colour 80×25 text OSD, drawn entirely by the idle ARM core, hosts a DOS Navigator-style file manager, a universal tape station, and a music player. The Spectrum's own 128 menu is visible behind the overlay — the core keeps running; the OSD does not halt it.*
 
@@ -17,6 +17,45 @@ What sets this step apart is that **acceptance is by numbers, not by impression*
 below is closed by a measurement: a timing test suite, a byte-for-byte comparison against a reference, a
 counter in a register, or a simulator run. Where the references disagree with each other, the decision
 becomes a switch in the machine settings rather than a choice made on the owner's behalf.
+
+## What it looks like
+
+Every shot below comes from the live board: the shell canvas is read straight out of memory over JTAG,
+so this is exactly what is on screen — no photographs of a monitor.
+
+![The BulbaNavigator file manager on the live board](images/nav-browser.png)
+
+*The file manager over a running machine. The menu bar and status line at the top carry the machine,
+the volume and the core version; the key hints sit at the bottom. The Spectrum underneath keeps
+executing.*
+
+![The file copy dialog](images/nav-copy-dialog.png)
+
+*The copy dialog: six ways to resolve a name clash, a free-space check, move mode and write
+verification. Every window saves its background on a stack — without that, artefacts stay behind it,
+which is what three separate complaints turned out to share as a single cause.*
+
+![The settings menu](images/nav-options.png)
+
+*Settings are described by data rather than code, and grouped: machine, ROM, disk controllers, display,
+navigator, audio, and the ULA timing lab.*
+
+![Machine settings](images/nav-machine.png)
+
+*Machine settings. Anything the references disagree about becomes a switch: the SAA1099 gate on port
+`#FF`, the General Sound card's memory and clock, the ULA timing phase, snow, the Kempston interface.
+Each option explains when you would touch it — an option without that is worse than no option.*
+
+![The ULA timing lab](images/nav-ula-lab.png)
+
+*The ULA timing lab: eleven knobs right in the menu — the memory and I/O contention windows, floating
+bus, border mode, phase and delay, paper delay, ULA and IRQ phase, interrupt source. These are what the
+numbers were found with before being fixed in the core.*
+
+![The tape station](images/nav-tape.png)
+
+*The tape station: the three loading mechanisms are separated and exposed as individual switches —
+smart load, warp and the sync loader — plus MP3 and WAV treated as tape.*
 
 ## What was done
 
@@ -199,7 +238,7 @@ The player from Step 13 is folded in and extended. It plays **`.psg`** (AYUMI so
 
 ## In the OSD
 
-![The built-in F1 help: the full ZX-BulboNavigator hotkey list, scrollable, drawn over the browser](images/navigator-keys-step14.jpg)
+![The built-in F1 help: the full ZX-BulboNavigator hotkey list, scrollable, drawn over the browser](../14-color-osd/images/navigator-keys-step14.jpg)
 
 *Press F1 for the built-in hotkey reference.*
 
