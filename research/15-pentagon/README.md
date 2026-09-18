@@ -1,29 +1,130 @@
-# Step 15 — Pentagon (machine family) — accuracy and live tuning
+# Step 15 — the Spectrum machine family, measured against the real thing
 
 Languages: **English** · [Русский](README.ru.md)
 
-## Current state
-
-Production core **B0195**, firmware **v0.15.440**. The rest of this file describes step 15 as it
-was planned; what actually works today is written up separately (Russian, translation pending):
-
-- [The BulbaNavigator shell](docs/NAVIGATOR.ru.md) — canvas, window framework, browser, tape
-  station, player, options, host file service.
-- [Machines and what was fixed in them](docs/MACHINES.ru.md) — frame geometry, timings, the
-  Pentagon border, tape loading, ROM, and what is still open.
-- [What the emulation can do](docs/EMULATION.ru.md) — memory, storage, audio, input, video.
-- [Tracker vs. code audit](docs/ISSUES_AUDIT.ru.md) — done, partial, not started.
-
+Production state: core **B0196**, firmware **v0.15.440**. Everything below was checked on real hardware.
 
 ![The ZX-BulboNavigator: a true-colour, DOS Navigator-style file manager running on the ARM control plane over the live Spectrum screen](images/navigator-step14.jpg)
 
 *The ZX-BulboNavigator over a running ZX Spectrum 128K core. A true-colour 80×25 text OSD, drawn entirely by the idle ARM core, hosts a DOS Navigator-style file manager, a universal tape station, and a music player. The Spectrum's own 128 menu is visible behind the overlay — the core keeps running; the OSD does not halt it.*
 
-This tree continues the work from the step-14 foundation (colour DDR OSD + BulboNavigator) and implements **Step 15**: the first "other machine" (Pentagon 128 as a timing leg on the Atlas 128K core) with correct 320-line raster, wider border, floating-bus = 0xFF, no contention, live INT and paper-offset tuners for perfect border positioning, and machine-agnostic control plane.
+Step 15 is the move from "one machine works" to "there are several machines, and each behaves like the
+real one". A single core carries three Spectrums — **48K, 128K and Pentagon 1024** — with MiSTer-48 and
+NES/Dendy as separate cores. The shell above them is machine-agnostic: the browser, the tape station and
+the player know nothing about the Spectrum and talk to the machine over a stable AXI contract.
 
-All new development for multi-machine support (starting with Pentagon) lives here. The 14-color-osd tree is frozen as the published step-14 snapshot.
+What sets this step apart is that **acceptance is by numbers, not by impression**. Nearly every item
+below is closed by a measurement: a timing test suite, a byte-for-byte comparison against a reference, a
+counter in a register, or a simulator run. Where the references disagree with each other, the decision
+becomes a switch in the machine settings rather than a choice made on the owner's behalf.
 
-It all runs on the otherwise-idle Cortex-A9. The Spectrum core keeps executing underneath; the OSD is an overlay, not a halt. And, as with every step, the design is machine-agnostic: the browser, the tape station, and the player know nothing about the ZX. They talk to a stable AXI contract, so the same environment will sit over a future NES or C64 core unchanged.
+## What was done
+
+### The machines and their accuracy
+
+- **Timing Tests 48K pass in full**, port tests 35/36/37 included: "All Tests Complete 100% Pass".
+- **Timing Tests 128K — all 34 tests.** The suite ends at 34: line 1350 holds a `STOP`, and the
+  "choose test 1-35" prompt is inherited from the 48K version and lies.
+- **The interrupt position differs per machine** — 4 on the 48K, 6 on the 128K. A fix measured on the
+  48K instrument travelled with the shared core and broke test 4 on the 128K.
+- **Contention matches the real machine:** the memory table is the canonical `6,5,4,3,2,1,0,0` anchored
+  at 14336, the port contention window is back at zero, and the older phase survives as a switch.
+- **A border write lands after contention, not before** — that is what the real machine does, and it
+  removes an 8×1 pixel dash left of the paper on the first line that a live 48K does not have.
+- **The CPU now matches a real Z80:** the Q flag and the flags of an interrupted block instruction. On
+  hardware: `z80full` 152/152, `z80ccf` 152/152, `z80full 1.2a` 160/160, `z80memptr` all passed.
+- **Pentagon 1024** has real megabyte paging: banks 0..7 in fabric memory, 8..63 in DDR. RAM size is a
+  machine option — 128, 256, 512 or 1024 KB.
+- **Stock Pentagon ROM sets work:** the ROM page is addressed by a pair of signals, so factory sets
+  reach their own file manager. The magic button inserts the service page on NMI and drops it on `RETN`,
+  the way a Multiface does.
+
+### The frame
+
+- **Native capture geometry:** 384 real pixels, borders 64 and 64, by one formula on both 48K and 128K.
+  Capture used to take 336 pixels and pad the line by **replicating the edge pixel** 24 times per side.
+- **The right edge of the paper matches the reference pixel for pixel.**
+- **Pentagon's fine border:** a 2-pixel edge step instead of 8. Two references disagree (2 and 1), but
+  what you can observe is the same: the colour is changed by `OUT (#FE),A`, and that only lands on a CPU
+  clock boundary.
+- **The top edge of the frame is closed.** Two earlier fixes each removed exactly half the artefact
+  because they treated the symptom. The cause was one clock cycle at the frame swap: the line-address
+  snapshot was computed from the old frame base but tagged with the new epoch. The tag was honest; the
+  address lied.
+
+### Storage
+
+- **TR-DOS / Beta Disk:** reading and **writing**, `FORMAT` included. Six defects closed; the seventh
+  turned out to be a rotten ROM dump rather than our code. The drive is faster: 200 → 10 ms per
+  revolution, 32 → 4.6 µs per byte.
+- **NEMO-IDE:** the machine reads `.hdf` **byte for byte**.
+- **DivMMC / esxDOS:** images and folder mode; `.mkdir` went from 35 s to 2-3 s.
+- **Z-Controller:** five programs accepted, with working software collected on the card.
+- Disk images can be browsed from the navigator: catalogue view, blank disk creation, card info.
+
+### Sound
+
+Six sources: beeper, AY/YM, TurboSound, SAA1099, SpecDrum and **General Sound, which plays music**. The
+SAA1099 turned out to be a **stub in the bitstream** — two files declared the same module name and the
+one read later won. The chip also got exactly 8 MHz instead of 8.0952.
+
+### Tape
+
+`.tap`, `.tzx`, `.wav`, `.mp3`; instant loading through a ROM trap, warp up to 8× with automatic
+engagement, pilot-tone detection inside MP3 and WAV. **Permission to play the tape is now separate from
+permission to accelerate the CPU** — while they were one signal, part two of the SHOCK demo measured the
+wrong frame length between blocks and took the wrong branch.
+
+### The shell
+
+An ARGB8888 canvas, 640×400 as 80×25 cells, CP866 font. A DOS Navigator-style file manager, a tape
+station, a player (PSG, WAV, MP3 through one resampler to 47996 Hz) and data-driven settings. A window
+framework where **every window saves its background on a stack** — three separate complaints turned out
+to be one cause. Crop and pan are now separate: crop trims its own edge, pan moves the output window.
+
+### Instruments
+
+The work that made the rest possible: an honest single-frame grab over JTAG, a per-source audio peak
+meter, line-reader counters, a host-side remote for the board, simulator benches and an independent
+oracle. Plus a rule paid for twice: **an instrument that changes the behaviour of what it measures must
+be switchable off** — the sound card's diagnostic trace was itself breaking the music.
+
+## What is in this directory
+
+| Directory | Contents |
+|---|---|
+| [`bitstreams/`](bitstreams/) | **prebuilt cores and the boot image** — nothing to build, the files go on the card |
+| [`roms/`](roms/) | the **ROM sets** the machine was tested against, and [where each file came from](roms/PROVENANCE.md): author, origin, and what we changed |
+| [`docs/`](docs/) | write-ups (Russian): the shell, every machine fix with its evidence, what the emulation can do, the SD card layout, and the tracker audit |
+| `sources/` | RTL: machine cores, control plane, video path, devices |
+| `arm/` | the shell firmware |
+| `tools/` | instruments: frame grab, screen decode, host-side remote, card upload |
+| `sim/` | simulator benches and Z80 measurement programs |
+| `flash/` | boot image assembly and JTAG upload |
+
+The per-build log with the reasoning behind each change is [`BUILD_HISTORY.md`](BUILD_HISTORY.md);
+current state and instrument rules live in [`HANDOVER_CURRENT.md`](HANDOVER_CURRENT.md).
+
+## Running it
+
+Put the files from [`bitstreams/`](bitstreams/) and a ROM set from [`roms/`](roms/) on the card. Where
+exactly is in [`docs/SDCARD.ru.md`](docs/SDCARD.ru.md), together with the main trap: **when you update
+the ZX core you must replace both files** — `0:/CORES/ATLAS.BIT.BIN` and `0:/BOOT.BIN` — because all
+three Spectrums share one core name and a cold start brings the bitstream up from the boot image.
+
+## Still open
+
+- **Pentagon** timing acceptance has not been run; it is the only machine without a completed suite.
+- 128K demos have not been run.
+- The **MiSTer-48** core on the card has fallen behind the shared top module.
+- Pentagon's port `#FF`: we return `0xFF`, one live reference returns the attribute. The clones disagree
+  among themselves, so this belongs in machine options rather than being decided for the owner.
+- Networking is not blocked by firmware: **this board's Ethernet hangs off FPGA pins**, so it needs a
+  bitstream that routes the controller out to the PHY.
+
+The full breakdown is in the tracker audit, `docs/ISSUES_AUDIT.ru.md`.
+
+---
 
 ## The true-colour OSD canvas
 
