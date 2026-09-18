@@ -67,8 +67,8 @@ room for bigger machines, though the build still targets the 7010 everyone has.
 
 ## What it should do
 
-The cores: ZX Spectrum 48K and 128K run today; Pentagon (320-line frame, no
-contention) and other machines are on the roadmap (Step 15 onward).
+The cores: ZX Spectrum 48K, 128K and Pentagon 1024 all run today, each measured against the real
+machine (Step 15); NES/Dendy runs as a second platform. C64 and other machines are on the roadmap.
 
 For input there is a PS/2 keyboard on two FPGA pins, Kempston and Sinclair
 joysticks, and Dendy / Sega gamepads.
@@ -120,8 +120,23 @@ machine and the ARM is the operator. [Step 11](research/11-file-browser/) builds
 an SD file browser, an options menu that saves to the card, and an OSD panel you can move and fade.
 [Step 12](research/12-snapshot-loader/) closes that loop: pick a `.z80` or `.sna` and the ARM cold-resets
 the machine, streams the RAM in over the AXI back door, injects the whole Z80 register set, and lets the
-core run from the snapshot's PC — the browser is now a real loader. Next: bigger machines and a
-flag-/timing-exact 48K core for the test suites.
+core run from the snapshot's PC — the browser is now a real loader. [Step 13](research/13-music-player/)
+adds a machine-agnostic music player and [Step 14](research/14-color-osd/) turns the OSD into a
+true-colour DOS Navigator-style file manager.
+
+[**Step 15**](research/15-pentagon/) is where the platform became a *family*: one core carries
+**ZX Spectrum 48K, 128K and Pentagon 1024**, and each was measured against the real machine rather than
+eyeballed. Timing Tests pass in full on 48K (port tests included) and on 128K; the Z80 passes
+`z80full`, `z80ccf` and `z80memptr`; contention, border timing and the interrupt position match the
+hardware. Storage grew up — TR-DOS reads *and writes*, NEMO-IDE reads `.hdf` byte for byte, DivMMC /
+esxDOS works — and General Sound plays music. Prebuilt cores ship in
+[`research/15-pentagon/bitstreams/`](research/15-pentagon/bitstreams/) and the ROM sets, with full
+provenance, in [`research/15-pentagon/roms/`](research/15-pentagon/roms/).
+
+Next: the network. **Step 16** puts a web remote panel on the board — live screen, keyboard and an SD
+file manager in a browser. The firmware side already exists; the obstacle is physical, since this
+board's Ethernet hangs off FPGA pins rather than the processor's, so it needs a bitstream that routes
+the controller out to the PHY.
 
 ## Learning the board
 
@@ -233,11 +248,34 @@ So far:
   (PSG/MP3/WAV, play modes, non-blocking pause), and a data-driven menu whose settings persist to
   `bulbulator.ini`.
 
-- **[Step 15 — Pentium (machine family) and beyond](research/15-pentagon/).** Starting with v0.15.01, all new multi-machine work (Pentagon as first additional machine with correct 320-line timings, wider border, floating bus off, live tuners, etc.) lives in the dedicated step-15 tree. The 14-color-osd tree is frozen after its public publication.
+- **[Step 15 — the Spectrum machine family, measured against the real thing](research/15-pentagon/).**
+  One core carries ZX Spectrum 48K, 128K and Pentagon 1024; NES/Dendy runs as a separate core. The point
+  of this step is that acceptance is by numbers: Timing Tests pass in full on 48K and 128K, the Z80
+  passes `z80full` / `z80ccf` / `z80memptr`, the captured frame is 384 real pixels with 64/64 borders,
+  and Pentagon's border steps by 2 pixels like the real machine. Storage (TR-DOS read **and write**,
+  NEMO-IDE, DivMMC/esxDOS, Z-Controller), six sound sources including a General Sound that plays music,
+  and a tape station that no longer fools a demo's own 48K/128K detector. Ships with prebuilt cores and
+  documented ROM sets.
+- **Step 16 — the network (planned).** A web remote panel for the board: live screen, keyboard and an SD
+  file manager in a browser. The firmware side is written; what is missing is a bitstream that routes
+  the Ethernet controller out to this board's PHY pins, because the Ethernet is wired to the FPGA rather
+  than to the processor.
 
 More steps get added as I get them working.
 
 ## Changelog
+- **2026-09-18 — Step 15: the Spectrum machine family, measured against the real thing.** One core for
+  ZX Spectrum 48K / 128K / Pentagon 1024. Timing Tests pass in full on 48K (ports included) and on 128K;
+  `z80full` 152/152, `z80ccf` 152/152, `z80full 1.2a` 160/160, `z80memptr` all passed. Native capture
+  geometry (384 real pixels, 64/64 borders) on both 48K and 128K, per-machine interrupt position,
+  Pentagon's 2-pixel border step, and a frame tag that closed the top-edge artefact. Tape playback and
+  CPU warp became separate permissions. Storage: TR-DOS read/write/FORMAT, NEMO-IDE byte-exact `.hdf`,
+  DivMMC/esxDOS, Z-Controller. Sound: SAA1099 (which had been a stub in the bitstream) at exactly 8 MHz,
+  TurboSound, SpecDrum, and General Sound playing music. The shell gained a window framework, per-side
+  crop separated from pan, and a data-driven settings tree. Ships prebuilt cores
+  (`research/15-pentagon/bitstreams/`) and the ROM sets with full provenance
+  (`research/15-pentagon/roms/`). Core `0xB01B0196`, firmware v0.15.440.
+
 - **2026-07-08 — Step 14: colour OSD & the ZX-BulboNavigator.** The 1-bpp strip is replaced by a true-colour 640×400 ARGB8888 DDR OSD (`osd_ddr_rd` over AXI-HP1 + a per-pixel alpha compositor), hosting a full DOS Navigator-style file manager on the idle ARM: a browser with `Ctrl+F3-6` sort, mask select, a 78×15 Copy/Move dialog (six conflict modes), rename / mkdir / recursive delete; a data-driven menu bar with options saved to `bulbulator.ini`; a machine-agnostic tape station (`.tap`/`.tzx`/`.wav`/`.mp3` with a hardware tape-head reader model, MP3/WAV-as-tape, Tape Sound, Mute-machine-on-load); the music player folded in (PSG/MP3/WAV, play modes, non-blocking pause, MP3 preload); a pause bitmask, boot-nav, and a transparent PAUSE sign. A clean clone reproduces the bitstream — the PS/2 watchdog patch is vendored in `third_party/atlas-zx-ps2-watchdog/` and overlaid at build time. (control-plane VERSION `0xB01B0017`, firmware v0.14.92).
 
 - **2026-07-10 — Step 15 starts in dedicated tree.** All new work for multi-machine support (Pentagon first) moves to `research/15-pentagon/`. Development, builds and commits for v0.15.01+ are only in the step-15 folder. 14-color-osd is frozen.
