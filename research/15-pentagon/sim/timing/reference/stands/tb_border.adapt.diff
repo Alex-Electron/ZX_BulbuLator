@@ -1,0 +1,18 @@
+--- /tmp/ep4/simulation/modelsim/tb_border.v	2026-08-26 17:17:55.880698238 +0200
++++ tb_border.v	2026-08-28 10:17:17.934527123 +0200
+@@ -41,12 +41,12 @@
+ 		.MACHINE(machine),
+ 		.CONTENTION(),
+ 		.CONTENTION_IO(),
+-		.INT_ADJ(8'd0),
++		.INT_ADJ(12'd0),
+ 		.BORD_PHASE(4'd9),
+-		.BORD_DELAY(2'd0),
++		.BORD_DELAY(2'd0), .OSD_SPEED(2'd0), .OSD_EXT(1'b0), .OSD_POKE(1'b0), .OSD_ACTIVE(),
+ 		.INT_VADJ(8'd0),
+ 		.CONT_ADJ(5'd0),
+-		.IO_ADJ(5'd0),
++		.IO_ADJ(8'd0),
+ 		.PORT_FF_ACTIVE(),
+ 		.PORT_FF_DATA(),
+ 		.VID_A(),

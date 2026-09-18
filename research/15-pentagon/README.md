@@ -1,6 +1,19 @@
-# Step 15 — Pentium (machine family) — accuracy and live tuning
+# Step 15 — Pentagon (machine family) — accuracy and live tuning
 
 Languages: **English** · [Русский](README.ru.md)
+
+## Current state
+
+Production core **B0195**, firmware **v0.15.440**. The rest of this file describes step 15 as it
+was planned; what actually works today is written up separately (Russian, translation pending):
+
+- [The BulbaNavigator shell](docs/NAVIGATOR.ru.md) — canvas, window framework, browser, tape
+  station, player, options, host file service.
+- [Machines and what was fixed in them](docs/MACHINES.ru.md) — frame geometry, timings, the
+  Pentagon border, tape loading, ROM, and what is still open.
+- [What the emulation can do](docs/EMULATION.ru.md) — memory, storage, audio, input, video.
+- [Tracker vs. code audit](docs/ISSUES_AUDIT.ru.md) — done, partial, not started.
+
 
 ![The ZX-BulboNavigator: a true-colour, DOS Navigator-style file manager running on the ARM control plane over the live Spectrum screen](images/navigator-step14.jpg)
 
@@ -8,7 +21,7 @@ Languages: **English** · [Русский](README.ru.md)
 
 This tree continues the work from the step-14 foundation (colour DDR OSD + BulboNavigator) and implements **Step 15**: the first "other machine" (Pentagon 128 as a timing leg on the Atlas 128K core) with correct 320-line raster, wider border, floating-bus = 0xFF, no contention, live INT and paper-offset tuners for perfect border positioning, and machine-agnostic control plane.
 
-All new development for multi-machine support (starting with Pentium) lives here. The 14-color-osd tree is frozen as the published step-14 snapshot.
+All new development for multi-machine support (starting with Pentagon) lives here. The 14-color-osd tree is frozen as the published step-14 snapshot.
 
 It all runs on the otherwise-idle Cortex-A9. The Spectrum core keeps executing underneath; the OSD is an overlay, not a halt. And, as with every step, the design is machine-agnostic: the browser, the tape station, and the player know nothing about the ZX. They talk to a stable AXI contract, so the same environment will sit over a future NES or C64 core unchanged.
 
@@ -152,15 +165,27 @@ The AXI control plane grows the true-colour OSD and tape-station registers; the 
 sources/osd_ddr_rd.v               DDR->HDMI true-colour OSD reader (AXI-HP1)
 sources/osd_compositor.v           per-pixel alpha compositor + independent banner (transparent PAUSE)
 sources/tape_player.v              machine-agnostic PULSE tape replay (T-state lock-step, FIFO drain-on-stop)
-sources/bulbulator_zx_ddr_top.v    top level: colour OSD + tape station wired in (VERSION 0xB01B0017)
-sources/axi_ctl.v                  control plane: DDR-OSD + tape registers
+sources/bulbulator_zx_ddr_top.v    top level: colour OSD + tape station wired in (VERSION 0xB01B0195)
+sources/axi_ctl.v                  control plane: DDR-OSD, tape, machine and video registers
 arm/loader_main.c                  the ZX-BulboNavigator (browser, dialogs, menus, tape station, options)
 arm/player.c                       universal music player (AY/PCM, mux, non-blocking ring)
 arm/mp3dec.c                       shared MP3 source (music + tape), with whole-file RAM preload
 arm/vga866.h                       CP866 VGA 8x16 font (ASCII + box-drawing + Cyrillic)
 arm/lscript.ld                     linker script: D-cache + non-cacheable DDR canvas window
-arm/loader.elf                     prebuilt ARM app (firmware tag v0.14.92)
-bulbulator_zx_loader.bit           prebuilt bitstream (0xB01B0017)
+arm/loader.elf                     prebuilt ARM app (firmware tag v0.15.440)
+bulbulator_zx_loader.bit           prebuilt bitstream (0xB01B0195)
+arm/tv_ui.c                        declarative Turbo Vision / DOS Navigator window framework
+arm/gs_arm.c                       General Sound: secondary Z80 card service
+arm/divmmc_card.c                  DivMMC / esxDOS card and folder mode
+arm/nes_rom.c                      NES cartridge parser
+arm/rom_ident.c                    ROM set identification by page content
+arm/net_kvm.c                      web remote panel (blocked on Ethernet pinout)
+sources/atlas_core/video.v         machine video: frame geometry, blanking, border latch, INT position
+sources/fb_line_disp.v             HDMI line reader with the frame tag (top-edge fix)
+docs/NAVIGATOR.ru.md               shell: full feature description
+docs/MACHINES.ru.md                machines: every fix with its evidence
+docs/EMULATION.ru.md               what the emulation can do today
+docs/ISSUES_AUDIT.ru.md            tracker vs. code
 flash/BOOT.BIN                     ready SD image (FSBL + bitstream + loader app)
 ```
 

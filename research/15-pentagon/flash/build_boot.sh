@@ -14,7 +14,11 @@ DIR=$(cd "$(dirname "$0")" && pwd)
 BG=${BOOTGEN:-/tools/Xilinx/Vivado/2023.1/bin/bootgen}
 cd "$DIR"
 
-[ -f loader.bin ] || arm-none-eabi-objcopy -O binary ../arm/loader.elf loader.bin
+# v02.08 (совет консулов): БЕЗУСЛОВНО. Раньше стояло `[ -f loader.bin ] ||`, то есть при уже
+# существующем файле в BOOT.BIN уезжала ПРОШЛАЯ прошивка - и вывод «фикс не работает» был ложным.
+rm -f loader.bin
+arm-none-eabi-objcopy -O binary ../arm/loader.elf loader.bin
+echo -n "  прошивка в образе: "; arm-none-eabi-strings ../arm/loader.elf | grep -oE "v0\.[0-9]+\.[0-9]+" | sort -u | tail -1
 
 "$BG" -arch zynq -image bulb_loader_sd_bin.bif -w -o BOOT_raw.bin
 

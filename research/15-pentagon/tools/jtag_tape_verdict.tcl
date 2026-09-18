@@ -3,7 +3,7 @@
 # run (the screen must be captured at EOT time - a late dump can show an unrelated
 # later state, e.g. after a user reset).
 #
-# args: <filename> [dir] [sync] [fast] [wavfast] [scrout] [waitsec] [autostart]
+# args: <filename> [dir] [sync] [fast] [wavfast] [scrout]
 #   filename - tape file on SD (in dir)
 #   dir      - SD directory, default 0:/loadtest
 #   sync     - KMB+0x24 raw Sync Loader bit, default 0
@@ -11,7 +11,6 @@
 #   wavfast  - KMB+0x20 WAV speed mode (0=1x 1=FAST8 2=SAFE4 3=AUTO 8->4), default 3
 #   scrout   - screen dump path on this host, default /tmp/scr_verdict.bin
 #   waitsec  - EOT wait cap in seconds, default 180 (use ~900 for 1x runs)
-#   autostart- 1 = firmware starts the ROM loader, 0 = guest is already waiting
 # Requires loader.elf already running (fresh via jtag_load_loader_reset.tcl).
 connect -url tcp:localhost:3121
 targets -set -filter {name =~ "*Cortex-A9*#0"}
@@ -40,7 +39,6 @@ set fast     1;                    if {$argc >= 4} { set fast    [lindex $argv 3
 set wavfast  3;                    if {$argc >= 5} { set wavfast [lindex $argv 4] }
 set scrout   "/tmp/scr_verdict.bin"; if {$argc >= 6} { set scrout [lindex $argv 5] }
 set waitsec  180;                  if {$argc >= 7} { set waitsec [lindex $argv 6] }
-set autostart 1;                   if {$argc >= 8} { set autostart [lindex $argv 7] }
 
 proc rd {addr} { return [expr {[lindex [mrd -value $addr] 0] & 0xFFFFFFFF}] }
 proc putstr {addr s} {
@@ -54,7 +52,7 @@ stop
 mwr [expr {$KMB+0x1c}] $fast
 mwr [expr {$KMB+0x20}] $wavfast
 mwr [expr {$KMB+0x24}] $sync
-mwr [expr {$KMB+0x28}] $autostart
+mwr [expr {$KMB+0x28}] 1 ;# deterministic autostart
 mwr [expr {$KMB+0x30}] 0 ;# ROM trap OFF
 mwr [expr {$KMB+0x34}] 0 ;# Smart Load OFF
 putstr [expr {$KMB+0x100}] $dir

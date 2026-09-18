@@ -1,0 +1,13 @@
+--- diskio.c
++++ diskio.c
+@@ -173,0 +174,10 @@
++		/*
++		 * A processor-only JTAG restart can leave the SD host powered while
++		 * the software driver instance has been reloaded.  In that state the
++		 * cached FatFs status may still say "ready", but ReadPolled would
++		 * assert because XSdPs_CfgInitialize has not run for this instance.
++		 */
++		if (SdInstance[pdrv].IsReady != XIL_COMPONENT_IS_READY) {
++			s |= STA_NOINIT;
++		}
++

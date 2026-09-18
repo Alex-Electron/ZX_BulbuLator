@@ -40,15 +40,23 @@ ln -sfn "$REPO/cores/hdmi" "$B/hdmi"
 # `-tclargs mistert80` and `-tclargs mister48` reproducible with no /tmp staging.
 ln -sfn "$REPO/cores/zx-mister/rtl"     "$B/mister48"
 ln -sfn "$REPO/cores/zx-mister/rtl/T80" "$B/mister_t80"
-ln -sfn "$REPO/research/15-pentagon/sources/t80_bulb" "$B/t80_bulb"
 
 # Step 15 deliberately modifies the Atlas model, memory, video timing and PS/2 receiver.
 # Keep those exact sources beside this step and compile them from build/atlas_core. Never
 # depend on (or mutate) a dirty cores/zx checkout during assembly.
 cp -R "$HERE/atlas_core" "$B/"
+# Форк процессора: наш T80.vhd (B0128, NMI подтверждается за 11 тактов, а не 13). build.tcl
+# читает ЕГО, а одноимённый апстримный из zx/src/T80/ выкидывает из списка ПО ИМЕНИ - иначе
+# два файла с одним именем архитектуры и молчаливая подмена (оплачено немым SAA1099).
+cp -R "$HERE/t80_bulb" "$B/"
 
 # --- base glue, unchanged since Step 6 ---
-cp "$S6/mem_zx.v" "$S6/kbd_buttons.v" "$S6/hdmi_wrap.sv" \
+# B0131: mem_zx.v ИЗ ШАГА 06 БОЛЬШЕ НЕ КОПИРУЕТСЯ. У нас свой форк sources/mem_zx_bulb.v
+# (регион esx = ОЗУ DivMMC 128 КБ в дыре окна DDR), имя модуля у него ТО ЖЕ - mem_zx.
+# Скопировать оба = два файла с одним именем модуля = молчаливая подмена
+# (CRITICAL WARNING [Synth 8-9873], оплачено немым SAA1099). Апстримный выкинут ПО ИМЕНИ
+# и здесь, и в списке чтения build.tcl. НЕ ВОЗВРАЩАТЬ.
+cp "$S6/kbd_buttons.v" "$S6/hdmi_wrap.sv" \
    "$HERE/get_rom.sh" "$B/"
 
 # --- async FIFO + triple-buffer manager, unchanged since Step 8 ---
@@ -63,7 +71,8 @@ cp "$S12/inject_cdc.v" "$B/"
 # --- Step 14/15 delta (from $HERE): osd_ddr_rd.v, bulbulator_zx_ddr_top.v, fb_capture_rr.v etc. for
 #     colour OSD + step 15 Pentium timing leg (320 lines, paper offsets, floating bus, live tuners).
 #     This tree is the continuation for step 15 (multi-machine). 14-color-osd tree is frozen. ---
-cp "$HERE/axi_ctl.v" "$HERE/bulbulator_zx_ddr_top.v" "$HERE/mister48_core.sv" "$HERE/hybrid_zx_core.sv" "$HERE/osd_compositor.v" "$HERE/osd_ddr_rd.v" "$HERE/tape_bram_fifo.v" "$HERE/tape_player.v" "$HERE/ps2_tx.v" "$HERE/fb_capture_rr.v" "$HERE/fb_line_disp.v" "$HERE/clock_zx.v" "$HERE/build.tcl" "$HERE/bulbulator_ddr.xdc" "$B/"
+cp "$HERE/mem_zx_bulb.v" "$HERE/axi_ctl.v" "$HERE/bulbulator_zx_ddr_top.v" "$HERE/mister48_core.sv" "$HERE/hybrid_zx_core.sv" "$HERE/osd_compositor.v" "$HERE/osd_ddr_rd.v" "$HERE/tape_bram_fifo.v" "$HERE/tape_player.v" "$HERE/ps2_tx.v" "$HERE/ddr_probe.v" "$HERE/ddr_mem.v" "$HERE/control_plane.v" "$HERE/bdi_activity_icon.v" "$HERE/turbosound_bulb.v" "$HERE/beta_disk.v" "$HERE/wd1793.sv" "$HERE/nemo_ide.v" "$HERE/kempston_mouse.v" "$HERE/usd_bulb.v" "$HERE/divmmc_card.v" "$HERE/gs_wq_fifo.v" "$HERE/gs_flow.v" "$HERE/fb_capture_rr.v" "$HERE/fb_line_disp.v" "$HERE/clock_zx.v" "$HERE/build.tcl" "$HERE/bulbulator_ddr.xdc" "$B/"
+cp -R "$HERE/nes_core" "$B/"; cp "$HERE/bulbulator_nes_top.v" "$HERE/build_nes.tcl" "$B/"
 
 ( cd "$B" && sh get_rom.sh >/dev/null )
 echo "Assembled into $B"

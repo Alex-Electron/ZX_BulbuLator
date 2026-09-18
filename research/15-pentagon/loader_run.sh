@@ -17,6 +17,7 @@ BG="${BOOTGEN:-/tools/Xilinx/Vivado/2023.1/bin/bootgen}"
 # 1. bootgen the PCAP .bit.bin
 echo ">>> bootgen .bit.bin ..."
 ( cd "$HERE/flash" && "$BG" -arch zynq -image bulb_loader_pcap.bif -w -process_bitstream bin ) >/tmp/bg.log 2>&1 \
+  && cp -f "$HERE/sources/build/bulbulator_zx_loader.bit.bin" "$HERE/bulbulator_zx_loader.bit.bin" \
   && echo "    OK $(ls -la $HERE/bulbulator_zx_loader.bit.bin 2>/dev/null | awk '{print $5}') bytes" \
   || { echo bootgen FAIL; tail /tmp/bg.log; exit 1; }
 

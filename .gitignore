@@ -21,6 +21,8 @@ zxinj/snapshot.z80
 zxinj/zxinj.elf
 # Generated PCAP "armoured train" input (bootgen -process_bitstream bin from the .bit).
 *.bit.bin
+# Шаг 15: готовые ядра публикуются НАМЕРЕННО — это то, что кладётся на карту памяти.
+!research/15-pentagon/bitstreams/*.bit.bin
 
 # Vivado / Vitis build artifacts.
 # This repo commits only sources and prebuilt bitstreams; the full projects are

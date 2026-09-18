@@ -1,0 +1,104 @@
+R=12  loop=199  sp=23363  Pass
+---------------------------
+Test 19 {Uncontended}
+LD r,n; LD rr,nn;LD A,(nn);LD (n
+n),A;LD dd,(nn);LD (nn),dd
+R=40  loop=215  sp=56820  Pass
+Test 19 {Contended}
+R=119  loop=178  sp=23367  Pass
+Test 20 {Uncontended}
+LD r,(ss); LD (ss),r
+R=61  loop=298  sp=56825  Pass
+Test 20 {Contended}
+R=59  loop=258  sp=23334  Pass
+Test 21 {Uncontended}
+PUSH ii;POP ii; LD (ii+n),r; LD
+(ii+n),n
+R=91  loop=153  sp=56860  Pass
+Test 21 {Contended}
+R=103  loop=123  sp=23320  Pass
+Test 22 {Uncontended}
+LD A,(ii+n); LD r,(ii+n)
+R=113  loop=211  sp=56809  Pass
+Test 22 {Contended}
+R=53  loop=171  sp=23338  Pass
+Test 23 {Uncontended}
+LD A,(IX+n); LD r,(IX+n); BIT (I
+X+n);RES (iX+n);SET (IX+n)
+R=75  loop=108  sp=56892  Pass
+Test 23 {Contended}
+R=29  loop=90  sp=23411  Pass
+Test 24 {Uncontended}
+LD A,(IY+n); LD r,(IY+n);BIT (IY
++n);RES (IY+n);SET (IY+n)
+Test 24 {Contended}
+?  ? ?? ??    ?  ? ??
+??s? ??????co??en????  ? ??? ???
+???????????; ?????????n????? ???
+?n????? ??????;??? ?????? ?
+?=??  ?oop=???  sp=?????  ?ass
+?  ? ?? ??  ?  ? ??
+Test 25 {Uncontended}
+(ADD/ADC/SUB/SBC/AND/XOR/OR/CP)
+A,(IX+n)
+R=83  loop=179  sp=56838  Pass
+Test 25 {Contended}
+R=89  loop=143  sp=23309  Pass
+Test 26 {Uncontended}
+R=93  loop=171  sp=56850  Pass
+Test 26 {Contended}
+R=85  loop=144  sp=23337
+R=85  loop=144  sp=23337  Pass
+Test 27 {Uncontended}
+BIT (HL);RES (HL);SET (HL);INC (
+HL);DEC (HL)
+R=107  loop=164  sp=56829  Pass
+Test 27 {Contended}
+HL);DEC (HL)              ?
+R=6?  loo?=143  s?=23332  Pass
+         ?       ?
+R=66  loop=143  sp=23332  Pass
+Test 28 {Uncontended}
+RET; RET cc; RETI; RETN
+R=32  loop=57  sp=56894  Pass
+Test 28 {Contended}
+R=20  loop=52  sp=23335  Pass
+Test 29 {Uncontended}
+CALL CC,n; JR cc,n; DJNZ
+R=55  loop=117  sp=56802  Pass
+Test 29 {Contended}
+R=33  loop=98  sp=0  Pass
+Test 30 {Uncontended}
+LDI; LDIR; LDD; LDDR
+R=59  loop=201  sp=56806  Pass
+Test 30 {Contended}
+R=117  loop=168  sp=23357  Pass
+Test 31 {Uncontended}
+CPI; CPIR; CPD; CPDR
+R=42  loop=203  sp=56801  Pass
+Test 31 {Contended}
+R=72  loop=174  sp=23325  Pass
+Test 32 {Uncontended}
+INI; INIR; IND; INDR
+R=93  loop=221  sp=56844  Pass
+Test 32 {Contended}
+R=105  loop=192  sp=23305  Pass
+Test 33 {Uncontended}
+OUTI; OTIR; OUTD; OTDR
+R=91  loop=
+R=91  loop=221  sp=56844  Pass
+Test 33 {Contended}
+R=111  loop=192  sp=23315  Pass
+Test 34 {Uncontended}
+RST 18
+R=46  loop=455  sp=56807  Pass
+ZXSPECTRUMZXSPECTRUMZXSPECTRUMZX
+Test 35 {Contended}
+IN A,(n?
+Test 36 {Contended}
+IN A,(n); OUT (n),A; IN r,(C); O
+UT (C),r [13]
+R=54  loop=237  sp=23300  Fail
+Expecting:
+R=49  sp=23337
+Press any key for next test.

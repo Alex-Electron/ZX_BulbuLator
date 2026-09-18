@@ -39,12 +39,13 @@ set_property BITSTREAM.STARTUP.MATCH_CYCLE NoWait [current_design]
 # PS7 FCLK0 = 100 MHz. Everything else derives from it automatically:
 #   clock_zx_i/mmcm CLKOUT0 -> spclk ~56.667 MHz (machine core)
 #   mmcm         CLKOUT0 -> clk_pixel 74.25 MHz, CLKOUT1 -> clk_ser 371.25 MHz (HDMI)
-create_clock -period 10.000 -name fclk100 [get_pins ps7_stub/FCLKCLK[0]]
+# control_plane: the shell (PS7, HDMI MMCM, audio divider) lives under the `shell` instance now
+create_clock -period 10.000 -name fclk100 [get_pins shell/ps7_stub/FCLKCLK[0]]
 
 # ~48 kHz audio sample clock: a register-divided clock (clk_pixel / 1547) that clocks the HDMI
 # audio resync stage. Declared so its domain is analyzed instead of silently untimed.
-create_generated_clock -name clk_audio -source [get_pins b0/O] -divide_by 1547 \
-    [get_pins clk_audio_r_reg/Q]
+create_generated_clock -name clk_audio -source [get_pins shell/b0/O] -divide_by 1547 \
+    [get_pins shell/clk_audio_r_reg/Q]
 
 # The three domains are architecturally asynchronous (every crossing goes through a gray-pointer
 # FIFO, a 2-FF/3-FF synchroniser, a toggle handshake, or a settle-latch - see the audit table in
@@ -53,8 +54,8 @@ create_generated_clock -name clk_audio -source [get_pins b0/O] -divide_by 1547 \
 set_clock_groups -asynchronous \
     -group [get_clocks fclk100] \
     -group [get_clocks -of_objects [get_pins clock_zx_i/mmcm/CLKOUT0]] \
-    -group [list [get_clocks -of_objects [get_pins mmcm/CLKOUT0]] \
-                 [get_clocks -of_objects [get_pins mmcm/CLKOUT1]] \
+    -group [list [get_clocks -of_objects [get_pins shell/mmcm/CLKOUT0]] \
+                 [get_clocks -of_objects [get_pins shell/mmcm/CLKOUT1]] \
                  [get_clocks clk_audio]]
 
 # ---- Clock-domain crossings ----
@@ -97,27 +98,36 @@ set_false_path -to [get_cells -hierarchical -filter {NAME =~ *osddr*v_s1_reg*}]
 set_false_path -to [get_cells -hierarchical -filter {NAME =~ *inj_i*rsync_reg*}]
 set_false_path -to [get_cells -hierarchical -filter {NAME =~ *inj_i*rb_sync_reg*}]
 
-# ---- Ethernet PHY IP101G (EMIO GMII) + 25 MHz ref (IP-KVM) ----
-set_property -dict { PACKAGE_PIN U14 IOSTANDARD LVCMOS33 } [get_ports GMII_rx_clk]
-set_property -dict { PACKAGE_PIN U15 IOSTANDARD LVCMOS33 } [get_ports GMII_tx_clk]
-set_property -dict { PACKAGE_PIN W16 IOSTANDARD LVCMOS33 } [get_ports GMII_rx_dv]
-set_property -dict { PACKAGE_PIN Y16 IOSTANDARD LVCMOS33 } [get_ports {GMII_rxd[0]}]
-set_property -dict { PACKAGE_PIN V16 IOSTANDARD LVCMOS33 } [get_ports {GMII_rxd[1]}]
-set_property -dict { PACKAGE_PIN V17 IOSTANDARD LVCMOS33 } [get_ports {GMII_rxd[2]}]
-set_property -dict { PACKAGE_PIN Y17 IOSTANDARD LVCMOS33 } [get_ports {GMII_rxd[3]}]
-set_property -dict { PACKAGE_PIN W19 IOSTANDARD LVCMOS33 } [get_ports GMII_tx_en]
-set_property -dict { PACKAGE_PIN W18 IOSTANDARD LVCMOS33 } [get_ports {GMII_txd[0]}]
-set_property -dict { PACKAGE_PIN Y18 IOSTANDARD LVCMOS33 } [get_ports {GMII_txd[1]}]
-set_property -dict { PACKAGE_PIN V18 IOSTANDARD LVCMOS33 } [get_ports {GMII_txd[2]}]
-set_property -dict { PACKAGE_PIN Y19 IOSTANDARD LVCMOS33 } [get_ports {GMII_txd[3]}]
-set_property -dict { PACKAGE_PIN W15 IOSTANDARD LVCMOS33 } [get_ports MDIO_mdc]
-set_property -dict { PACKAGE_PIN Y14 IOSTANDARD LVCMOS33 } [get_ports MDIO_mdio]
-set_property -dict { PACKAGE_PIN U18 IOSTANDARD LVCMOS33 } [get_ports clk_25m]
-# GMII clocks are external from PHY — declare async relative to fabric
-create_clock -period 40.000 -name gmii_rx_clk [get_ports GMII_rx_clk]
-create_clock -period 40.000 -name gmii_tx_clk [get_ports GMII_tx_clk]
-set_clock_groups -asynchronous -group [get_clocks gmii_rx_clk] -group [get_clocks gmii_tx_clk] -group [get_clocks fclk100]
+# ---- Ethernet PHY (IP101GA) через EMIO: провода от GEM0 процессора к ногам ПЛИС ----
+# Ноги ВОССТАНОВЛЕНЫ по документации платы: в наших файлах их не было (жили в проекте внутри
+# погибшей ВМ), и все 15 у нас были свободны. Банк 34, поэтому LVCMOS33 как у остальных.
+# U18 - ОПОРНЫЙ такт для самого PHY: без него микросхема не отвечает даже по MDIO (проверено:
+# молчали все 32 адреса). В документации сеть подписана CLK_50M_PHY, но четырёхбитному MII нужны
+# 25 МГц, и прежний проект ровно для этого держал синтезатор частоты.
+set_property -dict { PACKAGE_PIN W18 IOSTANDARD LVCMOS33 } [get_ports {eth_txd[0]}]
+set_property -dict { PACKAGE_PIN Y18 IOSTANDARD LVCMOS33 } [get_ports {eth_txd[1]}]
+set_property -dict { PACKAGE_PIN V18 IOSTANDARD LVCMOS33 } [get_ports {eth_txd[2]}]
+set_property -dict { PACKAGE_PIN Y19 IOSTANDARD LVCMOS33 } [get_ports {eth_txd[3]}]
+set_property -dict { PACKAGE_PIN W19 IOSTANDARD LVCMOS33 } [get_ports eth_tx_en]
+set_property -dict { PACKAGE_PIN U15 IOSTANDARD LVCMOS33 } [get_ports eth_tx_clk]
+set_property -dict { PACKAGE_PIN Y16 IOSTANDARD LVCMOS33 } [get_ports {eth_rxd[0]}]
+set_property -dict { PACKAGE_PIN V16 IOSTANDARD LVCMOS33 } [get_ports {eth_rxd[1]}]
+set_property -dict { PACKAGE_PIN V17 IOSTANDARD LVCMOS33 } [get_ports {eth_rxd[2]}]
+set_property -dict { PACKAGE_PIN Y17 IOSTANDARD LVCMOS33 } [get_ports {eth_rxd[3]}]
+set_property -dict { PACKAGE_PIN W16 IOSTANDARD LVCMOS33 } [get_ports eth_rx_dv]
+set_property -dict { PACKAGE_PIN U14 IOSTANDARD LVCMOS33 } [get_ports eth_rx_clk]
+set_property -dict { PACKAGE_PIN W15 IOSTANDARD LVCMOS33 } [get_ports eth_mdc]
+set_property -dict { PACKAGE_PIN Y14 IOSTANDARD LVCMOS33 } [get_ports eth_mdio]
+set_property -dict { PACKAGE_PIN U18 IOSTANDARD LVCMOS33 } [get_ports eth_ref_clk]
 
-# GMII TX/RX clocks land on non-CC pins on EBAZ4205 — allow general routing
-set_property CLOCK_DEDICATED_ROUTE FALSE [get_nets {GMII_rx_clk_IBUF}]
-set_property CLOCK_DEDICATED_ROUTE FALSE [get_nets {GMII_tx_clk_IBUF}]
+# Такты приёма и передачи приходят ОТ PHY (25 МГц). В фабрике на них ничего не висит - они уходят
+# прямо в примитив PS7, - но объявить их надо, иначе домен останется неанализируемым.
+create_clock -period 40.000 -name eth_rx_clk [get_ports eth_rx_clk]
+create_clock -period 40.000 -name eth_tx_clk [get_ports eth_tx_clk]
+set_clock_groups -asynchronous -group [get_clocks {eth_rx_clk eth_tx_clk}]
+
+# U15 (TX_CLK) - это N-сторона дифференциальной тактовой пары (IO_L11N_T1_SRCC_34), и одиночным
+# тактовым входом Vivado её использовать НЕ ДАЁТ: ERROR [Place 30-876]. Нога задана разводкой платы,
+# выбора у нас нет, поэтому разрешаем недедицированный маршрут до тактового буфера - на 25 МГц это
+# безопасно. RX_CLK на U14 - P-сторона той же пары и идёт штатным путём.
+set_property CLOCK_DEDICATED_ROUTE FALSE [get_nets -of_objects [get_pins shell/bufg_eth_tx/I]]

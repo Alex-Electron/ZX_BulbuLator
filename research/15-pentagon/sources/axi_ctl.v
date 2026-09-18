@@ -265,8 +265,9 @@ module axi_ctl #(
     output reg  [8:0]  ctl_paper_h,       // 0xC8 PAPER_H: h start of paper (left border) for live wider-border tuning
     output reg  [8:0]  ctl_paper_v,       // 0xCC PAPER_V: v start of paper (top border) for live tuning
     output reg  [31:0] ctl_joy,           // 0xC4 JOY_STATE: generic gamepad mask, 2 players (aclk, v0x4A)
-    output reg  [31:0] ctl_scr_pos,
-    output reg  [31:0] ctl_ula_tune,       // 0xD0 SCR_POS: {vmargin[15:0], hmargin[15:0]} whole-frame HDMI position (fb_line_disp, live)
+    output reg  [31:0] ctl_scr_pos,        // 0xD0 SCR_POS: {vmargin[15:0], hmargin[15:0]} whole-frame HDMI position
+    output reg  [31:0] ctl_ula_tune,       // 0x1C0: primary live 48K timing controls
+    output reg  [31:0] ctl_ula_tune2,      // 0x1C4: floating-bus/memory-contention/border-mode controls
     // ---- 0x11C..0x138 DDR PROBE: аппаратный замер пути PL->память (ddr_probe.v). Машино-агностично:
     //      это диагностика ОБОЛОЧКИ, а не машины, и она же дименсионирует будущий DDR-картридж. ----
     output reg  [31:0] ctl_probe_base,    // 0x120 W: базовый адрес цели (DDR 0x0xxxxxxx или OCM 0xFFFC0000)
@@ -289,6 +290,7 @@ module axi_ctl #(
     output reg         ctl_quiesce,       // 0x114 W bit0: v158 QUIESCE PL DDR masters (safe PL reload)
     input  wire        axi_idle,          // 1 = all PL DDR masters idle (STATUS bit3)
     input  wire [31:0] memwr_cnt,         // 0xAC R: core RAM-write counter (tape-load verification probe)
+    input  wire [31:0] disp_diag,         // 0x1C8 R: B0196 приборы читателя строк {отложенных пусков[31:16], недогрузок[15:0]}
     input  wire        halt_ack,
     input  wire        ram_busy,
     input  wire        reset_busy,        // machine reset/wipe in progress (STATUS bit2; from inject_cdc)
@@ -350,8 +352,7 @@ module axi_ctl #(
                IDX_ROMTRAP = 6'h38,                                          // 0xE0 ROMTRAP (W: bit0 en / bit1 done; R: bit0 rt_pending, [13:8] live 7FFD)
                IDX_REG0    = 6'h39, IDX_REG1 = 6'h3A, IDX_REG2 = 6'h3B,      // 0xE4/0xE8/0xEC REG0..REG2 (R-only 212-bit reg snapshot)
                IDX_REG3    = 6'h3C, IDX_REG4 = 6'h3D, IDX_REG5 = 6'h3E,      // 0xF0/0xF4/0xF8 REG3..REG5
-               IDX_REG6    = 6'h3F,
-               IDX_ULATUNE = 7'h40;                                          // 0x100 ULA_TUNE (RW: live ULA 48K/128K timing tuning)
+               IDX_REG6    = 6'h3F;
     localparam IDX_PROBECTL = 7'h47, IDX_PROBEBASE= 7'h48, IDX_PROBESTAT= 7'h49,  // 0x11C/0x120/0x124
                IDX_PROBEMIN = 7'h4A, IDX_PROBEMAX = 7'h4B, IDX_PROBESUM = 7'h4C,  // 0x128/0x12C/0x130
                IDX_PROBECYC = 7'h4D, IDX_PROBEBEAT= 7'h4E;                        // 0x134/0x138
@@ -377,6 +378,8 @@ module axi_ctl #(
     localparam IDX_ROMLD = 7'h55, IDX_ROMLDCTL = 7'h56, IDX_ROMLDADDR = 7'h57; // 0x154 / 0x158 / 0x15C
     localparam IDX_FDCSTAT = 7'h58, IDX_FDCCTL = 7'h59, IDX_FDCDATA = 7'h5A, IDX_FDCST2 = 7'h5B; // 0x160/4/8/C
     localparam IDX_ROMDBG  = 7'h6F;   // 0x1BC R: B0147 прибор трапа Beta Disk (см. rom_dbg_in)
+    // B0157: dedicated, collision-free ULA lab registers.  0x114 remains exclusively QUIESCE.
+    localparam IDX_ULATUNE = 7'h70, IDX_ULATUNE2 = 7'h71; // 0x1C0 / 0x1C4 RW
     localparam IDX_AUDDBG  = 7'h5C;   // 0x170 R: B0088 пики звука {SAA, AY2, AY1, SpecDrum, бипер}
     localparam IDX_GSSTAT  = 7'h5D;   // 0x174 R: состояние General Sound
     /* B0119 ПРИБОР ОБРАТНОГО ДАВЛЕНИЯ. Считаем ПОТЕРЯННЫЕ БАЙТЫ, а не эпизоды: эпизод не
@@ -397,7 +400,8 @@ module axi_ctl #(
     localparam IDX_NEMOST2 = 7'h63;   // 0x18C R: полный адрес LBA
     localparam IDX_DMMCCTL = 7'h67, IDX_DMMCBUFA = 7'h68, IDX_DMMCBUFW = 7'h69,  // 0x19C/0x1A0/0x1A4
                IDX_DMMCBUFR= 7'h6A, IDX_DMMCSTAT = 7'h6B, IDX_DMMCLBA  = 7'h6C,  // 0x1A8/0x1AC/0x1B0
-               IDX_DMMCDBG = 7'h6D, IDX_DMMCCAP  = 7'h6E;                        // 0x1B4/0x1B8
+               IDX_DMMCDBG = 7'h6D, IDX_DMMCCAP  = 7'h6E,                        // 0x1B4/0x1B8
+               IDX_DISPDIAG = 7'h72;   // 0x1C8 DISP_DIAG (R: B0196 {отложенных пусков[31:16], недогрузок[15:0]})
     /* Тот же сдвиг флага на два такта, что у NEMO-IDE и мыши (B0114/B0116). У карты цена ошибки
        выше: в слове едут подтверждение запроса и НОМЕР этого запроса, и смесь битов двух записей
        означала бы подтверждение чужого сектора - то есть молча не тот блок в файле. */
@@ -516,8 +520,9 @@ module axi_ctl #(
             ctl_pent_int <= 32'h012B013E;   // owner-tuned Pentagon INT default: v=299 (0x12B), hc=318 (0x13E) -> boot shows correct, no post-config jump
             ctl_paper_h  <= 9'd0;
             ctl_paper_v  <= 9'd60;          // owner-tuned Pentagon paper defaults (match ARM baked -> no boot jump)
-            ctl_scr_pos  <= 32'h003A0100;
-            ctl_ula_tune <= 32'd0;   // default vmargin=58 (0x3A), hmargin=256 (0x100)
+            ctl_scr_pos   <= 32'h003A0100;
+            ctl_ula_tune  <= 32'd0;  // lab disabled: exact baked B0154 timing selection
+            ctl_ula_tune2 <= 32'd0;
             ctl_probe_base  <= 32'h0F000000;   // безопасное окно DDR по умолчанию (вне кадра и вне FS_BUF)
             ctl_probe_ctrl  <= 32'h00000100;
             ctl_probe_start <= 1'b0;
@@ -577,7 +582,8 @@ module axi_ctl #(
                         IDX_PAPERH:  ctl_paper_h  <= s_wdata[8:0]; // Step 15: live paper h offset (left border)
                         IDX_PAPERV:  ctl_paper_v  <= s_wdata[8:0]; // Step 15: live paper v offset (top border)
                         IDX_SCRPOS:  ctl_scr_pos  <= s_wdata;
-                        IDX_ULATUNE: ctl_ula_tune <= s_wdata;      // Step 15: live whole-frame HDMI position
+                        IDX_ULATUNE:  ctl_ula_tune  <= s_wdata;
+                        IDX_ULATUNE2: ctl_ula_tune2 <= s_wdata;
                         IDX_SCRSCALE:ctl_scr_scale<= s_wdata;
                         IDX_PROBEBASE: ctl_probe_base <= s_wdata;
                         IDX_PROBECTL:  begin ctl_probe_ctrl <= s_wdata; ctl_probe_start <= 1'b1; end      // CE21: live integer upscale {ymul,xmul} (per machine)
@@ -753,6 +759,7 @@ module axi_ctl #(
                     IDX_TAPECTL: s_rdata <= {25'd0, ctl_tape_more, ctl_tape_sync, ctl_tape_fmode, ctl_tape_mute, ctl_tape_earmux, ctl_tape_run};
                     IDX_TAPESTAT:s_rdata <= {30'd0, tape_playing, tape_full};
                     IDX_MEMWR:   s_rdata <= memwr_cnt;
+                    IDX_DISPDIAG: s_rdata <= disp_diag;   // B0196 приборы читателя строк
                     IDX_KBDTXST: s_rdata <= {30'd0, kbd_tx_ack, kbd_tx_busy};
                     IDX_KBDDIAG: s_rdata <= kbd_diag;
                     IDX_PROBESTAT: s_rdata <= probe_stat;
@@ -771,6 +778,8 @@ module axi_ctl #(
                     IDX_JOY:     s_rdata <= ctl_joy;
                     IDX_PAPERH:  s_rdata <= {23'd0, ctl_paper_h};
                     IDX_PAPERV:  s_rdata <= {23'd0, ctl_paper_v};
+                    IDX_ULATUNE:  s_rdata <= ctl_ula_tune;
+                    IDX_ULATUNE2: s_rdata <= ctl_ula_tune2;
                     IDX_WARPHOLD:s_rdata <= ctl_warp_hold;
                     IDX_SYNCHOLD:s_rdata <= ctl_sync_hold;
                     IDX_ROMTRAP: s_rdata <= {sync_diag_in, 2'd0, p7ffd_s1_in, 7'd0, rt_pending_a_in};  // bit0 pending, [13:8] 7FFD, [31:16] SYNC diag

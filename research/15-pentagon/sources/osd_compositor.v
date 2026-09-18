@@ -80,10 +80,20 @@ module osd_compositor #(
     // Alpha set from the menu in 5% steps; higher = dimmer/more opaque. Screen still shows faintly through.
     wire [7:0]  br = bg_q[23:16], bgc = bg_q[15:8], bb = bg_q[7:0];
     wire [7:0]  dr = rgb_in[23:16], dg = rgb_in[15:8], db = rgb_in[7:0];
-    wire [7:0]  ia = 8'd255 - op_q;
-    wire [15:0] mr = br*op_q + dr*ia;
-    wire [15:0] mg = bgc*op_q + dg*ia;
-    wire [15:0] mb = bb*op_q + db*ia;
+    // 🥇 B0123 ОДНО УМНОЖЕНИЕ НА КАНАЛ ВМЕСТО ДВУХ. Тождество целочисленное, результат бит-в-бит
+    // тот же: bg*a + video*(255-a) == video*255 + a*(bg-video), а video*255 == (video<<8) - video.
+    // Двенадцать умножителей 8x8 в пиксельном домене (шесть здесь, шесть в control_plane) не попали
+    // в DSP и стоили около 760 LUT при 91 % занятости кристалла и 67 свободных DSP из 80.
+    // Разность знаковая: bg может быть темнее видео.
+    wire signed [9:0]  dv_r = $signed({2'b00, br })  - $signed({2'b00, dr});
+    wire signed [9:0]  dv_g = $signed({2'b00, bgc})  - $signed({2'b00, dg});
+    wire signed [9:0]  dv_b = $signed({2'b00, bb })  - $signed({2'b00, db});
+    wire signed [18:0] pr_r = dv_r * $signed({1'b0, op_q});
+    wire signed [18:0] pr_g = dv_g * $signed({1'b0, op_q});
+    wire signed [18:0] pr_b = dv_b * $signed({1'b0, op_q});
+    wire [15:0] mr = {dr, 8'd0} - {8'd0, dr} + pr_r[15:0];
+    wire [15:0] mg = {dg, 8'd0} - {8'd0, dg} + pr_g[15:0];
+    wire [15:0] mb = {db, 8'd0} - {8'd0, db} + pr_b[15:0];
     wire [23:0] rgb_bg = { mr[15:8], mg[15:8], mb[15:8] };
     assign rgb_out = (osd_en && in_win) ? (pix ? INK : rgb_bg) : rgb_in;
 endmodule

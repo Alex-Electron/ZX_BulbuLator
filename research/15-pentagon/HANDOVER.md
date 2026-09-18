@@ -1,87 +1,8 @@
-# BulbuLator Step 15 — Pentagon timing leg — HANDOVER (2026-07-10)
+# BulbuLator Шаг 15 — HANDOVER (fork from 14-color-osd at Pentagon accuracy round, 2026-07-10)
 
-> Изолированное research-дерево для Pentagon (и будущих машин семейства). Шаг 14 (14-color-osd) заморожен и опубликован.  
-> Вся новая работа по multi-machine (точные тайминги Pentium + live tuning) ведётся только здесь.
-
-## Что уже сделано (состояние на момент handover)
-
-### 1. RTL — Pentagon как отдельная timing-нога
-- `video.v`:
-  - `pentagon` флаг → `hCountEnd=448`, `vCountEnd=320`.
-  - Tunable INT: `irqLine = pent_int_v`, `irqBeg/End` на базе `pent_int_h` (дефолт 239/326).
-  - Wider border: `h_paper_start=64`, `v_paper_start=24` (теперь **live** из регистров).
-  - `hBlank = 320..383` (ровно 384 видимых пикселя на строку).
-  - `hsync 320..351`, `vsync 300..303`, `vBlank 296..303` — под референс (ZX-Uno / Speccy2010 / MiSTer).
-- `main.v`:
-  - `contend = pentagon ? 1'b1 : ...` (полное отключение contention).
-  - `floating bus = 8'hFF` при несовпадении портов (классический Pentagon).
-- Регистры (GP0 / AXI GP0):
-  - `0xBC` — `MACHINE_CFG` (bit 0 = pentagon).
-  - `0xC4` — `PENT_INT` {v[24:16], hc[8:0]}.
-  - `0xC8` — `PAPER_H` (live).
-  - `0xCC` — `PAPER_V` (live).
-- `fb_capture_rr.v`: FB_W=384, FB_H=302, авто-skip = flen-303 (для 320 строк → skip=17), re-raster до ровно 302 строк + padding.
-- `bulbulator_zx_ddr_top.v` + `fb_line_disp`: CROP_W/H=384/302, HMARGIN/VMARGIN под wider border.
-
-### 2. ARM / loader_main.c — live меню и управление
-- В Options (F9) добавлены четыре **ITEM_RANGE** (полностью живые):
-  - `PENT INT V` (0..319)
-  - `PENT INT H` (0..447)
-  - `PAPER H OFF` (0..127)
-  - `PAPER V OFF` (0..63)
-- `apply_pint()` / `apply_paper()` — чистые poke в регистры (машина не останавливается, border не ломается).
-- `config_load()` / save: поддержка `pint_v=`, `pint_h=`, `paper_h=`, `paper_v=`.
-- Применение дефолтов + из ini сразу после `config_load()` в `main()`.
-- `MACHINE_CFG` тоже выставляется при старте (и live через меню).
-
-### 3. Сборка, прошивка, closed-loop JTAG
-- Полностью изолированное дерево `research/15-pentagon/`.
-- `sources/assemble.sh` + `build.sh` → `bulbulator_zx_loader.bit`.
-- `loader_run.sh` / ручные PCAP + `dow arm/loader.elf`.
-- Многократные успешные прошивки (PCFG_DONE, POST_CONFIG).
-- JTAG live-поки (`xsdb mwr`):
-  - `MACHINE_CFG = 1`
-  - `PENT_INT = 0x00EF0146` (и другие значения)
-  - Чтение VGEOM, KBD_*, VERSION и т.д. для диагностики.
-- Re-dow loader.elf для переинициализации PS/2 и регистров.
-
-### 4. Текущее состояние (на момент handover)
-- Pentagon-режим работает (320 строк, wider border, floating 0xFF, no contention).
-- PENT_INT — полностью live (меню + JTAG).
-- **PAPER_H / PAPER_V** — только что за-wired в ПЛИС (axi_ctl → top → main → video). Ранее были только в C-стороне.
-- Build с live paper запущен (после правок портов).
-- Известные визуальные проблемы на текущем бите (от пользователя):
-  - Окно Spectrum "бежит влево вниз".
-  - Нижние ~20 px — мусор.
-  - Навигатор не реагирует на клавиатуру (KBD_FIFO пустой).
-
-### 5. Что осталось сделать (следующие шаги)
-- Дождаться окончания билда → прошивка → проверка live PAPER.
-- Тюнинг четырёх параметров (PENT V/H + PAPER H/V) до совпадения с референсом.
-- Починить / отладить PS/2 (kbd_init, reset 0xFF, возможно ресинк модуля).
-- При необходимости подкрутить skip / CROP_H / VMARGIN в capture/display под 320-line.
-- Захардкодить финальные значения или оставить как "recommended" в ini.
-- Обновить README / скриншоты / тесты.
-
----
-
-## Как пользоваться сейчас (для продолжения работы)
-
-```bash
-# На ThinkPad
-cd ~/bulb-v13/research/15-pentagon
-# После билда
-cp sources/build/bulbulator_zx_loader.bit .
-... bootgen + pcap_load + dow arm/loader.elf
-
-# Live-поки (пока без меню)
-xsdb -eval 'mwr 0x400000BC 1; mwr 0x400000C4 0x00EF0146'
-
-# В меню (когда клавиатура заработает)
-F9 → Options → PENT INT V/H, PAPER H/V OFF
-```
-
-Все изменения только в `research/15-pentagon/`. 14-color-osd не трогаем.
+> Читать ПЕРВЫМ. Полная техническая спецификация и актуальное состояние шага 14 «ZX-BulbaNavigator» — OSD-файловый менеджер в стиле
+> DOS Navigator поверх ядра эмулятора ZX Spectrum 128K. Прошивка **v0.14.92**, ядро ПЛИС **0xB01B0017**. Шаг 14 ЗАКРЫТ и ОПУБЛИКОВАН — см. §8 в конце.
+> Эталоны дизайна DN — в `refs/` (DN_DESIGN_SPEC.md, DN_COPY_DIALOG.md, DN_TETRIS_PORT.md).
 
 ---
 
@@ -92,7 +13,7 @@ F9 → Options → PENT INT V/H, PAPER H/V OFF
 - Мак используется в качестве тонкого клиента (редактирование кода, терминал, git-синхронизация).
 - Клавиатура PS/2 и HDMI-монитор подключены непосредственно к плате EBAZ4205.
 - Локальная копия репозитория на Mac (синхронизированная папка Яндекс.Диска):
-  `/Users/alex/Yandex.Disk.localized/DIY/EBAZ4205/BulbuLator/research/14-color-osd/`
+  `<репозиторий>/research/14-color-osd/`
 - Рабочее дерево сборки на ThinkPad:
   `~/bulb-v13/research/14-color-osd/` (Mac-копия `arm/loader_main.c` синхронизируется через `rsync`).
 
@@ -269,12 +190,6 @@ ssh thinkpad 'cd ~/bulb-v13/research/14-color-osd && source /tools/Xilinx/Vivado
 3. **Стандарты Dos Navigator 1:1:** Все диалоги, кнопки, шрифты, отступы и цвета должны строго соответствовать оригинальной схеме Dos Navigator. Зеленые кнопки, бирюзовые стрелки выбора, отсутствие прозрачности в модальных окнах — обязательные требования.
 4. **Чистота Git-истории:** Все коммиты должны выполняться строго от лица автора: `Alexander Lavrinovich <7916859+Alex-Electron@users.noreply.github.com>`. Использование AI-подписей, co-author тегов или сгенерированных ботами футеров в коммитах категорически запрещено!
 5. **Обновление Базы Знаний:** Файл `HANDOVER.md` в корне шага 14 и в Obsidian Vault должен быть полностью обновлен и синхронизирован по окончании каждой сессии разработки.
-
----
-
-## Примечание по этому файлу
-Старая часть ниже — это содержимое HANDOVER от шага 14 (заморожено).  
-Вся актуальная информация по Step 15 находится в верхней части этого файла (см. «Что уже сделано»).
 
 ---
 

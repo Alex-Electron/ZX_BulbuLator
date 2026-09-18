@@ -8,6 +8,28 @@ configparams force-mem-accesses 1
 if {[catch {targets -set -filter {name =~ "APU*"}}]} {
     targets -set -filter {name =~ "DAP*"}
 }
+# ====== v02.08 ОБЯЗАТЕЛЬНЫЙ QUIESCE ПЕРЕД СБРОСОМ (совет консулов) ======
+# Сырой `rst -system` на ЖИВОЙ плате оставляет полуоткрытый бёрст в AFI-FIFO порта S_AXI_HP0:
+# кадр в DDR замерзает при живом ядре и живом звуке, и это НЕ лечится ни перепрошивкой, ни
+# FPGA_RST_CTRL - только холодным стартом. Правильная последовательность лежала рядом, в
+# sources/warm_sd_reboot.tcl, но сюда её не перенесли. Просим ядро остановить своих DDR-мастеров
+# и ждём подтверждения (STATUS бит3); если подтверждения нет - продолжаем, но громко предупреждаем.
+catch {
+    mwr -force 0x43C00114 1
+    set quiesced 0
+    for {set q 0} {$q < 2000} {incr q} {
+        after 1
+        if {[expr {[lindex [mrd -force -value 0x43C00008] 0] & 8}] != 0} { set quiesced 1; break }
+    }
+}
+# STATUS = GP0+0x08 (сверено с sources/warm_sd_reboot.tcl:15), бит3 = все PL-мастера DDR встали.
+if {![info exists quiesced] || !$quiesced} {
+    puts "ОТКАЗ: QUIESCE не подтверждён - сброс НЕ делаем."
+    puts "Иначе полуоткрытый бёрст залипнет в AFI-FIFO и лечиться будет только холодным стартом."
+    puts "Если плата заведомо мертва и это осознанно, снимите проверку вручную."
+    exit 1
+}
+puts "QUIESCE ok"
 catch {rst -system}
 after 50
 targets -set -filter {name =~ "*Cortex-A9*#1"}
