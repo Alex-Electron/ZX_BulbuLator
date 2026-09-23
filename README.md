@@ -32,6 +32,14 @@ and running.*
 (Tape Loader / 128 BASIC / Calculator / 48 BASIC / Tape Tester) on the EBAZ4205 over
 HDMI. The full build is [Step 6](research/06-zx-spectrum-128/).*
 
+![The finale of the demo Rage on the Pentagon machine, read from the board's frame buffer](docs/images/demo-rage-pentagon.png)
+
+*The finale of the demo Rage on the Pentagon machine. The eight colour sectors run across the paper and the border alike, which makes this screen the check for the Pentagon's 2-pixel border step. The frame was read out of the board's frame buffer, not photographed off a monitor.*
+
+![ZX BulbaNavigator, the file manager on the board](research/15-pentagon/images/nav-browser.png)
+
+*ZX BulbaNavigator, the shell on the ARM side: a DOS Navigator-style file manager that loads tapes, snapshots, disk images and music from the SD card. More screenshots are in [Step 15](research/15-pentagon/).*
+
 The biggest change from the original cores is memory. MiST drives an external
 SDRAM controller; here the Spectrum's own 128 KB sits in on-chip BRAM wired straight
 into the core, while the Pentagon's extended banks 8-63 live in the PS DDR3 and are
@@ -156,6 +164,8 @@ rotted out of a TR-DOS page, one of which silently killed directory writes — a
 repaired, with every byte of the repair documented. Prebuilt cores ship in
 [`research/15-pentagon/bitstreams/`](research/15-pentagon/bitstreams/) and the ROM sets, with full
 provenance, in [`research/15-pentagon/roms/`](research/15-pentagon/roms/).
+
+Step 15 also closed four tracker issues: [#43](https://github.com/Alex-Electron/ZX_BulbuLator/issues/43) (Pentagon 128/256/1024), [#52](https://github.com/Alex-Electron/ZX_BulbuLator/issues/52) (TR-DOS / Beta Disk), [#53](https://github.com/Alex-Electron/ZX_BulbuLator/issues/53) (esxDOS through DivMMC, `.hdf` through NEMO-IDE) and the umbrella [#51](https://github.com/Alex-Electron/ZX_BulbuLator/issues/51) (virtual disks). What's still open for the Pentagon is collected in [#96](https://github.com/Alex-Electron/ZX_BulbuLator/issues/96).
 
 Next: the network. **Step 16** puts a web remote panel on the board — live screen, keyboard and an SD
 file manager in a browser. The firmware side already exists; the obstacle is physical, since this
