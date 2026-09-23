@@ -57,3 +57,10 @@ usage_statistics_webtalk*
 #   *.xdc          — constraints
 #   *.tcl *.sh     — build/flash scripts
 #   *.hex          — memory init / ROM images
+
+# Local-only files, not part of the published project
+.cbmignore
+docs/images/splash_orig.jpg
+research/JTAG.md
+# Step 16 is not published yet; its working tree stays local until it is
+research/16-web-kvm/
