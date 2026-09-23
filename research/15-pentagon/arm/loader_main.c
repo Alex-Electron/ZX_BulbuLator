@@ -518,6 +518,7 @@ static void     net_poll(void);   /* Ethernet опросом из главног
 static int  pl_reload(const char* path);         /* v0.15.143: runtime PL core-reload (defined below) */
 static void fabric_reinit_after_reload(void);    /* v0.15.143: re-push full fabric state after a PL core-reload */
 static void apply_machine(void);                 /* Step 15: apply machine mode (defined below) */
+static void apply_gs(void);                      /* v441: периферия новой машины в apply_machine (defined below) */
 #include "nes_rom.c"                              /* v146: iNES/NES2.0 header parser (nes_parse_header, nes_hdr_t) - test main() guarded out */
 static int  nes_load(const char* path);          /* v146: parse .nes -> stream PRG/CHR into the NES core BRAM (defined below) */
 
@@ -1231,7 +1232,7 @@ static void browser_status(const char* s){   /* transient feedback (MOUNT/READ/F
 /* Title screen (shown when the OSD opens with F12): just the name, centred, scale 2. */
 /* Firmware build tag shown on the F12 splash (bump per milestone). The PL core VERSION
    (0x4000_0000) is shown live too, so the splash states exactly which firmware + bitstream run. */
-#define BULB_FW "v0.15.440"
+#define BULB_FW "v0.15.444"
 static char hexnib(uint32_t v){ return (v<10) ? ('0'+v) : ('A'+v-10); }
 /* Single source of truth for the version line ("v0.13 core 0xB01B0013"): the ARM firmware tag
    BULB_FW + the live PL core VERSION read from register 0x00. Used by BOTH the F12 splash
@@ -1918,13 +1919,27 @@ static const char* const CH_NOYES[] = {"NO","YES"};
    bitstream and stays). Old ini NO(0)->AUTO keeps the new default; YES(1)->ON keeps old behavior. */
 static const char* const CH_SYNCMODE[] = {"AUTO","ON","OFF"};
 #define TAPESYNC_BIT() (((opt_tapesync)!=2)?0x20u:0u)
-static const char* const CH_FASTLOAD[] = {"NORMAL","8x","4x"};   /* 0=1x real-time 1=CPU-only 8x (AUTO-ROM gated) 2=whole-core 4x. v130 UI simplification (owner 22.07); values keep their legacy meaning for ini/KVM compat */
+static const char* const CH_FASTLOAD[] = {"NORMAL","FAST 8x"};   /* v0.15.443 (владелец 23.09): 4x для TAP/TZX снят - всё грузится на 8x. Старое 2 (4x) из ini/KVM молча становится 1 (8x), см. cur_fmode */
+/* v0.15.443 КАК АВТОСТАРТ ВХОДИТ В ЗАГРУЗКУ НА 128K/ПЕНТАГОНЕ (просьба владельца 23.09: «некоторые демки требуют
+   вызова LOAD через бейсик 48к даже на 128к машине»). Спорное - в опцию, поэтому три варианта:
+   0 = 128 MENU: как было, Enter на «Tape Loader» меню 128. Для обычного 128K-софта.
+   1 = USR 0: 48 BASIC с НЕЗАПЕРТОЙ страничностью (#7FFD=#10), ровно как классический USR 0. 128K-память и AY
+       остаются доступны. Брать для 128K-демок, которые требуют LOAD "" из 48 BASIC.
+   2 = 48 LOCK: как пункт «48 BASIC» меню настоящего 128K (#7FFD=#30, страничность заперта). Брать для 48K-программ,
+       которые случайно пишут в #7FFD и на незапертой машине сами себе переключают память.
+   Вход делается инжектом PC=0 при нужном #7FFD, а не навигацией по меню ПЗУ: у пентагоновских BIOS меню у всех
+   разные, а страница 48 BASIC у нас всегда в слоте 1 (прошивка раскладывает наборы по содержимому).
+   На машине 48K опция ни на что не влияет. */
+static int opt_tape128 = 0;
+static const char* const CH_TAPE128[] = {"128 MENU","USR 0","48 LOCK"};   /* 0=1x real-time 1=CPU-only 8x (AUTO-ROM gated) 2=whole-core 4x. v130 UI simplification (owner 22.07); values keep their legacy meaning for ini/KVM compat */
 static const char* const CH_WAVMP3LOAD[] = {"NORMAL","FAST"};    /* v130 (owner 22.07): intent-only menu. 0=1x authentic; 1=FAST = the reliable hybrid (v129 promotion; SMART inject will make it faster transparently). Legacy ini/KVM values 2/3 are accepted and behave as FAST (cur_fmode promotes) but the menu shows 2 choices. */
 static const char* const CH_LAUNCH[]= {"MACHINE","MUSIC"};
 /* Step 15 scaffold: the machine list. ZX 128K runs today; the Pentagon rows are placeholders until the
    proven Pentagon core is imported (then opt_defmachine drives the boot machine + a live switch). CH_MACHINE
    = display labels; MACHINE_TAG = stable ini keys (index reordering must not break saved configs). */
-static const char* const CH_MACHINE[]  = {"ZX 128K (Atlas)", "PENTAGON 1024K (Atlas)", "ZX SPECTRUM 48K (Atlas)", "ZX SPECTRUM 48K (MiSTer)", "NES (NESTang)"};   /* every machine labeled with its source core (Atlas / MiSTer / NESTang) */
+/* v0.15.444 (владелец 23.09): у Пентагона в имени НЕТ объёма - он настройка (RAM size), и зашитое «1024K» врало
+   при 128K/512K. Живой объём показывает шапка навигатора (machine_type). Ключи ini остаются pent1024.* ради совместимости. */
+static const char* const CH_MACHINE[]  = {"ZX 128K (Atlas)", "PENTAGON (Atlas)", "ZX SPECTRUM 48K (Atlas)", "ZX SPECTRUM 48K (MiSTer)", "NES (NESTang)"};   /* every machine labeled with its source core (Atlas / MiSTer / NESTang) */
 static const char* const MACHINE_TAG[] = {"zx128",   "pent1024",         "zx48",                    "zx48mr",                  "nes"};
 static const char* const CH_ULATIM[]   = {"EARLY (TYPE 1)", "LATE (TYPE 2)"};
 static const char* const CH_TUNE[]     = {"OFF (B0154)", "ON (LIVE)"};
@@ -5721,9 +5736,15 @@ static void zx_tap_key(uint8_t code){ zx_key(code,0); tape_wait_ms(60); zx_key(c
 static void zx_tape_autostart(void){
     if(!opt_autostart) return;
     machine_reset();                       /* cold reset + RAM wipe -> selected ROM boots cleanly */
+    int via48 = (opt_defmachine < 2) && (opt_tape128 == 1 || opt_tape128 == 2);
+    if(via48){                              /* v443: 128K/Пентагон -> прямо в 48 BASIC (USR 0 / 48 LOCK), см. CH_TAPE128 */
+        zregs z = {0};                      /* PC=0, DI, IM 0: ПЗУ 48 BASIC само делает полный старт */
+        z.p7ffd = (opt_tape128 == 2) ? 0x30u : 0x10u;   /* бит4 = страница 48 BASIC; бит5 = запереть страничность */
+        inject_finish(&z);                  /* снимает HALT, поставленный machine_reset */
+    }
     halt_src = 0; apply_halt();             /* drop every HALT source so the ROM actually runs to the menu */
     tape_wait_ms(2500);                     /* let the ROM reach BASIC/menu (a bit longer for reliability) */
-    if(opt_defmachine>=2){                  /* 48K BASIC (Atlas or MiSTer core): J = LOAD keyword, PS/2 0x54 = Symbol-Shift+P = quote */
+    if(opt_defmachine>=2 || via48){                  /* 48K BASIC (Atlas or MiSTer core): J = LOAD keyword, PS/2 0x54 = Symbol-Shift+P = quote */
         zx_tap_key(0x3B); tape_wait_ms(120);
         /* Two identical Symbol-Shift+P chords need a real all-keys-up scan
            between them.  The old 40 ms generic settle was occasionally still
@@ -9301,7 +9322,8 @@ static void cfg_set(const char* k, const char* v){
         int m=k[6]-'0'; if(d<0)d=0;
         if(k[5]=='x'){ if(d>1024)d=1024; g_mp[m].scr_x=d; } else { if(d>400)d=400; g_mp[m].scr_y=d; }
     }   /* legacy global scr_x/scr_y keys are intentionally IGNORED (superseded per machine) */
-    else if(!cicmp(k,"fastload")){ int d=v[0]-'0'; if(d<0)d=0; if(d>2)d=2; opt_fastload=d; }
+    else if(!cicmp(k,"fastload")){ int d=v[0]-'0'; if(d<0)d=0; if(d>1)d=1; opt_fastload=d; }   /* v443: старое 2 (4x) = FAST 8x */
+    else if(!cicmp(k,"tape128")){ int d=v[0]-'0'; if(d<0||d>2)d=0; opt_tape128=d; }                /* v443 */
     else if(!cicmp(k,"region")){ int r=v[0]-'0'; if(r>=0&&r<=2) opt_region=r; }   /* v0.15.189 регион NES */
     else if(!cicmp(k,"snow")){ opt_snow = (v[0]!='0'); }   /* v145 ULA snow (global) */
     else if(!cicmp(k,"kempston")){ opt_kj = (v[0]!='0'); }   /* B0175 интерфейс Kempston */
@@ -9635,6 +9657,7 @@ static int config_save(void){                  /* 1 = written OK, 0 = failed (ca
     { p=appstr(o,p,"wavfast="); p=appch(o,p,(char)('0'+(opt_wavfast&3))); p=appch(o,p,'\r'); p=appch(o,p,'\n'); }
     { p=appstr(o,p,"tapesync="); p=appch(o,p,(char)('0'+(opt_tapesync%3))); p=appch(o,p,'\r'); p=appch(o,p,'\n'); }   /* v132: 0=AUTO 1=ON 2=OFF */
     { p=appstr(o,p,"autostart="); p=appch(o,p,opt_autostart?'1':'0'); p=appch(o,p,'\r'); p=appch(o,p,'\n'); }
+    { p=appstr(o,p,"tape128="); p=appch(o,p,(char)('0'+((opt_tape128>=0&&opt_tape128<=2)?opt_tape128:0))); p=appch(o,p,'\r'); p=appch(o,p,'\n'); }   /* v443 */
     { p=appstr(o,p,"romtrap="); p=appch(o,p,opt_romtrap?'1':'0'); p=appch(o,p,'\r'); p=appch(o,p,'\n'); }
     { p=appstr(o,p,"smartload="); p=appch(o,p,opt_smartload?'1':'0'); p=appch(o,p,'\r'); p=appch(o,p,'\n'); }
     p=appstr(o,p,"timemode=");     p=appch(o,p,opt_timemode?'1':'0'); p=appch(o,p,'\r'); p=appch(o,p,'\n');
@@ -10004,6 +10027,22 @@ static void apply_machine(void){
         mp_store(applied);                         /* save the machine we are leaving (keep its live tweaks) */
         mp_load(opt_defmachine);                   /* load the machine we are entering -> opt_* */
         apply_pint(); apply_paper(); apply_ulatune(); apply_crop(); /* push machine timing + paper + crop */
+        /* 🥇 v0.15.441 ПЕРИФЕРИЯ НОВОЙ МАШИНЫ - ТОЖЕ В ЯДРО, А НЕ ТОЛЬКО В opt_*.
+           mp_load переносит настройки машины в переменные прошивки, но NEMO-IDE, General Sound и мышь
+           живут в СВОИХ регистрах ядра (NEMO_CTL, GS_CTL, KM_CTL), а не в MACHINE_CFG. Без явного
+           применения они оставались такими, какими были у ПРЕЖНЕЙ машины. У 48K, 128K и Пентагона ядро
+           одно (ATLAS), перезагрузки ПЛИС при смене нет, - значит устройства Пентагона продолжали
+           работать в машине 48K.
+           Оплачено 23.09 тестом таймингов: Пентагон -> 48K через меню давал провал 35/36/37 шесть раз из
+           шести, а то же ядро, поднятое с карты сразу в режиме 48K, - 100 % десять раз из десяти.
+           Доказательство прибором: после теста в регистрах NEMO лежали АДРЕСА ПОРТОВ (lba0=70 lba1=90
+           lba2=B0 head=D0 cmd=E0) - тест делает OUT (C),C по всем младшим байтам, а NEMO разбирает
+           ЛЮБОЙ порт с A1=A2=0 и давит собственный декодер машины (nemo_ide.v: sup = ebl). Чтения этих
+           портов отдавали регистр IDE вместо плавающей шины. На живом 48K такой карты нет.
+           apply_divmmc и apply_zc сюда НЕ ставим: карта DivMMC и Z-Controller в ядре выключаются битами
+           17/19 MACHINE_CFG, который ниже перетолкивается всё равно, а сами функции трогают том карты и
+           (apply_divmmc) сбрасывают машину - лишний сброс посреди переключения. */
+        apply_ide(); apply_gs(); apply_kmouse();
     }
     if(first || changed){
         /* GUARDED, glitch-free machine-mode transition. The core's ROM bank / RAM paging / contention
@@ -10291,7 +10330,8 @@ static unsigned cur_fmode(void){
        with mode3 both pass with confirmed game screens. TAP/TZX keep their policy. */
     if((g_tape_fmt==TAPE_FMT_WAV || g_tape_fmt==TAPE_FMT_MP3) && opt_wavfast==1) return 3u;
     if(g_tape_fmt==TAPE_FMT_WAV || g_tape_fmt==TAPE_FMT_MP3) return (unsigned)opt_wavfast & 3u;
-    return (unsigned)opt_fastload & 3u;
+    if(opt_fastload < 0 || opt_fastload > 1) opt_fastload = 1;   /* v443: 4x снят; старое 2 из KVM/ini = FAST 8x */
+    return (unsigned)opt_fastload;
 }
 static void apply_fast(void){ TAPE_CTRL = (TAPE_CTRL & ~0x18u) | (cur_fmode()<<3); }   /* live warp-mode change (per current format) */
 static void apply_tapesync(void){ TAPE_CTRL = (TAPE_CTRL & ~0x20u) | TAPESYNC_BIT(); }   /* live SYNC LOADER (bit5) */
@@ -10442,7 +10482,7 @@ static menu_item opt_items[] = {
     {"CROP R",     ITEM_RANGE, &opt_crop_r, 0, 1, 0, apply_crop, 190, ""},  /* [28] trim right */
     {"CROP T",     ITEM_RANGE, &opt_crop_t, 0, 1, 0, apply_crop, 148, ""},  /* [29] trim top */
     {"CROP B",     ITEM_RANGE, &opt_crop_b, 0, 1, 0, apply_crop, 148, ""},  /* [30] trim bottom */
-    {"TAP/TZX SPEED",  ITEM_CHOICE, &opt_fastload, CH_FASTLOAD, 3, 0, apply_fast}, /* [31] .tap/.tzx load speed: OFF / FAST 8x (CPU-only) / SAFE 4x (whole-core) */
+    {"TAP/TZX SPEED",  ITEM_CHOICE, &opt_fastload, CH_FASTLOAD, 2, 0, apply_fast}, /* [31] .tap/.tzx load speed: OFF / FAST 8x (CPU-only) / SAFE 4x (whole-core) */
     {"WAV/MP3 SPEED", ITEM_CHOICE, &opt_wavfast, CH_WAVMP3LOAD, 2, 0, apply_fast}, /* [32] v130: NORMAL(1x) / FAST(hybrid). Legacy 2/3 from ini clamp to FAST via cur_fmode */
     /* v0.15.334: строка честно говорит, что на скорости 8x лента демандовая независимо от выбора
        (см. разбор над таблицей). Значение и его сохранение прежние - меняется только показ. */
@@ -10545,6 +10585,7 @@ static menu_item opt_items[] = {
     {"FLOAT BUS DLY",ITEM_RANGE,&opt_fbus_delay,0,1,0,apply_ulatune,3," tap"},         /* [89] */
     {"BORDER MODE", ITEM_CHOICE,&opt_border_mode,CH_BORDMODE,2,0,apply_ulatune},       /* [90] */
     {"KEMPSTON JOYSTICK", ITEM_CHOICE, &opt_kj, CH_NOYES, 2, 0, apply_kj},              /* [91] B0175: интерфейса на голом 48K нет; ВЫКЛ = порты с a5=0 отдают плавающую шину */
+    {"TAPE LOAD VIA", ITEM_CHOICE, &opt_tape128, CH_TAPE128, 3, 0},                     /* [92] v443: как автостарт входит в загрузку на 128K/Пентагоне */
 };
 /* (no opt_menu instance any more: opt_items[] feed the Options > Settings nested dropdown directly) */
 
@@ -10671,7 +10712,8 @@ static const MenuItem mi_tape[] = {                        /* all tape / MP3 par
   {"T~A~P/TZX SPEED",  0,0,NULL,NULL,&opt_items[32]},       /* [32]. v0.15.185: было [31] = CROP B -> строка молча резала кадр снизу вместо выбора скорости (жалоба владельца) */
   {"~W~AV/MP3 SPEED",0,0,NULL,NULL,&opt_items[33]},   /* [33]. было [32] = скорость TAP */
   {"S~y~nc loader",0,0,NULL,NULL,&opt_items[34]},     /* [34]. было [33] = скорость WAV */
-  {"Auto-sta~r~t", 0,0,NULL,NULL,&opt_items[35]},     /* [35]. было [34] = SYNC LOADER */
+  {"Auto-sta~r~t", 0,0,NULL,NULL,&opt_items[35]},
+  {"~L~oad via (128K)", 0,0,NULL,NULL,&opt_items[92]},   /* [92] v443: 128 MENU / USR 0 / 48 LOCK */     /* [35]. было [34] = SYNC LOADER */
   {"~S~mart load", 0,0,NULL,NULL,&opt_items[37]},     /* [37]. было [36] = ROM-TRAP (он остаётся без строки, снят намеренно) */          /* instant byte-inject for standard ROM loaders + auto pulse-fallback for custom loaders. (ROM-trap [35] retired - Model A freeze/inject is architecturally dead for a real CPU, loaded nothing; smart load replaces it) */
 };
 static Menu m_tape = { mi_tape, MENU_N(mi_tape), 0 };
@@ -10710,7 +10752,7 @@ static const struct { short ix; const char* lab; } MENU_IX_EXPECT[] = {
     {78,"DIVMMC WRITE"},{79,"Z-CONTROLLER WRITE"},
     {80,"IO CONT DLY"},{81,"BORD PHASE"},{82,"BORD DELAY"},{83,"PAPER DELAY"},{84,"IRQ PHASE"},
     {85,"INT SOURCE"},{86,"ULA PHASE"},{87,"TUNE OVERRIDE"},{88,"MEM CONT DLY"},
-    {89,"FLOAT BUS DLY"},{90,"BORDER MODE"},                                                /* v433 */
+    {89,"FLOAT BUS DLY"},{90,"BORDER MODE"},{91,"KEMPSTON JOYSTICK"},{92,"TAPE LOAD VIA"},   /* v443: 91 сторож тоже не проверял */                                                /* v433 */
 };
 /* v231 АУДИТ ВЫСОТ МЕНЮ. Тот же приём, что MENU_IX_EXPECT для индексов: проверяем инвариант на
    старте, а не ждём жалобы на артефакты. Подменю машин уже дважды перерастало окружение, когда в
@@ -13559,6 +13601,10 @@ static int copy_move_dialog(char* dst, int dstsz, int* removesrc, int* checkfree
             if(k==K_SPACE || k==K_ENTER){
                 if(tv_browse_dialog(dst, dstsz, TV_BROWSE_DIR, NULL)){
                     len = slen(dst); cur = len;
+                    focus = FOC_OK;    /* v0.15.442 (просьба владельца): каталог выбран деревом - дальше остаётся
+                                          только подтвердить, поэтому фокус сразу на OK, а не на кнопке дерева
+                                          (раньше до OK приходилось жать Tab несколько раз). Отмена в дереве
+                                          фокус не трогает. */
                 }
                 dn_win_draw(left,top,W,H,deftitle);
                 dn_puts(left+2,top+1,"Target folder:",DNK_DLG_FG,DNK_DLG_BG);
@@ -14670,12 +14716,12 @@ static void render_pause_sign(void){
 }
 /* Step 15: within the ZX family (MACHINE_ID stays 0x...5A58) the MODEL is the ARM-selected machine
    (opt_defmachine drives MACHINE_CFG); label accordingly. Cross-family cores will key off MACHINE_ID. */
-static const char* machine_name(void){ return (opt_defmachine==1) ? "PENTAGON 1024K" : (opt_defmachine==3) ? "ZX SPECTRUM 48K (MiSTer)" : (opt_defmachine==2) ? "ZX SPECTRUM 48K (Atlas)" : "ZX SPECTRUM 128K"; }
+static const char* machine_name(void){ return (opt_defmachine==1) ? "PENTAGON" : (opt_defmachine==3) ? "ZX SPECTRUM 48K (MiSTer)" : (opt_defmachine==2) ? "ZX SPECTRUM 48K (Atlas)" : "ZX SPECTRUM 128K"; }
 /* v0.15.172 (owner: "the machine type in the navigator's top row is still wrong"). The old chain of
    ternaries had NO case for machine 4, so the NES fell through to the "ZX 128K" default. A TABLE indexed
    by the machine makes a missing label impossible: adding a machine to CH_MACHINE without a short label
    would not compile-check, but the index is now the single source of truth and stays in step. */
-static const char* const MACHINE_SHORT[] = {"ZX 128K", "PENT 1024", "ZX 48K", "ZX 48K MR", "NES"};
+static const char* const MACHINE_SHORT[] = {"ZX 128K", "PENT", "ZX 48K", "ZX 48K MR", "NES"};
 /* 🥇 v0.15.397 ОБЪЁМ ОЗУ В ИМЕНИ МАШИНЫ - ЖИВОЙ, А НЕ ЗАШИТЫЙ (задание владельца).
    В таблице выше объём стоит строкой, и при `RAM size = 512K` шапка всё равно уверяла «1024» - ложь
    в самом заметном месте интерфейса. Объём машины у нас настройка (`opt_ramsize` -> `RAMSIZE_CFG` ->

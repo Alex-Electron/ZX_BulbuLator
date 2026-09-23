@@ -298,6 +298,8 @@ So far:
 More steps get added as I get them working.
 
 ## Changelog
+- **2026-09-23 — Step 15, firmware v0.15.444.** Switching machines in the menu now applies the new machine's own NEMO-IDE, General Sound and mouse settings. Before, they stayed as the previous machine had left them: 48K, 128K and Pentagon share one core, the switch doesn't reload the FPGA, and those three devices keep their own registers. The same hunt explained the Timing Tests 48K failures in tests 35-37. The 48K machine had NEMO-IDE switched on, and like the original card it decodes ports loosely (A1 = A2 = 0 is enough), so it answers a quarter of all ports, exactly the ones those tests read the floating bus through. With it off, the test passes three runs out of three. Tape speed is now NORMAL or FAST 8x; the 4x mode is gone, since everything loads at 8x. A new *Load via (128K)* option picks how auto-start gets into loading on 128K and Pentagon: the 128 menu, `USR 0` (48 BASIC with paging left open, for 128K demos that insist on `LOAD ""` from 48 BASIC) or a locked 48 BASIC. The copy dialog moves focus to OK once you pick a folder in the tree, and the menu calls the Pentagon just *PENTAGON*, because its memory size is a setting.
+
 - **2026-09-18 — Step 15: the Spectrum machine family, measured against the real thing.** One core for
   ZX Spectrum 48K / 128K / Pentagon 1024. Timing Tests pass in full on 48K (ports included) and on 128K;
   `z80full` 152/152, `z80ccf` 152/152, `z80full 1.2a` 160/160, `z80memptr` all passed. Native capture

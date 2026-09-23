@@ -51,7 +51,7 @@
 
 | Файл отсюда | Куда на карту |
 |---|---|
-| `../bitstreams/BOOT_B0196_v0.15.440.BIN` | `0:/BOOT.BIN` |
+| `../bitstreams/BOOT_B0196_v0.15.444.BIN` | `0:/BOOT.BIN` |
 | `../bitstreams/ATLAS_B0196.bit.bin` | `0:/CORES/ATLAS.BIT.BIN` |
 | `../bitstreams/NES_CE29.bit.bin` | `0:/CORES/NES.BIT.BIN` |
 | наборы ПЗУ (в репозитории их нет, см. `../roms/README.md`) | `0:/ROMS/` |
