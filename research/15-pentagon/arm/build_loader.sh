@@ -1,24 +1,30 @@
 #!/bin/bash
 # loader.elf build for BulbuLator Step 13 (snapshot loader + F5 file browser + options + the universal
 # music player: loader_main.c + player.c + third_party/ayumi, linked with -lm).
-# Compiles against the standalone BSP and links the xilffs (FatFs) objects directly,
-# bypassing the broken platform-generate/FSBL (xilffs objects exist but aren't archived into libxil.a).
-# NOTE: this still needs the Vitis 2023.1 BSP workspace ($WS) - the ARM app is not yet clean-clone
-# buildable (xsdps + FatFs aren't vendored into the repo); see the README's honest note. The xsdps /
-# xilffs BSP sources carry the Step-11/12 hardening patches (diskio re-init + trimmed timeouts).
+# Compiles against the standalone BSP and links the xilffs (FatFs) objects ff.o/ffunicode.o/ffsystem.o
+# directly (they are archived into libxilffs.a, not libxil.a; diskio.c is compiled here as diskio_bulb.c).
+# The BSP workspace ($WS) is generated from the repo by bsp/make_bsp.sh (Vitis 2023.1 xsct + the
+# xsdps/xilffs patches in bsp/patches/). Default: bsp/ws if make_bsp.sh has been run, otherwise the
+# old hand-made workspace on the build machine (/home/lavrinovich/sdboot/ws).
 # All paths overridable via env.
 set -e
 source /tools/XilinxVitis/Vitis/2023.1/settings64.sh 2>/dev/null || true
-WS="${WS:-/home/lavrinovich/sdboot/ws}"
+ARMD="$(cd "$(dirname "$0")" && pwd)"
+if [ -z "$WS" ]; then
+  if [ -d "$ARMD/bsp/ws/ebaz" ]; then WS="$ARMD/bsp/ws"; else WS=/home/lavrinovich/sdboot/ws; fi
+fi
+[ -d "$WS/ebaz" ] || { echo "no BSP workspace at $WS - run bsp/make_bsp.sh first"; exit 1; }
 BSP=$WS/ebaz/ps7_cortexa9_0/standalone_domain/bsp/ps7_cortexa9_0
 BSP1=$WS/ebaz/ps7_cortexa9_1/ps7_cortexa9_1/bsp/ps7_cortexa9_1                 # v233: тут лежит собранный lwIP 2.1.3
 LW=$BSP1/libsrc/lwip213_v1_0/src
 LWINC="-I$BSP1/include -I$BSP1/include/lwip -I$LW/lwip-2.1.3/src/include -I$LW/contrib/ports/xilinx/include"
 XF=$BSP/libsrc/xilffs_v5_0/src
-ARMD="$(cd "$(dirname "$0")" && pwd)"
 SRC="${SRC:-$ARMD/loader_main.c}"
 TP="$ARMD/../../../third_party"
 APPDIR="${APPDIR:-$WS/loader}"
+echo "=== BSP workspace: $WS"
+mkdir -p "$APPDIR/src" "$APPDIR/Debug/src"
+[ -f "$APPDIR/Debug/Xilinx.spec" ] || cp -f "$ARMD/bsp/Xilinx.spec" "$APPDIR/Debug/Xilinx.spec"
 
 cp -f "$SRC" "$APPDIR/src/main.c"
 # General Sound: ядро на ARM + вендоренный эмулятор Z80 (z80emu, "do whatever you want with it")
@@ -87,5 +93,5 @@ arm-none-eabi-gcc -mcpu=cortex-a9 -mfpu=vfpv3 -mfloat-abi=hard \
   -Wl,--start-group,-lxil,-llwip4,-lgcc,-lc,-lm,--end-group
 
 ls -la loader.elf
-echo "BUILD_OK - copy loader.elf into the repo: cp loader.elf <repo>/research/12-snapshot-loader/arm/loader.elf"
+echo "BUILD_OK"
 cp -f "$APPDIR/Debug/loader.elf" "$ARMD/loader.elf"   # auto-copy into the repo (kills the stale-elf trap)

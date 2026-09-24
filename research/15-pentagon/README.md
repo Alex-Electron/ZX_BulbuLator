@@ -291,13 +291,20 @@ The AXI control plane grows the true-colour OSD and tape-station registers; the 
 
 ## Build, flash, run
 
-**Build the bitstream.** `./build.sh` → `sources/build/bulbulator_zx_loader.bit`. This step adds the DDR colour-OSD reader (`osd_ddr_rd`), the compositor changes, and the tape station (`tape_player.v`) to the fabric. `assemble.sh` also overlays our PS/2 watchdog-resync patch (`third_party/atlas-zx-ps2-watchdog/ps2.v`) onto the fetched Atlas core, so a clean clone rebuilds the exact bitstream that runs on the board.
+The prebuilt files are in [`bitstreams/`](bitstreams/); where they go on the card is in the main
+[README](../../README.md#try-it). To build everything yourself and put it on the board, follow
+[`BUILDING.md`](BUILDING.md), checked end to end on a clean clone. In short, from the repository root:
 
-**Build the ARM app.** `cd arm && ./build_loader.sh` → `loader.elf`. It builds against a Vitis BSP workspace, links FatFs (xilffs), the SD driver (`xsdps`), AYUMI, minimp3, and the speexdsp resampler, and uses the custom `lscript.ld` that enables D-cache and reserves the non-cacheable DDR window for the canvas.
+```sh
+./get_deps.sh                                              # third-party cores, pinned commits
+research/15-pentagon/build.sh                              # ZX core -> sources/build/bulbulator_zx_loader.bit
+research/15-pentagon/flash/bit2bin.sh <core.bit>           # .bit.bin for 0:/CORES/
+research/15-pentagon/arm/bsp/make_bsp.sh                   # Vitis platform + BSPs (once)
+research/15-pentagon/arm/build_loader.sh                   # ARM shell -> arm/loader.elf
+research/15-pentagon/flash/mkboot_zx.sh <core.bit> BOOT.BIN
+```
 
-**Flash over JTAG and run.** The flash script PCAP-configures the bitstream (converting it to a `.bit.bin` via `bootgen`, as in Steps 6–13), then loads and runs `arm/loader.elf` on Cortex-A9 #0. The fabric version at register `0x00` should read `0xB01B0017`.
-
-**Boot from SD (no host, no JTAG).** Package the FSBL, the bitstream, and the loader app into `BOOT.BIN` with `flash/build_boot.sh`, copy it to the card's FAT boot partition, strap for SD boot, and power on.
+The ZX core and the firmware built this way are identical, byte for byte, to the published ones.
 
 ## Files
 
@@ -305,7 +312,7 @@ The AXI control plane grows the true-colour OSD and tape-station registers; the 
 sources/osd_ddr_rd.v               DDR->HDMI true-colour OSD reader (AXI-HP1)
 sources/osd_compositor.v           per-pixel alpha compositor + independent banner (transparent PAUSE)
 sources/tape_player.v              machine-agnostic PULSE tape replay (T-state lock-step, FIFO drain-on-stop)
-sources/bulbulator_zx_ddr_top.v    top level: colour OSD + tape station wired in (VERSION 0xB01B0195)
+sources/bulbulator_zx_ddr_top.v    top level: shell + machine wiring (VERSION 0xB01B0196)
 sources/axi_ctl.v                  control plane: DDR-OSD, tape, machine and video registers
 arm/loader_main.c                  the ZX-BulboNavigator (browser, dialogs, menus, tape station, options)
 arm/player.c                       universal music player (AY/PCM, mux, non-blocking ring)
@@ -313,7 +320,8 @@ arm/mp3dec.c                       shared MP3 source (music + tape), with whole-
 arm/vga866.h                       CP866 VGA 8x16 font (ASCII + box-drawing + Cyrillic)
 arm/lscript.ld                     linker script: D-cache + non-cacheable DDR canvas window
 arm/loader.elf                     prebuilt ARM app (firmware tag v0.15.444)
-bulbulator_zx_loader.bit           prebuilt bitstream (0xB01B0195)
+BUILDING.md                        how to build everything from source and put it on the board
+bitstreams/                        prebuilt cores and the boot image
 arm/tv_ui.c                        declarative Turbo Vision / DOS Navigator window framework
 arm/gs_arm.c                       General Sound: secondary Z80 card service
 arm/divmmc_card.c                  DivMMC / esxDOS card and folder mode
@@ -326,7 +334,12 @@ docs/NAVIGATOR.ru.md               shell: full feature description
 docs/MACHINES.ru.md                machines: every fix with its evidence
 docs/EMULATION.ru.md               what the emulation can do today
 docs/ISSUES_AUDIT.ru.md            tracker vs. code
-flash/BOOT.BIN                     ready SD image (FSBL + bitstream + loader app)
+flash/mkboot_zx.sh                 boot image: FSBL + bitstream + firmware -> BOOT.BIN
+flash/bit2bin.sh                   .bit -> .bit.bin for 0:/CORES/
+flash/fsbl.bin                     first-stage boot loader (same as Step 14)
+tools/put_retry.tcl                safe file upload to the card over JTAG
+tools/card_ls.tcl                  card directory listing over JTAG (size check)
+tools/card_mv.tcl                  rename on the card over JTAG
 ```
 
 ## Credits

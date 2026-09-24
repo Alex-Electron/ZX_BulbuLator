@@ -17,9 +17,8 @@ If you've enjoyed the project, it would be really nice of you to buy me a cup of
 
 A hardware ZX Spectrum emulator on a Xilinx Zynq SoC: bring up an open ZX Spectrum
 core on the cheap, easy-to-find EBAZ4205 board, reworking it for the Xilinx
-architecture along the way. The published build runs on the open **Atlas `zx`**
-core; the MiSTer 48K core sits beside it as a separate bitstream — a cross-check backend for the
-48K machine, not a machine Atlas is missing.
+architecture along the way. All three Spectrum machines run on the open **Atlas `zx`**
+core, reworked here; that is the core this project brings to perfection.
 
 ![EBAZ4205 board wired to the HDMI/audio and buttons expansion shield](docs/images/board.jpg)
 
@@ -47,6 +46,56 @@ reached over AXI — which takes a lot of timing and routing pain off the table.
 
 This repo is a working notebook and an idea record. It fills up as things get
 checked on real hardware.
+
+## Try it
+
+You don't need to build anything to try it: the files are prebuilt in
+[`research/15-pentagon/bitstreams/`](research/15-pentagon/bitstreams/). If you want to build it yourself,
+the full instructions are in [`research/15-pentagon/BUILDING.md`](research/15-pentagon/BUILDING.md).
+
+**Hardware.**
+
+- An EBAZ4205 with the Zynq-7010, switched to boot from the microSD card. That takes one resistor, R2577.
+  [Step 0](research/00-setup/) shows where it is and how to power the board (5 V or 12 V).
+- HDMI and a PS/2 keyboard. The board has neither connector, so both are wired to FPGA pins; on mine they
+  sit on a home-made shield. The pin map is in
+  [`bulbulator_ddr.xdc`](research/15-pentagon/sources/bulbulator_ddr.xdc): HDMI TMDS on F19/F20 (clock),
+  D19/D20, C20/B20 and B19/A20, PS/2 clock on G19 and data on H20. Sound goes out over HDMI.
+- A microSD card formatted as FAT32.
+
+**The card.** Only `BOOT.BIN` is required: without anything else the board boots with the ROM built into
+the bitstream. The other files add machines and devices. Paths on the left are relative to
+`research/15-pentagon/`.
+
+| From the repo | To the card | What it is |
+|---|---|---|
+| `bitstreams/BOOT_B0196_v0.15.444.BIN` | `BOOT.BIN` | boot image: first-stage loader, ZX core and the shell firmware |
+| `bitstreams/ATLAS_B0196.bit.bin` | `CORES/ATLAS.BIT.BIN` | the ZX core; the shell reloads it from here when you switch machines |
+| `bitstreams/NES_CE29.bit.bin` | `CORES/NES.BIT.BIN` | NES / Dendy |
+| `roms/*.ROM` | `ROMS/` | ROM sets, picked per machine with `ROM SET` |
+| `roms/GS105B.ROM` | `GS/GS105B.ROM` | General Sound firmware |
+| `roms/ESXMMC.ROM` | `ROMS/ESXMMC.ROM` | the DivMMC ROM; esxDOS also wants its own `SYS` and `BIN` folders from [esxdos.org](http://www.esxdos.org/) on the DivMMC card (the `DIVMMC/` folder or `DIVMMC.IMG`) |
+
+Games, demos, disk images and music can go anywhere on the card. The full layout is in
+[`docs/SDCARD.ru.md`](research/15-pentagon/docs/SDCARD.ru.md).
+
+**First start.** Put the card in and power the board. The ZX Spectrum 128 comes up with the navigator
+open over it. Pick a `.tap`, `.tzx`, `.z80`, `.sna`, `.trd`, `.scl` or a music file and press Enter.
+
+| Key | What it does |
+|---|---|
+| `F12` | hide or show the navigator |
+| `F9` | menu bar: machine, ROM, disks, display, tape, sound |
+| `Enter` | open a folder, load a program, play music |
+| `F5` / `F6` / `F7` / `F8` | copy / rename or move / make a folder / delete |
+| `F10` | pause the machine |
+| `F11` | hard reset, clears the RAM |
+| `Ctrl+Alt+Del` | soft reset, keeps the RAM |
+| `Ctrl+Alt+Ins` | NMI |
+| `Num +` / `Num -` | volume |
+| `Esc` | back or close |
+
+Settings apply at once, but they reach the card only when you pick **Save config** in the menu.
 
 ## Target board
 
@@ -81,9 +130,8 @@ of first. The build still targets the 7010 everyone has.
 
 ### Working on the board today
 
-**Machines.** ZX Spectrum 48K, 128K and Pentagon 1024 on one core; a MiSTer 48K backend as a separate
-cross-check bitstream; NES/Dendy as a second platform on its own core. The two Sinclair machines are
-measured rather than eyeballed — their timing suites pass in full. Pentagon's paging, ROM sets, disk
+**Machines.** ZX Spectrum 48K, 128K and Pentagon 128–1024K on one core; NES/Dendy as a second platform on its own core. The two Sinclair machines are
+measured rather than eyeballed — their timing suites pass in full (the 48K one with NEMO-IDE switched off, as on a real 48K: the card decodes ports loosely and answers the very ports the test probes). Pentagon's paging, ROM sets, disk
 and its fine two-pixel border are all working and checked against reference screens, but its timing
 acceptance has not been run yet.
 
@@ -100,7 +148,7 @@ Z-Controller. Disk images can be browsed from the navigator.
 numeric-keypad mode for software that is mouse-only), and per-machine joystick mapping with a
 button-capture wizard.
 
-**Tape.** `.tap`, `.tzx`, `.wav` and `.mp3`, with instant loading through a ROM trap and warp up to 8×.
+**Tape.** `.tap`, `.tzx`, `.wav` and `.mp3`. Standard blocks load instantly: SMART LOAD feeds the bytes straight into the ROM loader instead of playing the tape. Anything else plays as real pulses, at normal speed or 8×. On 128K and Pentagon, auto-start gets into loading through the 128 menu, `USR 0` or a locked 48 BASIC, whichever the program wants.
 
 **Video.** HDMI 720p50 with per-machine integer upscale, per-side crop and pan.
 
@@ -155,7 +203,7 @@ adds a machine-agnostic music player and [Step 14](research/14-color-osd/) turns
 true-colour DOS Navigator-style file manager.
 
 [**Step 15**](research/15-pentagon/) is where the platform became a *family*: one core carries
-**ZX Spectrum 48K, 128K and Pentagon 1024**, and the two Sinclair machines were measured against the
+**ZX Spectrum 48K, 128K and Pentagon 128–1024K**, and the two Sinclair machines were measured against the
 real thing rather than eyeballed. Timing Tests pass in full on 48K (port tests included) and on 128K;
 the Z80 passes `z80full`, `z80ccf` and `z80memptr`; contention, border timing and the interrupt
 position match the hardware. Pentagon's timing acceptance is still to be run. Storage grew up — TR-DOS reads *and writes*, NEMO-IDE reads `.hdf` byte for byte, DivMMC /
@@ -283,7 +331,7 @@ So far:
   `bulbulator.ini`.
 
 - **[Step 15 — the Spectrum machine family, measured against the real thing](research/15-pentagon/).**
-  One core carries ZX Spectrum 48K, 128K and Pentagon 1024; NES/Dendy runs as a separate core. The point
+  One core carries ZX Spectrum 48K, 128K and Pentagon 128–1024K; NES/Dendy runs as a separate core. The point
   of this step is that acceptance is by numbers: Timing Tests pass in full on 48K and 128K, the Z80
   passes `z80full` / `z80ccf` / `z80memptr`, the captured frame is 384 real pixels with 64/64 borders,
   and Pentagon's border steps by 2 pixels like the real machine. Storage (TR-DOS read **and write**,
@@ -312,9 +360,9 @@ More steps get added as I get them working.
   (`research/15-pentagon/bitstreams/`) and the ROM sets with full provenance
   (`research/15-pentagon/roms/`). Core `0xB01B0196`, firmware v0.15.440.
 
-- **2026-07-08 — Step 14: colour OSD & the ZX-BulboNavigator.** The 1-bpp strip is replaced by a true-colour 640×400 ARGB8888 DDR OSD (`osd_ddr_rd` over AXI-HP1 + a per-pixel alpha compositor), hosting a full DOS Navigator-style file manager on the idle ARM: a browser with `Ctrl+F3-6` sort, mask select, a 78×15 Copy/Move dialog (six conflict modes), rename / mkdir / recursive delete; a data-driven menu bar with options saved to `bulbulator.ini`; a machine-agnostic tape station (`.tap`/`.tzx`/`.wav`/`.mp3` with a hardware tape-head reader model, MP3/WAV-as-tape, Tape Sound, Mute-machine-on-load); the music player folded in (PSG/MP3/WAV, play modes, non-blocking pause, MP3 preload); a pause bitmask, boot-nav, and a transparent PAUSE sign. A clean clone reproduces the bitstream — the PS/2 watchdog patch is vendored in `third_party/atlas-zx-ps2-watchdog/` and overlaid at build time. (control-plane VERSION `0xB01B0017`, firmware v0.14.92).
-
 - **2026-07-10 — Step 15 starts in dedicated tree.** All new work for multi-machine support (Pentagon first) moves to `research/15-pentagon/`. Development, builds and commits for v0.15.01+ are only in the step-15 folder. 14-color-osd is frozen.
+
+- **2026-07-08 — Step 14: colour OSD & the ZX-BulboNavigator.** The 1-bpp strip is replaced by a true-colour 640×400 ARGB8888 DDR OSD (`osd_ddr_rd` over AXI-HP1 + a per-pixel alpha compositor), hosting a full DOS Navigator-style file manager on the idle ARM: a browser with `Ctrl+F3-6` sort, mask select, a 78×15 Copy/Move dialog (six conflict modes), rename / mkdir / recursive delete; a data-driven menu bar with options saved to `bulbulator.ini`; a machine-agnostic tape station (`.tap`/`.tzx`/`.wav`/`.mp3` with a hardware tape-head reader model, MP3/WAV-as-tape, Tape Sound, Mute-machine-on-load); the music player folded in (PSG/MP3/WAV, play modes, non-blocking pause, MP3 preload); a pause bitmask, boot-nav, and a transparent PAUSE sign. A clean clone reproduces the bitstream — the PS/2 watchdog patch is vendored in `third_party/atlas-zx-ps2-watchdog/` and overlaid at build time. (control-plane VERSION `0xB01B0017`, firmware v0.14.92).
 
 - **2026-06-30 — Step 13: Universal ARM music player.** A machine-agnostic music player built into the ARM control plane. Press **Enter** on a `.psg` file in the F5 browser to play it over HDMI, while the ZX Spectrum core runs in the background. Uses the AYUMI soft-synth library. Requires D-Cache (enabled via custom `lscript.ld` for the Cortex-A9) for real-time 47996 Hz playback without audio underruns. Audio is pushed via AXI to a new hardware FIFO in the PL, replacing the fabric audio when active. (control-plane VERSION `0xB01B000B`).
 

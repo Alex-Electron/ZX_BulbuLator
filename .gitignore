@@ -44,6 +44,10 @@ zxinj/zxinj.elf
 *.dcp
 *.xpr
 *.xsa
+# Step 15: the hardware handoff the ARM BSP is generated from is published on purpose
+!research/15-pentagon/arm/bsp/ebaz4205_ps7.xsa
+# Generated Vitis workspace (research/15-pentagon/arm/bsp/make_bsp.sh output)
+research/15-pentagon/arm/bsp/ws/
 xsim.dir/
 webtalk*.jou
 webtalk*.log

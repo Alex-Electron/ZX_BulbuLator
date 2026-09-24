@@ -288,13 +288,20 @@ MiSTer-48 и NES/Денди. Оболочка над ними машино-не�
 
 ## Сборка, прошивка, запуск
 
-**Собери битстрим.** `./build.sh` → `sources/build/bulbulator_zx_loader.bit`. На этом шаге в фабрику добавляются DDR-считыватель цветного OSD (`osd_ddr_rd`), правки композитора и кассетная станция (`tape_player.v`). А ещё `assemble.sh` накладывает наш патч watchdog-ресинка PS/2 (`third_party/atlas-zx-ps2-watchdog/ps2.v`) поверх скачанного ядра Atlas — так чистый клон пересобирает ровно тот битстрим, что стоит на плате.
+Готовые файлы лежат в [`bitstreams/`](bitstreams/); куда их класть на карту, написано в главном
+[README](../../README.ru.md#как-попробовать). Чтобы собрать всё самостоятельно и поставить на плату, следуй инструкции
+[`BUILDING.ru.md`](BUILDING.ru.md), проверенной целиком на чистом клоне. Вкратце, из корня репозитория:
 
-**Скомпилируй приложение для ARM.** `cd arm && ./build_loader.sh` → `loader.elf`. Оно компилируется с использованием рабочей области Vitis BSP, подключает FatFs (xilffs), драйвер SD (`xsdps`), AYUMI, minimp3 и ресемплер speexdsp, а также использует настраиваемый файл `lscript.ld`, который включает D-кеш и резервирует некешируемое окно DDR для холста.
+```sh
+./get_deps.sh                                              # third-party cores, pinned commits
+research/15-pentagon/build.sh                              # ZX core -> sources/build/bulbulator_zx_loader.bit
+research/15-pentagon/flash/bit2bin.sh <core.bit>           # .bit.bin for 0:/CORES/
+research/15-pentagon/arm/bsp/make_bsp.sh                   # Vitis platform + BSPs (once)
+research/15-pentagon/arm/build_loader.sh                   # ARM shell -> arm/loader.elf
+research/15-pentagon/flash/mkboot_zx.sh <core.bit> BOOT.BIN
+```
 
-**Прошивка по JTAG и запуск.** Скрипт прошивки конфигурирует битстрим через PCAP (преобразуя его в `.bit.bin` через `bootgen`, как в шагах 6–13), затем загружает и запускает `arm/loader.elf` на Cortex-A9 №0. Версия фабрики в регистре `0x00` должна читаться как `0xB01B0017`.
-
-**Загрузка с SD (без хоста, без JTAG).** Скомпилируй FSBL, битстрим и загрузчик в файл `BOOT.BIN` с помощью `flash/build_boot.sh`, скопируй его в загрузочный раздел FAT карты, подключи для загрузки с SD и включи питание.
+Ядро ZX и прошивка, собранные таким образом, совпадают с опубликованными байт в байт.
 
 ## Файлы
 
@@ -302,7 +309,7 @@ MiSTer-48 и NES/Денди. Оболочка над ними машино-не�
 sources/osd_ddr_rd.v               DDR->HDMI true-colour OSD reader (AXI-HP1)
 sources/osd_compositor.v           per-pixel alpha compositor + independent banner (transparent PAUSE)
 sources/tape_player.v              machine-agnostic PULSE tape replay (T-state lock-step, FIFO drain-on-stop)
-sources/bulbulator_zx_ddr_top.v    top level: colour OSD + tape station wired in (VERSION 0xB01B0195)
+sources/bulbulator_zx_ddr_top.v    top level: shell + machine wiring (VERSION 0xB01B0196)
 sources/axi_ctl.v                  control plane: DDR-OSD, tape, machine and video registers
 arm/loader_main.c                  the ZX-BulboNavigator (browser, dialogs, menus, tape station, options)
 arm/player.c                       universal music player (AY/PCM, mux, non-blocking ring)
@@ -310,7 +317,8 @@ arm/mp3dec.c                       shared MP3 source (music + tape), with whole-
 arm/vga866.h                       CP866 VGA 8x16 font (ASCII + box-drawing + Cyrillic)
 arm/lscript.ld                     linker script: D-cache + non-cacheable DDR canvas window
 arm/loader.elf                     prebuilt ARM app (firmware tag v0.15.444)
-bulbulator_zx_loader.bit           prebuilt bitstream (0xB01B0195)
+BUILDING.md                        how to build everything from source and put it on the board
+bitstreams/                        prebuilt cores and the boot image
 arm/tv_ui.c                        declarative Turbo Vision / DOS Navigator window framework
 arm/gs_arm.c                       General Sound: secondary Z80 card service
 arm/divmmc_card.c                  DivMMC / esxDOS card and folder mode
@@ -323,7 +331,12 @@ docs/NAVIGATOR.ru.md               shell: full feature description
 docs/MACHINES.ru.md                machines: every fix with its evidence
 docs/EMULATION.ru.md               what the emulation can do today
 docs/ISSUES_AUDIT.ru.md            tracker vs. code
-flash/BOOT.BIN                     ready SD image (FSBL + bitstream + loader app)
+flash/mkboot_zx.sh                 boot image: FSBL + bitstream + firmware -> BOOT.BIN
+flash/bit2bin.sh                   .bit -> .bit.bin for 0:/CORES/
+flash/fsbl.bin                     first-stage boot loader (same as Step 14)
+tools/put_retry.tcl                safe file upload to the card over JTAG
+tools/card_ls.tcl                  card directory listing over JTAG (size check)
+tools/card_mv.tcl                  rename on the card over JTAG
 ```
 
 ## Благодарности

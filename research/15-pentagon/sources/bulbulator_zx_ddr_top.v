@@ -480,7 +480,7 @@ module bulbulator_zx_ddr_top
                                                     // под ifndef, ветвь снова синтезируется.
                                                     // Прежде здесь стоял B005B и не поднимался.
 `elsif MISTER48_CORE
-    localparam [31:0] BUILD_VERSION = 32'hB01B0150; // MiSTer-48, сборка 20.08. Прежде здесь стоял
+    localparam [31:0] BUILD_VERSION = 32'hB01B0197; // MiSTer-48, сборка 24.09 (B0197: ula_tune2 под ifndef). До неё: B0150, сборка 20.08. Прежде здесь стоял
                                                     // B0059: ядро пересобиралось, а НОМЕР нет, и
                                                     // машина рапортовала шестидесятой сборкой -
                                                     // владелец это и увидел. Каждая ветвь держит
@@ -1684,7 +1684,14 @@ module bulbulator_zx_ddr_top
 `endif
         .ula_late(ula_late_sp),
         .ula_tune(pint_active),        // B0053: PENT_INT is free on native48 and becomes a frame-atomic JTAG timing tuner
+`ifndef MISTER48_CORE
+`ifndef HYBRID_CORE
         .ula_tune2(t2_active),         // B0180: ОЖИВЛЁН - раньше вход висел и все ручки на нём были мертвы НА ПЛАТЕ
+`endif
+`endif
+/*      ↑ B0197: под ifndef, как связи карты в B0148. У mister48_core и hybrid_zx_core порта ula_tune2 нет, и
+        обе ветви снова перестали синтезироваться с B0180 - нашла это проверка «чистый клон -> сборка всех
+        ядер» при подготовке инструкций, потому что собирали по-прежнему только Atlas. */
         .pent_int_v(pint_active[24:16]),
         .pent_int_h(pint_active[8:0]),
         .paper_h(paper_h_sp),

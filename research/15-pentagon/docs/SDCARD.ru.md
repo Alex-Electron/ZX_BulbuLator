@@ -24,7 +24,7 @@
 │
 ├── CORES/                            ядра машин, по одному файлу на ядро
 │   ├── ATLAS.BIT.BIN                 ZX: 48K, 128K и Пентагон 1024 — все три на одном ядре
-│   ├── MISTER48.BIT.BIN              сверочная нога MiSTer-48
+│   ├── MISTER48.BIT.BIN              необязательно: ядро MiSTer-48, проектом не развивается
 │   └── NES.BIT.BIN                   NES / Денди
 │
 ├── ROMS/                             наборы ПЗУ машины
@@ -54,7 +54,14 @@
 | `../bitstreams/BOOT_B0196_v0.15.444.BIN` | `0:/BOOT.BIN` |
 | `../bitstreams/ATLAS_B0196.bit.bin` | `0:/CORES/ATLAS.BIT.BIN` |
 | `../bitstreams/NES_CE29.bit.bin` | `0:/CORES/NES.BIT.BIN` |
-| наборы ПЗУ (в репозитории их нет, см. `../roms/README.md`) | `0:/ROMS/` |
+| `../roms/*.ROM` — наборы ПЗУ машины, происхождение в `../roms/PROVENANCE.md` | `0:/ROMS/` |
+| `../roms/GS105B.ROM` — прошивка карты General Sound | `0:/GS/GS105B.ROM` |
+| `../roms/ESXMMC.ROM` — ПЗУ DivMMC | `0:/ROMS/ESXMMC.ROM` |
+
+Самому esxDOS нужны ещё его каталоги `SYS` и `BIN` из дистрибутива с [esxdos.org](http://www.esxdos.org/): они
+кладутся на карту DivMMC, то есть в `0:/DIVMMC/` (режим «папка») или внутрь `0:/DIVMMC.IMG` (режим «образ»).
+
+Собрать всё это самому из исходников — [`../BUILDING.md`](../BUILDING.md).
 
 ## 🥇 Обновляя ядро ZX, меняй ОБА файла
 
