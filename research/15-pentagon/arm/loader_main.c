@@ -1233,7 +1233,7 @@ static void browser_status(const char* s){   /* transient feedback (MOUNT/READ/F
 /* Title screen (shown when the OSD opens with F12): just the name, centred, scale 2. */
 /* Firmware build tag shown on the F12 splash (bump per milestone). The PL core VERSION
    (0x4000_0000) is shown live too, so the splash states exactly which firmware + bitstream run. */
-#define BULB_FW "v0.15.445"
+#define BULB_FW "v0.15.446"
 static char hexnib(uint32_t v){ return (v<10) ? ('0'+v) : ('A'+v-10); }
 /* Single source of truth for the version line ("v0.13 core 0xB01B0013"): the ARM firmware tag
    BULB_FW + the live PL core VERSION read from register 0x00. Used by BOTH the F12 splash
@@ -1927,7 +1927,8 @@ static const char* const CH_FASTLOAD[] = {"NORMAL","FAST 8x"};   /* v0.15.443 (�
    1 = USR 0: 48 BASIC с НЕЗАПЕРТОЙ страничностью (#7FFD=#10), ровно как классический USR 0. 128K-память и AY
        остаются доступны. Брать для 128K-демок, которые требуют LOAD "" из 48 BASIC.
    2 = 48 LOCK: как пункт «48 BASIC» меню настоящего 128K (#7FFD=#30, страничность заперта). Брать для 48K-программ,
-       которые случайно пишут в #7FFD и на незапертой машине сами себе переключают память.
+       которые случайно пишут в #7FFD и на незапертой машине сами себе переключают память. На Пентагоне замок
+       включается как у настоящей машины: сначала стандартный режим (#EFF7 бит2), потом #7FFD (v0.15.446).
    Вход делается инжектом PC=0 при нужном #7FFD, а не навигацией по меню ПЗУ: у пентагоновских BIOS меню у всех
    разные, а страница 48 BASIC у нас всегда в слоте 1 (прошивка раскладывает наборы по содержимому).
    На машине 48K опция ни на что не влияет. */
@@ -5754,6 +5755,22 @@ static void zx_tape_autostart(void){
     if(via48){                              /* v443: 128K/Пентагон -> прямо в 48 BASIC (USR 0 / 48 LOCK), см. CH_TAPE128 */
         zregs z = {0};                      /* PC=0, DI, IM 0: ПЗУ 48 BASIC само делает полный старт */
         z.p7ffd = (opt_tape128 == 2) ? 0x30u : 0x10u;   /* бит4 = страница 48 BASIC; бит5 = запереть страничность */
+        if(opt_tape128 == 2 && opt_defmachine == 1){
+            /* 🥇 v0.15.446 «48 LOCK» НА ПЕНТАГОНЕ. У Пентагона 1024 бит 5 #7FFD запирает страничность ТОЛЬКО в
+               стандартном режиме (#EFF7 бит2 = 1); после сброса #EFF7 = 0, машина в режиме 1024, и бит 5 там -
+               старший бит номера банка. Значит одной записи #7FFD=#30 мало: замок не срабатывал вовсе (v443..445).
+               Как у настоящей машины: сначала стандартный режим, потом замок. #EFF7 инжектом не записать,
+               поэтому кладём в буфер принтера (#5B00, банк 5) программу из 17 байт и стартуем с неё:
+                 LD BC,#EFF7 : LD A,4 : OUT (C),A : LD BC,#7FFD : LD A,#30 : OUT (C),A : JP 0
+               ПЗУ 48 BASIC после JP 0 делает обычный холодный старт и затирает буфер. */
+            static const uint8_t lock_stub[17] = { 0x01,0xF7,0xEF, 0x3E,0x04, 0xED,0x79,
+                                                   0x01,0xFD,0x7F, 0x3E,0x30, 0xED,0x79, 0xC3,0x00,0x00 };
+            IJ_RAMA = (5u << 14) + 0x1B00u;
+            for(int i = 0; i < 17; i++){ IJ_RAMD = lock_stub[i];
+                for(volatile uint32_t t=0; (IJ_STAT & 0x2u) && t<1000000u; t++){} }
+            z.p7ffd = 0x10u;                 /* замок ставит сама программа, после #EFF7 */
+            z.PC    = 0x5B00u;
+        }
         inject_finish(&z);                  /* снимает HALT, поставленный machine_reset */
     }
     halt_src = 0; apply_halt();             /* drop every HALT source so the ROM actually runs to the menu */

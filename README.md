@@ -69,7 +69,7 @@ the bitstream. The other files add machines and devices. Paths on the left are r
 
 | From the repo | To the card | What it is |
 |---|---|---|
-| `bitstreams/BOOT_B0198_v0.15.445.BIN` | `BOOT.BIN` | boot image: first-stage loader, ZX core and the shell firmware |
+| `bitstreams/BOOT_B0198_v0.15.446.BIN` | `BOOT.BIN` | boot image: first-stage loader, ZX core and the shell firmware |
 | `bitstreams/ATLAS_B0198.bit.bin` | `CORES/ATLAS.BIT.BIN` | the ZX core; the shell reloads it from here when you switch machines |
 | `bitstreams/NES_CE29.bit.bin` | `CORES/NES.BIT.BIN` | NES / Dendy |
 | `roms/*.ROM` | `ROMS/` | ROM sets, picked per machine with `ROM SET` |
@@ -346,6 +346,8 @@ So far:
 More steps get added as I get them working.
 
 ## Changelog
+- **2026-09-24 — firmware v0.15.446.** *Load via (128K) = 48 LOCK* now really locks paging on the Pentagon. On a Pentagon 1024, bit 5 of `#7FFD` is a lock only in the standard 128K mode (`#EFF7` bit 2); after reset the machine is in 1024 mode, where the same bit selects a memory bank. Auto-start now switches to standard mode first and then locks, as the real machine does.
+
 - **2026-09-24 — Step 15: frame blend, core B0198, firmware v0.15.445.** Demos that flip between the two screens every frame (the rotating shadow in Eklhaft SP2, gigascreen pictures) blend into a steady image on a CRT but flicker at 25 Hz on an LCD. *Display → Frame blend* now shows the average of the machine's last two frames on HDMI: OFF, AUTO (the default: on only while the machine flips screens almost every frame, so games and loading stripes stay sharp) or ON. The frame buffer grew from three to five, so the pair is always two consecutive machine frames, even when the 50.02 Hz machine gets a frame ahead of the 50.00 Hz HDMI. The machine and its timing are untouched: with blending off the output is pixel for pixel what it was, and Timing Tests pass 3/3 on 48K and 68/68 on 128K.
 
 - **2026-09-23 — Step 15, firmware v0.15.444.** Switching machines in the menu now applies the new machine's own NEMO-IDE, General Sound and mouse settings. Before, they stayed as the previous machine had left them: 48K, 128K and Pentagon share one core, the switch doesn't reload the FPGA, and those three devices keep their own registers. The same hunt explained the Timing Tests 48K failures in tests 35-37. The 48K machine had NEMO-IDE switched on, and like the original card it decodes ports loosely (A1 = A2 = 0 is enough), so it answers a quarter of all ports, exactly the ones those tests read the floating bus through. With it off, the test passes three runs out of three. Tape speed is now NORMAL or FAST 8x; the 4x mode is gone, since everything loads at 8x. A new *Load via (128K)* option picks how auto-start gets into loading on 128K and Pentagon: the 128 menu, `USR 0` (48 BASIC with paging left open, for 128K demos that insist on `LOAD ""` from 48 BASIC) or a locked 48 BASIC. The copy dialog moves focus to OK once you pick a folder in the tree, and the menu calls the Pentagon just *PENTAGON*, because its memory size is a setting.

@@ -2,7 +2,7 @@
 
 Языки: [English](README.md) · **Русский**
 
-Боевое состояние: ядро **B0198**, прошивка **v0.15.445**. Всё, что ниже, проверено на живой плате.
+Боевое состояние: ядро **B0198**, прошивка **v0.15.446**. Всё, что ниже, проверено на живой плате.
 
 ![ZX-BulboNavigator: файловый менеджер с полноцветным интерфейсом в стиле DOS Navigator, работающий на управляющей плоскости ARM поверх живого экрана Spectrum](../14-color-osd/images/navigator-step14.jpg)
 
@@ -316,7 +316,7 @@ arm/player.c                       universal music player (AY/PCM, mux, non-bloc
 arm/mp3dec.c                       shared MP3 source (music + tape), with whole-file RAM preload
 arm/vga866.h                       CP866 VGA 8x16 font (ASCII + box-drawing + Cyrillic)
 arm/lscript.ld                     linker script: D-cache + non-cacheable DDR canvas window
-arm/loader.elf                     prebuilt ARM app (firmware tag v0.15.445)
+arm/loader.elf                     prebuilt ARM app (firmware tag v0.15.446)
 BUILDING.md                        how to build everything from source and put it on the board
 bitstreams/                        prebuilt cores and the boot image
 arm/tv_ui.c                        declarative Turbo Vision / DOS Navigator window framework
