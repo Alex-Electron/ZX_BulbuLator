@@ -60,6 +60,7 @@ module bulbulator_nes_top (
         // machine video (nesclk domain)
         .cap_clk_i(nesclk), .cap_rstn_i(por_n), .cap_ce_i(vid_wr_ce),
         .cap_hsync_i(vid_hsync), .cap_vsync_i(vid_vsync), .cap_blank_i(vid_blank),
+        .scr_sel_i(1'b0),                 // B0198: второго экрана у NES нет - AUTO смешение не срабатывает
         .cap_r_i(vid_r), .cap_g_i(vid_g), .cap_b_i(vid_b), .cap_i_i(vid_i),
         .cap_pix8_i(vid_pix8),
         // machine audio (pre-volume mix computed below)

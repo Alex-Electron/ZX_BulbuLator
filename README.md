@@ -69,8 +69,8 @@ the bitstream. The other files add machines and devices. Paths on the left are r
 
 | From the repo | To the card | What it is |
 |---|---|---|
-| `bitstreams/BOOT_B0196_v0.15.444.BIN` | `BOOT.BIN` | boot image: first-stage loader, ZX core and the shell firmware |
-| `bitstreams/ATLAS_B0196.bit.bin` | `CORES/ATLAS.BIT.BIN` | the ZX core; the shell reloads it from here when you switch machines |
+| `bitstreams/BOOT_B0198_v0.15.445.BIN` | `BOOT.BIN` | boot image: first-stage loader, ZX core and the shell firmware |
+| `bitstreams/ATLAS_B0198.bit.bin` | `CORES/ATLAS.BIT.BIN` | the ZX core; the shell reloads it from here when you switch machines |
 | `bitstreams/NES_CE29.bit.bin` | `CORES/NES.BIT.BIN` | NES / Dendy |
 | `roms/*.ROM` | `ROMS/` | ROM sets, picked per machine with `ROM SET` |
 | `roms/GS105B.ROM` | `GS/GS105B.ROM` | General Sound firmware |
@@ -148,9 +148,9 @@ Z-Controller. Disk images can be browsed from the navigator.
 numeric-keypad mode for software that is mouse-only), and per-machine joystick mapping with a
 button-capture wizard.
 
-**Tape.** `.tap`, `.tzx`, `.wav` and `.mp3`. Standard blocks load instantly: SMART LOAD feeds the bytes straight into the ROM loader instead of playing the tape. Anything else plays as real pulses, at normal speed or 8×. On 128K and Pentagon, auto-start gets into loading through the 128 menu, `USR 0` or a locked 48 BASIC, whichever the program wants.
+**Tape.** `.tap`, `.tzx`, `.wav` and `.mp3`. A standard 48K tape loads instantly: SMART LOAD doesn't play it at all, but reads the BASIC loader and CODE blocks from the file, builds the memory image and starts it like a snapshot. Anything else (turbo, custom loaders, 128K programs) plays as real pulses, at normal speed or 8×. On 128K and Pentagon, auto-start gets into loading through the 128 menu, `USR 0` or a locked 48 BASIC, whichever the program wants.
 
-**Video.** HDMI 720p50 with per-machine integer upscale, per-side crop and pan.
+**Video.** HDMI 720p50 with per-machine integer upscale, per-side crop and pan, and optional CRT-style frame blending for demos that flip screens every frame.
 
 ### Planned
 
@@ -346,6 +346,8 @@ So far:
 More steps get added as I get them working.
 
 ## Changelog
+- **2026-09-24 — Step 15: frame blend, core B0198, firmware v0.15.445.** Demos that flip between the two screens every frame (the rotating shadow in Eklhaft SP2, gigascreen pictures) blend into a steady image on a CRT but flicker at 25 Hz on an LCD. *Display → Frame blend* now shows the average of the machine's last two frames on HDMI: OFF, AUTO (the default: on only while the machine flips screens almost every frame, so games and loading stripes stay sharp) or ON. The frame buffer grew from three to five, so the pair is always two consecutive machine frames, even when the 50.02 Hz machine gets a frame ahead of the 50.00 Hz HDMI. The machine and its timing are untouched: with blending off the output is pixel for pixel what it was, and Timing Tests pass 3/3 on 48K and 68/68 on 128K.
+
 - **2026-09-23 — Step 15, firmware v0.15.444.** Switching machines in the menu now applies the new machine's own NEMO-IDE, General Sound and mouse settings. Before, they stayed as the previous machine had left them: 48K, 128K and Pentagon share one core, the switch doesn't reload the FPGA, and those three devices keep their own registers. The same hunt explained the Timing Tests 48K failures in tests 35-37. The 48K machine had NEMO-IDE switched on, and like the original card it decodes ports loosely (A1 = A2 = 0 is enough), so it answers a quarter of all ports, exactly the ones those tests read the floating bus through. With it off, the test passes three runs out of three. Tape speed is now NORMAL or FAST 8x; the 4x mode is gone, since everything loads at 8x. A new *Load via (128K)* option picks how auto-start gets into loading on 128K and Pentagon: the 128 menu, `USR 0` (48 BASIC with paging left open, for 128K demos that insist on `LOAD ""` from 48 BASIC) or a locked 48 BASIC. The copy dialog moves focus to OK once you pick a folder in the tree, and the menu calls the Pentagon just *PENTAGON*, because its memory size is a setting.
 
 - **2026-09-18 — Step 15: the Spectrum machine family, measured against the real thing.** One core for

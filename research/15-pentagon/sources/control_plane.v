@@ -103,6 +103,7 @@ module control_plane #(
     input  wire        cap_rstn_i,     // core-domain power-on reset (por_n)
     input  wire        cap_ce_i,       // pixel clock-enable (ZX pe7M0 / NES vid_wr_ce)
     input  wire        cap_hsync_i, cap_vsync_i, cap_blank_i,
+    input  wire        scr_sel_i,          // B0198: какой экран машина показывает (ZX: 7FFD[3]); машины без второго экрана - 0
     input  wire        cap_r_i, cap_g_i, cap_b_i, cap_i_i,   // 4bpp RGBI path
     input  wire [7:0]  cap_pix8_i,                           // 8bpp palette-index path
     // ================= machine audio in (clk_audio domain) =================
@@ -625,13 +626,40 @@ module control_plane #(
     wire axi_idle_all = wr_idle & disp_idle & osd_idle & mem_idle & mach_axi_idle_i;
     assign ctl_quiesce_o = ctl_quiesce;
 
-    wire wr_done; wire [31:0] wr_base, disp_base;
-    fb_bufmgr3 ddrbuf (
+    wire wr_done; wire [31:0] wr_base, disp_base, prev_base; wire prev_ok;
+    // B0198: пять буферов вместо трёх - выводу нужна пара СОСЕДНИХ кадров машины (N, N-1) для смешения.
+    // disp_base ведёт себя ровно как у fb_bufmgr3, поэтому без смешения вывод прежний.
+    fb_bufmgr5 ddrbuf (
         .clk(fclk100), .resetn(core_resetn),
         .frame_done(wr_done), .frame_kick(frame_kick),
-        .wr_base(wr_base), .disp_base(disp_base),
-        .wr_buf_o(), .disp_buf_o(), .ready_buf_o()
+        .wr_base(wr_base), .disp_base(disp_base), .prev_base(prev_base), .prev_ok(prev_ok),
+        .wr_buf_o(), .disp_buf_o(), .prev_buf_o()
     );
+
+    /* 🥇 B0198 СМЕШЕНИЕ КАДРОВ: режим и автомат AUTO. Всё на fclk100 = домен читателя строк.
+       AUTO включает смешение, когда машина переключает экран через кадр: так рисуются тени и
+       gigascreen, которые на ЭЛТ сливаются, а на ЖК мерцают с 25 Гц. Признак один и тот же на оба
+       конца: в окне последних 8 кадров не меньше 6 переключений. Отдельных условий «включить» и
+       «выключить» нет намеренно (урок SHOCK.TAP: у латча с разными предикатами побеждает грубый). */
+    wire [1:0] ctl_blend;
+    (* ASYNC_REG="TRUE" *) reg [2:0] bsel_s = 3'd0, bvs_s = 3'd0;
+    reg        bsel_last = 1'b0;
+    reg [7:0]  bhist = 8'd0;
+    always @(posedge fclk100) begin
+        bsel_s <= {bsel_s[1:0], scr_sel_i};
+        bvs_s  <= {bvs_s[1:0],  cap_vsync_i};
+        if (bvs_s[2:1] == 2'b01) begin                  // фронт кадрового синхроимпульса машины
+            bhist     <= {bhist[6:0], (bsel_s[2] != bsel_last)};
+            bsel_last <= bsel_s[2];
+        end
+    end
+    wire [3:0] bcnt = bhist[0]+bhist[1]+bhist[2]+bhist[3]+bhist[4]+bhist[5]+bhist[6]+bhist[7];
+    reg        blend_auto = 1'b0, blend_en = 1'b0;
+    always @(posedge fclk100) begin
+        blend_auto <= (bcnt >= 4'd6);
+        blend_en   <= (ctl_blend == 2'd2) | ((ctl_blend == 2'd1) & blend_auto);
+    end
+    wire [31:0] blend_stat = {16'd0, bhist, 5'd0, blend_en, ctl_blend};
     fb_wr_axi #(.WORDS(WR_WORDS)) ddrwr (
         .clk(fclk100), .resetn(core_resetn), .base(wr_base),
         .fifo_empty(fifo_empty), .fifo_dout(fifo_dout), .fifo_rd(fifo_rd),
@@ -670,7 +698,8 @@ module control_plane #(
     ) ddrdisp (
         .pal_wclk(fclk100), .pal_we(ctl_pal_we), .pal_addr(ctl_pal_addr), .pal_rgb(ctl_pal_rgb),
         .clk(fclk100), .resetn(core_resetn),
-        .disp_base(disp_base), .frame_kick(frame_kick_d), .quiesce_i(ctl_quiesce), .idle_o(disp_idle),
+        .disp_base(disp_base), .prev_base(prev_base), .prev_ok(prev_ok), .blend_en(blend_en),   // B0198
+        .frame_kick(frame_kick_d), .quiesce_i(ctl_quiesce), .idle_o(disp_idle),
         .ar_addr(hp_araddr), .ar_id(hp_arid), .ar_len(hp_arlen), .ar_size(hp_arsize),
         .ar_burst(hp_arburst), .ar_cache(hp_arcache), .ar_prot(hp_arprot),
         .ar_lock(hp_arlock), .ar_qos(hp_arqos), .ar_valid(hp_arvalid), .ar_ready(hp_arready),
@@ -1058,6 +1087,7 @@ module control_plane #(
         .ctl_reset(ctl_reset_o),
         .ctl_kbd_inject(ctl_kbd_inject_o), .ctl_kbd_inject_we(ctl_kbd_inject_we_o), .memwr_cnt(memwr_cnt_i),
         .disp_diag({ld_stale, ld_underrun}),   // B0196: 0x1C8 приборы читателя строк
+        .ctl_blend(ctl_blend), .blend_stat(blend_stat),   // B0198: 0x1CC смешение кадров
         .ctl_kbd_tx_data(ctl_kbd_tx_data), .ctl_kbd_tx_we(ctl_kbd_tx_we),
         .kbd_tx_busy(kbd_tx_busy_aclk), .kbd_tx_ack(kbd_tx_ack_aclk), .kbd_diag(kbd_diag_i),
         .ctl_pentagon(ctl_pentagon_o), .ctl_model48(ctl_model48_o), .ctl_ula_late(ctl_ula_late_o), .ctl_force_atlas(ctl_force_atlas_o), .ctl_snow_off(ctl_snow_off_o), .ctl_pent_int(ctl_pent_int_o),

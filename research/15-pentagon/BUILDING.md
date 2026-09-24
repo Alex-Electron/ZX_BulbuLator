@@ -8,7 +8,7 @@ are in [`bitstreams/`](bitstreams/), and the main [README](../../README.md#try-i
 
 Everything here was checked by doing it: a fresh `git clone`, then these commands, on
 Ubuntu 26.04 with Vivado 2023.1. The ZX core built this way is identical, byte for byte, to
-`bitstreams/ATLAS_B0196.bit.bin`.
+`bitstreams/ATLAS_B0198.bit.bin`.
 
 ## What you need
 
@@ -133,13 +133,13 @@ Without the third argument it takes `arm/loader.elf`, the prebuilt firmware in t
 and `arm-none-eabi-objcopy`.
 
 bootgen writes the bitstream's file name into the image, so a boot image differs from
-`bitstreams/BOOT_B0196_v0.15.444.BIN` in those few bytes unless the input is named the same. Built from
+`bitstreams/BOOT_B0198_v0.15.445.BIN` in those few bytes unless the input is named the same. Built from
 the published files it matches byte for byte:
 
 ```sh
-cp research/15-pentagon/bitstreams/ATLAS_B0196.bit /tmp/B0196.bit
-research/15-pentagon/flash/mkboot_zx.sh /tmp/B0196.bit /tmp/BOOT.BIN
-cmp /tmp/BOOT.BIN research/15-pentagon/bitstreams/BOOT_B0196_v0.15.444.BIN && echo identical
+cp research/15-pentagon/bitstreams/ATLAS_B0198.bit /tmp/B0198.bit
+research/15-pentagon/flash/mkboot_zx.sh /tmp/B0198.bit /tmp/BOOT.BIN
+cmp /tmp/BOOT.BIN research/15-pentagon/bitstreams/BOOT_B0198_v0.15.445.BIN && echo identical
 ```
 
 ## 5. Put it on the board
@@ -179,5 +179,5 @@ reset, a half-finished burst gets stuck, and the picture freezes until you remov
 
 ## 6. Check what is running
 
-The navigator's top line shows the firmware and the core build, for example `v0.15.444 / b0196`.
-The same core number is readable at control-plane register `0x00` (`0xB01B0196`).
+The navigator's top line shows the firmware and the core build, for example `v0.15.445 / b0198`.
+The same core number is readable at control-plane register `0x00` (`0xB01B0198`).

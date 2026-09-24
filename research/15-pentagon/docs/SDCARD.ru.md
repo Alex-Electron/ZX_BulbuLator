@@ -51,8 +51,8 @@
 
 | Файл отсюда | Куда на карту |
 |---|---|
-| `../bitstreams/BOOT_B0196_v0.15.444.BIN` | `0:/BOOT.BIN` |
-| `../bitstreams/ATLAS_B0196.bit.bin` | `0:/CORES/ATLAS.BIT.BIN` |
+| `../bitstreams/BOOT_B0198_v0.15.445.BIN` | `0:/BOOT.BIN` |
+| `../bitstreams/ATLAS_B0198.bit.bin` | `0:/CORES/ATLAS.BIT.BIN` |
 | `../bitstreams/NES_CE29.bit.bin` | `0:/CORES/NES.BIT.BIN` |
 | `../roms/*.ROM` — наборы ПЗУ машины, происхождение в `../roms/PROVENANCE.md` | `0:/ROMS/` |
 | `../roms/GS105B.ROM` — прошивка карты General Sound | `0:/GS/GS105B.ROM` |

@@ -295,6 +295,7 @@ static inline uint32_t kbd_data_read(void){
 #define PAPER_V     (*(volatile uint32_t*)(GP0+0xCC))
 #define ULA_TUNE_REG  (*(volatile uint32_t*)(GP0+0x1C0)) /* B0157: live ULA timing lab; 0x114 is reserved for QUIESCE */
 #define ULA_TUNE2_REG (*(volatile uint32_t*)(GP0+0x1C4)) /* B0157: floating bus, memory contention and border mode */
+#define FRAME_BLEND_REG (*(volatile uint32_t*)(GP0+0x1CC)) /* B0198: W режим смешения кадров 0/1/2; R {история[15:8], активно[2], режим[1:0]}; у ядер до B0198 читается DEADBEEF */
 #define SCR_POS     (*(volatile uint32_t*)(GP0+0xD0))
 #define SCR_SCALE   (*(volatile uint32_t*)(GP0+0x118)) /* CE21: live integer upscale {ymul[7:4], xmul[3:0]} - PER MACHINE */  /* live whole-frame HDMI position: {vmargin[15:0], hmargin[15:0]} (fb_line_disp) */
 #define CROP_A      (*(volatile uint32_t*)(GP0+0xD4))  /* live crop origin: {sy0[15:0], sx0[15:0]} (trims left/top) */
@@ -1232,7 +1233,7 @@ static void browser_status(const char* s){   /* transient feedback (MOUNT/READ/F
 /* Title screen (shown when the OSD opens with F12): just the name, centred, scale 2. */
 /* Firmware build tag shown on the F12 splash (bump per milestone). The PL core VERSION
    (0x4000_0000) is shown live too, so the splash states exactly which firmware + bitstream run. */
-#define BULB_FW "v0.15.444"
+#define BULB_FW "v0.15.445"
 static char hexnib(uint32_t v){ return (v<10) ? ('0'+v) : ('A'+v-10); }
 /* Single source of truth for the version line ("v0.13 core 0xB01B0013"): the ARM firmware tag
    BULB_FW + the live PL core VERSION read from register 0x00. Used by BOTH the F12 splash
@@ -1931,6 +1932,16 @@ static const char* const CH_FASTLOAD[] = {"NORMAL","FAST 8x"};   /* v0.15.443 (�
    разные, а страница 48 BASIC у нас всегда в слоте 1 (прошивка раскладывает наборы по содержимому).
    На машине 48K опция ни на что не влияет. */
 static int opt_tape128 = 0;
+/* v0.15.445 (B0198) СМЕШЕНИЕ КАДРОВ НА ВЫВОДЕ - эмуляция послесвечения ЭЛТ (просьба владельца 24.09).
+   Демки, которые каждый кадр переключают экран 5/7 (тень в Eklhaft SP2, gigascreen), на ЭЛТ сливаются в ровную
+   картинку, а на ЖК мерцают с 25 Гц. Смешение - среднее кадров машины N и N-1, только на HDMI: машина, захват
+   и приборы (снимок кадра) его не видят, тайминги не меняются.
+   OFF  - как было, пиксель в пиксель; для сверки картинки.
+   AUTO - смешивать, только пока машина переключает экран почти каждый кадр (6 из последних 8). Игры и обычные
+          демки остаются резкими. Умолчание.
+   ON   - смешивать всегда; для демок, которые мерцают без переключения экрана (перерисовка через кадр). */
+static int opt_blend = 1;
+static const char* const CH_BLEND[] = {"OFF","AUTO","ON"};
 static const char* const CH_TAPE128[] = {"128 MENU","USR 0","48 LOCK"};   /* 0=1x real-time 1=CPU-only 8x (AUTO-ROM gated) 2=whole-core 4x. v130 UI simplification (owner 22.07); values keep their legacy meaning for ini/KVM compat */
 static const char* const CH_WAVMP3LOAD[] = {"NORMAL","FAST"};    /* v130 (owner 22.07): intent-only menu. 0=1x authentic; 1=FAST = the reliable hybrid (v129 promotion; SMART inject will make it faster transparently). Legacy ini/KVM values 2/3 are accepted and behave as FAST (cur_fmode promotes) but the menu shows 2 choices. */
 static const char* const CH_LAUNCH[]= {"MACHINE","MUSIC"};
@@ -2773,15 +2784,18 @@ static void ph_flush(void){
    FatFs из главного цикла нельзя, а здесь FatFs нет - только memcpy из DDR в DDR). */
 static void fs_frame_snapshot(void){
     const uint32_t fb0 = 0x0FF00000u, stride = 0x10000u, fsz = 384u*302u/2u;   /* 57 984 Б, 4bpp 384x302 */
+    /* v445: с B0198 буферов кадра ПЯТЬ (fb_bufmgr5). Признак - регистр 0x1CC: у новых ядер старшая половина
+       его чтения нулевая, у старых там DEADBEEF. g_fs_n = сколько буферов скопировано. */
+    const uint32_t nb = ((FRAME_BLEND_REG >> 16) == 0u) ? 5u : 3u;
     /* v0.15.436: ARM читает буферы кадра через L2, а Xil_DCacheInvalidateRange трогает только L1 - после первого
        снимка строки кадра оседали в L2 и все снимки отдавали старый кадр (esh1 при идущем SHOCK, 02.09). */
-    Xil_L2CacheInvalidateRange((INTPTR)fb0, 3u*stride);
-    Xil_DCacheInvalidateRange((INTPTR)fb0, 3u*stride);
-    for(uint32_t b = 0; b < 3u; b++)
+    Xil_L2CacheInvalidateRange((INTPTR)fb0, nb*stride);
+    Xil_DCacheInvalidateRange((INTPTR)fb0, nb*stride);
+    for(uint32_t b = 0; b < nb; b++)
         memcpy((void*)(FS_BUF_ADDR + b*stride), (const void*)(fb0 + b*stride), fsz);
-    Xil_DCacheFlushRange((INTPTR)FS_BUF_ADDR, 3u*stride);
-    Xil_L2CacheFlushRange((INTPTR)FS_BUF_ADDR, 3u*stride);
-    g_fs_n = 3u;
+    Xil_DCacheFlushRange((INTPTR)FS_BUF_ADDR, nb*stride);
+    Xil_L2CacheFlushRange((INTPTR)FS_BUF_ADDR, nb*stride);
+    g_fs_n = nb;
     g_fs_done = 1;
 }
 /* v0.15.437: при g_tape_on обслуживается ТОЛЬКО команда 14 (снимок кадра) - остальное ждёт конца ленты, как раньше. */
@@ -9324,6 +9338,7 @@ static void cfg_set(const char* k, const char* v){
     }   /* legacy global scr_x/scr_y keys are intentionally IGNORED (superseded per machine) */
     else if(!cicmp(k,"fastload")){ int d=v[0]-'0'; if(d<0)d=0; if(d>1)d=1; opt_fastload=d; }   /* v443: старое 2 (4x) = FAST 8x */
     else if(!cicmp(k,"tape128")){ int d=v[0]-'0'; if(d<0||d>2)d=0; opt_tape128=d; }                /* v443 */
+    else if(!cicmp(k,"frameblend")){ int d=v[0]-'0'; if(d<0||d>2)d=1; opt_blend=d; }               /* v445 */
     else if(!cicmp(k,"region")){ int r=v[0]-'0'; if(r>=0&&r<=2) opt_region=r; }   /* v0.15.189 регион NES */
     else if(!cicmp(k,"snow")){ opt_snow = (v[0]!='0'); }   /* v145 ULA snow (global) */
     else if(!cicmp(k,"kempston")){ opt_kj = (v[0]!='0'); }   /* B0175 интерфейс Kempston */
@@ -9658,6 +9673,7 @@ static int config_save(void){                  /* 1 = written OK, 0 = failed (ca
     { p=appstr(o,p,"tapesync="); p=appch(o,p,(char)('0'+(opt_tapesync%3))); p=appch(o,p,'\r'); p=appch(o,p,'\n'); }   /* v132: 0=AUTO 1=ON 2=OFF */
     { p=appstr(o,p,"autostart="); p=appch(o,p,opt_autostart?'1':'0'); p=appch(o,p,'\r'); p=appch(o,p,'\n'); }
     { p=appstr(o,p,"tape128="); p=appch(o,p,(char)('0'+((opt_tape128>=0&&opt_tape128<=2)?opt_tape128:0))); p=appch(o,p,'\r'); p=appch(o,p,'\n'); }   /* v443 */
+    { p=appstr(o,p,"frameblend="); p=appch(o,p,(char)('0'+((opt_blend>=0&&opt_blend<=2)?opt_blend:1))); p=appch(o,p,'\r'); p=appch(o,p,'\n'); }   /* v445 */
     { p=appstr(o,p,"romtrap="); p=appch(o,p,opt_romtrap?'1':'0'); p=appch(o,p,'\r'); p=appch(o,p,'\n'); }
     { p=appstr(o,p,"smartload="); p=appch(o,p,opt_smartload?'1':'0'); p=appch(o,p,'\r'); p=appch(o,p,'\n'); }
     p=appstr(o,p,"timemode=");     p=appch(o,p,opt_timemode?'1':'0'); p=appch(o,p,'\r'); p=appch(o,p,'\n');
@@ -9762,6 +9778,7 @@ static void apply_pos(void){ DDR_OSD_POS = ((unsigned)opt_y<<16) | (unsigned)opt
    the register (the machine cold-starts anyway). index 1 = Pentagon 1024K -> Pentagon timing bit. */
 static void apply_pint(void){ PENT_INT = ((unsigned)opt_pintv<<16) | (unsigned)opt_pinth; }  /* LIVE only: pokes register. Core keeps running, border not broken. */
 static void apply_crop(void);   /* v0.15.434: панорама живёт в кропе, объявление нужно раньше тела */
+static void apply_blend(void){ FRAME_BLEND_REG = (uint32_t)((opt_blend >= 0 && opt_blend <= 2) ? opt_blend : 1); }   /* v445: ядра до B0198 запись молча игнорируют */
 /* v0.15.434: пункт двигает ДВА механизма - растровый (Пентагон) и оконный (все остальные),
    поэтому кроп надо пересчитать здесь же, иначе сдвиг не вступит в силу до чужого вызова. */
 static void apply_scr(void);    /* v0.15.440: панорама двигает окно вывода - нужно объявление раньше тела */
@@ -10585,7 +10602,8 @@ static menu_item opt_items[] = {
     {"FLOAT BUS DLY",ITEM_RANGE,&opt_fbus_delay,0,1,0,apply_ulatune,3," tap"},         /* [89] */
     {"BORDER MODE", ITEM_CHOICE,&opt_border_mode,CH_BORDMODE,2,0,apply_ulatune},       /* [90] */
     {"KEMPSTON JOYSTICK", ITEM_CHOICE, &opt_kj, CH_NOYES, 2, 0, apply_kj},              /* [91] B0175: интерфейса на голом 48K нет; ВЫКЛ = порты с a5=0 отдают плавающую шину */
-    {"TAPE LOAD VIA", ITEM_CHOICE, &opt_tape128, CH_TAPE128, 3, 0},                     /* [92] v443: как автостарт входит в загрузку на 128K/Пентагоне */
+    {"TAPE LOAD VIA", ITEM_CHOICE, &opt_tape128, CH_TAPE128, 3, 0},
+    {"FRAME BLEND", ITEM_CHOICE, &opt_blend, CH_BLEND, 3, 0, apply_blend},                /* [93] v445: смешение кадров на выводе */                     /* [92] v443: как автостарт входит в загрузку на 128K/Пентагоне */
 };
 /* (no opt_menu instance any more: opt_items[] feed the Options > Settings nested dropdown directly) */
 
@@ -10752,7 +10770,7 @@ static const struct { short ix; const char* lab; } MENU_IX_EXPECT[] = {
     {78,"DIVMMC WRITE"},{79,"Z-CONTROLLER WRITE"},
     {80,"IO CONT DLY"},{81,"BORD PHASE"},{82,"BORD DELAY"},{83,"PAPER DELAY"},{84,"IRQ PHASE"},
     {85,"INT SOURCE"},{86,"ULA PHASE"},{87,"TUNE OVERRIDE"},{88,"MEM CONT DLY"},
-    {89,"FLOAT BUS DLY"},{90,"BORDER MODE"},{91,"KEMPSTON JOYSTICK"},{92,"TAPE LOAD VIA"},   /* v443: 91 сторож тоже не проверял */                                                /* v433 */
+    {89,"FLOAT BUS DLY"},{90,"BORDER MODE"},{91,"KEMPSTON JOYSTICK"},{92,"TAPE LOAD VIA"},{93,"FRAME BLEND"},   /* v443: 91 сторож тоже не проверял */                                                /* v433 */
 };
 /* v231 АУДИТ ВЫСОТ МЕНЮ. Тот же приём, что MENU_IX_EXPECT для индексов: проверяем инвариант на
    старте, а не ждём жалобы на артефакты. Подменю машин уже дважды перерастало окружение, когда в
@@ -10873,6 +10891,7 @@ static const MenuItem mi_display_zx[] = {
   {"Crop right",     0,0,NULL, NULL, &opt_items[29]},
   {"Crop top",       0,0,NULL, NULL, &opt_items[30]},
   {"Crop bottom",    0,0,NULL, NULL, &opt_items[31]},
+  {"Frame blend",    0,0,NULL, NULL, &opt_items[93]},   /* v445: OFF / AUTO / ON - смешение кадров N и N-1 на HDMI */
 };
 static const MenuItem mi_display_nes[] = {
   {"Screen X",       0,0,NULL, NULL, &opt_items[26]},
@@ -14554,6 +14573,7 @@ static void fabric_reinit_after_reload(void){
     OSD_DDR_BASE = OSDC_ADDR;
     
     apply_pint(); apply_paper(); apply_ulatune(); apply_crop(); scr_view_sync(); apply_scr();  /* re-push fabric-only live registers */
+    apply_blend();                    /* v445: после PCAP регистр смешения снова 0 = OFF */
     apply_pos();  apply_dim();   apply_vol();
     apply_fast(); apply_tapesync(); apply_tape_snd(); apply_tapemute();
 
@@ -14942,6 +14962,7 @@ void main(void){
        реально прошитому ядру и до PCAP-перезагрузки: если ini просил NES, а в ПЛИС лежал ZX, мы
        стримили 160 КБ картриджа в несуществующие регистры — «автозагрузка не работает». */
     apply_crop();                     /* Step 15: this machine's display crop */
+    apply_blend();                    /* v445: смешение кадров на выводе */
     apply_fast();                     /* Step 15: fast-load (warp) enable (GLOBAL tape-service) */
     apply_tapesync();                 /* Step 15: SYNC LOADER (demand tape) from ini */
     machine_menu_sync();              /* Step 15: Machine submenu = current machine's param set */

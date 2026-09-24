@@ -268,6 +268,7 @@ module axi_ctl #(
     output reg  [31:0] ctl_scr_pos,        // 0xD0 SCR_POS: {vmargin[15:0], hmargin[15:0]} whole-frame HDMI position
     output reg  [31:0] ctl_ula_tune,       // 0x1C0: primary live 48K timing controls
     output reg  [31:0] ctl_ula_tune2,      // 0x1C4: floating-bus/memory-contention/border-mode controls
+    output reg  [1:0]  ctl_blend,          // 0x1CC W: B0198 смешение кадров на выводе: 0 OFF, 1 AUTO, 2 ON
     // ---- 0x11C..0x138 DDR PROBE: аппаратный замер пути PL->память (ddr_probe.v). Машино-агностично:
     //      это диагностика ОБОЛОЧКИ, а не машины, и она же дименсионирует будущий DDR-картридж. ----
     output reg  [31:0] ctl_probe_base,    // 0x120 W: базовый адрес цели (DDR 0x0xxxxxxx или OCM 0xFFFC0000)
@@ -291,6 +292,7 @@ module axi_ctl #(
     input  wire        axi_idle,          // 1 = all PL DDR masters idle (STATUS bit3)
     input  wire [31:0] memwr_cnt,         // 0xAC R: core RAM-write counter (tape-load verification probe)
     input  wire [31:0] disp_diag,         // 0x1C8 R: B0196 приборы читателя строк {отложенных пусков[31:16], недогрузок[15:0]}
+    input  wire [31:0] blend_stat,        // 0x1CC R: B0198 {история переключений экрана[15:8], 0, активно[2], режим[1:0]}
     input  wire        halt_ack,
     input  wire        ram_busy,
     input  wire        reset_busy,        // machine reset/wipe in progress (STATUS bit2; from inject_cdc)
@@ -401,7 +403,8 @@ module axi_ctl #(
     localparam IDX_DMMCCTL = 7'h67, IDX_DMMCBUFA = 7'h68, IDX_DMMCBUFW = 7'h69,  // 0x19C/0x1A0/0x1A4
                IDX_DMMCBUFR= 7'h6A, IDX_DMMCSTAT = 7'h6B, IDX_DMMCLBA  = 7'h6C,  // 0x1A8/0x1AC/0x1B0
                IDX_DMMCDBG = 7'h6D, IDX_DMMCCAP  = 7'h6E,                        // 0x1B4/0x1B8
-               IDX_DISPDIAG = 7'h72;   // 0x1C8 DISP_DIAG (R: B0196 {отложенных пусков[31:16], недогрузок[15:0]})
+               IDX_DISPDIAG = 7'h72,   // 0x1C8 DISP_DIAG (R: B0196 {отложенных пусков[31:16], недогрузок[15:0]})
+               IDX_BLEND    = 7'h73;   // 0x1CC FRAME_BLEND (W: режим; R: состояние) - B0198
     /* Тот же сдвиг флага на два такта, что у NEMO-IDE и мыши (B0114/B0116). У карты цена ошибки
        выше: в слове едут подтверждение запроса и НОМЕР этого запроса, и смесь битов двух записей
        означала бы подтверждение чужого сектора - то есть молча не тот блок в файле. */
@@ -523,6 +526,7 @@ module axi_ctl #(
             ctl_scr_pos   <= 32'h003A0100;
             ctl_ula_tune  <= 32'd0;  // lab disabled: exact baked B0154 timing selection
             ctl_ula_tune2 <= 32'd0;
+            ctl_blend     <= 2'd0;          // B0198: до записи прошивкой смешение выключено = прежний вывод
             ctl_probe_base  <= 32'h0F000000;   // безопасное окно DDR по умолчанию (вне кадра и вне FS_BUF)
             ctl_probe_ctrl  <= 32'h00000100;
             ctl_probe_start <= 1'b0;
@@ -584,6 +588,7 @@ module axi_ctl #(
                         IDX_SCRPOS:  ctl_scr_pos  <= s_wdata;
                         IDX_ULATUNE:  ctl_ula_tune  <= s_wdata;
                         IDX_ULATUNE2: ctl_ula_tune2 <= s_wdata;
+                        IDX_BLEND:    ctl_blend     <= s_wdata[1:0];
                         IDX_SCRSCALE:ctl_scr_scale<= s_wdata;
                         IDX_PROBEBASE: ctl_probe_base <= s_wdata;
                         IDX_PROBECTL:  begin ctl_probe_ctrl <= s_wdata; ctl_probe_start <= 1'b1; end      // CE21: live integer upscale {ymul,xmul} (per machine)
@@ -760,6 +765,7 @@ module axi_ctl #(
                     IDX_TAPESTAT:s_rdata <= {30'd0, tape_playing, tape_full};
                     IDX_MEMWR:   s_rdata <= memwr_cnt;
                     IDX_DISPDIAG: s_rdata <= disp_diag;   // B0196 приборы читателя строк
+                    IDX_BLEND:    s_rdata <= blend_stat;  // B0198
                     IDX_KBDTXST: s_rdata <= {30'd0, kbd_tx_ack, kbd_tx_busy};
                     IDX_KBDDIAG: s_rdata <= kbd_diag;
                     IDX_PROBESTAT: s_rdata <= probe_stat;

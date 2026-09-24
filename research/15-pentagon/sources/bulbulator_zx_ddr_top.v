@@ -491,7 +491,8 @@ module bulbulator_zx_ddr_top
 //  localparam [31:0] BUILD_VERSION = 32'hB01B0086; // BDI floppy activity icon bottom-right HDMI (outside machine window).
 //  localparam [31:0] BUILD_VERSION = 32'hB01B0087; // НАСТОЯЩИЙ SAA1099 (в битстриме была
 //  localparam [31:0] BUILD_VERSION = 32'hB01B0088; // SAA1099 получает РОВНО 8 МГц (был 8.0952 =
-    localparam [31:0] BUILD_VERSION = 32'hB01B0196;  // B0196: снимок адреса строки помечен кадром - верхняя кромка
+    localparam [31:0] BUILD_VERSION = 32'hB01B0198;  // B0198: смешение кадров на выводе (Display -> Frame blend), 5 буферов кадра
+//  localparam [31:0] BUILD_VERSION = 32'hB01B0196;  // B0196: снимок адреса строки помечен кадром - верхняя кромка
 //  localparam [31:0] BUILD_VERSION = 32'hB01B0195;  // B0188 real border; native CPU speed in standard tape inter-block pauses.
                                                      // irqBeg 2/6 -> 4/8 (MiSTer ula.sv:169 hc_next==4/8).
                                                      // Timing Tests 48K на стенде, ВСЕ ЧЕТЫРЕ фазы входа:
@@ -781,6 +782,7 @@ module bulbulator_zx_ddr_top
         // machine video (spclk domain)
         .cap_clk_i(spclk), .cap_rstn_i(por_n), .cap_ce_i(pe7M0),
         .cap_hsync_i(vid_hsync), .cap_vsync_i(vid_vsync), .cap_blank_i(vid_blank),
+        .scr_sel_i(p7ffd_live_core[3]),   // B0198: выбор экрана 5/7 - для AUTO смешения кадров
         .cap_r_i(vid_r), .cap_g_i(vid_g), .cap_b_i(vid_b), .cap_i_i(vid_i),
         .cap_pix8_i(8'd0),
         // machine audio (the ZX leg + crossfade + tape click, computed below)

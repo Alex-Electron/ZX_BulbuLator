@@ -67,7 +67,7 @@ if {$MISTER48 || $HYBRID} {
 # EBAZ glue + control plane + DDR chain (line-buffer display) + OSD compositor + DDR-RGB OSD + the top.
 read_verilog [list clock_zx.v mem_zx_bulb.v kbd_buttons.v \
   axi_ctl.v inject_cdc.v \
-  fb_capture_rr.v async_fifo.v gs_wq_fifo.v gs_flow.v fb_wr_axi.v fb_bufmgr3.v fb_line_disp.v osd_compositor.v \
+  fb_capture_rr.v async_fifo.v gs_wq_fifo.v gs_flow.v fb_wr_axi.v fb_bufmgr5.v fb_line_disp.v osd_compositor.v \
   osd_ddr_rd.v tape_bram_fifo.v tape_player.v ps2_tx.v \
   ddr_probe.v ddr_mem.v control_plane.v bdi_activity_icon.v bulbulator_zx_ddr_top.v]
 read_xdc bulbulator_ddr.xdc

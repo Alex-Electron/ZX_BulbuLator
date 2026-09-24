@@ -55,6 +55,9 @@ module fb_line_disp #(
     input  wire        clk,
     input  wire        resetn,
     input  wire [31:0] disp_base,
+    input  wire [31:0] prev_base,     // B0198: кадр N-1 (fb_bufmgr5) - для смешения кадров
+    input  wire        prev_ok,       // B0198: пара уже из двух настоящих кадров
+    input  wire        blend_en,      // B0198: домен clk. 1 = приносить и смешивать кадр N-1
     input  wire        frame_kick,
     output reg  [31:0] ar_addr,
     output wire [5:0]  ar_id,
@@ -225,6 +228,8 @@ module fb_line_disp #(
     // disp_base pinned ONCE per frame; reader keeps {want0,want1} resident in 2 tagged buffers.
     //=============================================================================================
     (* ram_style="distributed" *) reg [63:0] lb [0:2*LBW-1];
+    (* ram_style="distributed" *) reg [63:0] lbp[0:2*LBW-1];   // B0198: та же строка из кадра N-1
+    reg  [1:0]    buf_hasp = 2'b00;                              // B0198: к строке принесён и кадр N-1
     reg  [8:0]    buf_row [0:1];
     reg  [WA-1:0] buf_base[0:1];
     reg  [1:0]    buf_valid;
@@ -241,6 +246,8 @@ module fb_line_disp #(
     // disp_base pin (latched the cycle after frame_kick) + base_valid (set once a frame has been pinned)
     reg        fk_d, base_valid;
     reg [31:0] frame_base;
+    reg [31:0] frame_pbase;          // B0198: база кадра N-1, пинится в тот же такт, что frame_base
+    reg        frame_pok;
     /* 🥇 B0194 МЕТКА КАДРА У СТРОК ЧИТАТЕЛЯ. Жалоба владельца 17.09: на мерцающих демках верхние
        ~4 строки кадра идут «с неоднородностью», и кропом это не лечится. Причина: строки в двух
        буферах читателя помечены ТОЛЬКО номером (`buf_row`), без привязки к кадру. Картинка кончается
@@ -252,10 +259,10 @@ module fb_line_disp #(
        у которого в B0124 уже была история с таймингом, и 32-битное сравнение баз туда класть нельзя. */
     reg        base_epoch = 1'b0;
     always @(posedge clk) begin
-        if (!resetn) begin fk_d<=1'b0; frame_base<=disp_base; base_valid<=1'b0; base_epoch<=1'b0; end
+        if (!resetn) begin fk_d<=1'b0; frame_base<=disp_base; frame_pbase<=prev_base; frame_pok<=1'b0; base_valid<=1'b0; base_epoch<=1'b0; end
         else begin
             fk_d <= frame_kick;
-            if (fk_d) begin frame_base <= disp_base; base_valid <= 1'b1; base_epoch <= ~base_epoch; end
+            if (fk_d) begin frame_base <= disp_base; frame_pbase <= prev_base; frame_pok <= prev_ok; base_valid <= 1'b1; base_epoch <= ~base_epoch; end
         end
     end
 
@@ -278,6 +285,9 @@ module fb_line_disp #(
     reg [8:0]  tgt_row;
     reg [WA-1:0] tgt_base;
     reg [8:0]  ar_issued;
+    reg [31:0] tgt_paddr;            // B0198: адрес строки в кадре N-1
+    reg        tgt_hasp;             // B0198: эта заливка приносит и кадр N-1
+    reg [3:0]  tgt_nb;               // B0198: всего очередей бёрстов в заливке (FBURSTS или 2*FBURSTS)
     reg [8:0]  words_rcvd;
     reg [2:0]  outstanding;
 
@@ -321,6 +331,7 @@ module fb_line_disp #(
        Метка однобитная намеренно: в конус `RD_IDLE` -> `ar_addr` нельзя класть 32-битное сравнение
        баз (у этого пути в B0124 уже была история с таймингом). */
     reg          fbe_q   = 1'b0;
+    reg [31:0]   paddr0_q = 32'd0, paddr1_q = 32'd0;   // B0198: адреса той же строки в кадре N-1
     always @(posedge clk) begin
         fbe_q   <= base_epoch;
         row0_q  <= want0;
@@ -329,6 +340,8 @@ module fb_line_disp #(
         row1_q  <= want1;
         base1_q <= align_f(want1);
         addr1_q <= frame_base + ({{(32-WA-3){1'b0}}, align_f(want1), 3'b000});
+        paddr0_q<= frame_pbase + ({{(32-WA-3){1'b0}}, align_f(want0), 3'b000});   // B0198
+        paddr1_q<= frame_pbase + ({{(32-WA-3){1'b0}}, align_f(want1), 3'b000});
     end
 
     wire base_fresh = (fbe_q == base_epoch);   // B0196: снимок адреса относится к ТЕКУЩЕЙ базе кадра
@@ -337,6 +350,7 @@ module fb_line_disp #(
         if (!resetn) begin
             rstate<=RD_IDLE; ar_valid<=1'b0; ar_addr<=32'd0; ar_issued<=9'd0; words_rcvd<=9'd0;
             outstanding<=3'd0; buf_valid<=2'b00; buf_epoch<=2'b00; tgt<=1'b0; tgt_epoch<=1'b0; live<=1'b0;
+            buf_hasp<=2'b00; tgt_hasp<=1'b0; tgt_nb<=FBURSTS[3:0]; tgt_paddr<=32'd0;
             buf_row[0]<=ROW_NONE; buf_row[1]<=ROW_NONE; buf_base[0]<={WA{1'b0}}; buf_base[1]<={WA{1'b0}};
         end else begin
             case (rstate)
@@ -349,6 +363,9 @@ module fb_line_disp #(
                     tgt_epoch <= base_epoch;
                     tgt_row  <= row0_q;
                     tgt_base <= base0_q;
+                    tgt_paddr<= paddr0_q;
+                    tgt_hasp <= blend_en;                              // B0198: без смешения заливка прежняя
+                    tgt_nb   <= blend_en ? (FBURSTS[3:0] << 1) : FBURSTS[3:0];
                     if (b0_spare) begin buf_valid[0]<=1'b0; buf_row[0]<=ROW_NONE; end
                     else          begin buf_valid[1]<=1'b0; buf_row[1]<=ROW_NONE; end
                     ar_addr  <= addr0_q;
@@ -358,6 +375,9 @@ module fb_line_disp #(
                     tgt_epoch <= base_epoch;
                     tgt_row  <= row1_q;
                     tgt_base <= base1_q;
+                    tgt_paddr<= paddr1_q;
+                    tgt_hasp <= blend_en;                              // B0198: без смешения заливка прежняя
+                    tgt_nb   <= blend_en ? (FBURSTS[3:0] << 1) : FBURSTS[3:0];
                     if (b0_spare) begin buf_valid[0]<=1'b0; buf_row[0]<=ROW_NONE; end
                     else          begin buf_valid[1]<=1'b0; buf_row[1]<=ROW_NONE; end
                     ar_addr  <= addr1_q;
@@ -365,15 +385,17 @@ module fb_line_disp #(
                 end
             end
             RD_AR: begin
-                if (!ar_valid && (ar_issued < FBURSTS) && (outstanding < MAXOUT[2:0]))
+                if (!ar_valid && (ar_issued < {5'd0,tgt_nb}) && (outstanding < MAXOUT[2:0]))
                     ar_valid <= 1'b1;
                 if (ar_hs) begin
                     ar_valid  <= 1'b0;
-                    ar_addr   <= ar_addr + 32'd128;
+                    // B0198: после FBURSTS очередей кадра N идут очереди той же строки из кадра N-1
+                    ar_addr   <= (ar_issued == FBURSTS-1) ? tgt_paddr : ar_addr + 32'd128;
                     ar_issued <= ar_issued + 9'd1;
                 end
                 if (r_hs) begin
-                    lb[(tgt?LBW:0) + words_rcvd] <= r_data;
+                    if (words_rcvd < LBW) lb [(tgt?LBW:0) + words_rcvd]       <= r_data;
+                    else                  lbp[(tgt?LBW:0) + words_rcvd - LBW] <= r_data;
                     words_rcvd <= words_rcvd + 9'd1;
                 end
                 case ({ar_hs,(r_hs & r_last)})
@@ -381,7 +403,8 @@ module fb_line_disp #(
                     2'b01: outstanding<=outstanding-3'd1;
                     default:;
                 endcase
-                if (words_rcvd==LBW-1 && r_hs) begin
+                if ((words_rcvd == (tgt_hasp ? 2*LBW-1 : LBW-1)) && r_hs) begin
+                    buf_hasp[tgt] <= tgt_hasp;       // B0198
                     buf_row [tgt] <= tgt_row;
                     buf_base[tgt] <= tgt_base;
                     buf_epoch[tgt]<= tgt_epoch;      // B0194
@@ -420,7 +443,11 @@ module fb_line_disp #(
        это окно живёт только внутри гашения, где ничего не выводится. */
     reg [1:0] v_s1, v_s2, e_s1, e_s2;
     reg       be_s1, be_s2;
+    reg [1:0] hp_s1, hp_s2;          // B0198: метка «есть кадр N-1» - той же дорогой, что buf_valid
+    reg       pok_s1, pok_s2;
     always @(posedge rd_clk) begin
+        hp_s1<=buf_hasp;  hp_s2<=hp_s1;
+        pok_s1<=frame_pok; pok_s2<=pok_s1;
         v_s1<=buf_valid;  v_s2<=v_s1;
         e_s1<=buf_epoch;  e_s2<=e_s1;
         be_s1<=base_epoch; be_s2<=be_s1;
@@ -431,13 +458,18 @@ module fb_line_disp #(
     wire [WA-1:0] sbase   = sel0 ? buf_base[0] : buf_base[1];
     wire [WA-1:0] bufidx  = lin_word - sbase;                 // 0..LBW-1 when have_line
     wire [63:0] word      = have_line ? lb[(sel0 ? 0 : LBW) + bufidx[$clog2(LBW)-1:0]] : 64'd0;
+    wire [63:0] wordp     = have_line ? lbp[(sel0 ? 0 : LBW) + bufidx[$clog2(LBW)-1:0]] : 64'd0;   // B0198
+    wire        blend_line = have_line && (sel0 ? hp_s2[0] : hp_s2[1]) && pok_s2;                     // B0198
 
     reg [63:0] rd_q; reg [3:0] nib_q; reg in_pic_q; reg have_q;
+    reg [63:0] rdp_q; reg blend_q;   // B0198
     always @(posedge rd_clk) begin
         rd_q<=word; nib_q<=lin_nib; in_pic_q<=in_pic; have_q<=have_line;
+        rdp_q<=wordp; blend_q<=blend_line;
     end
     wire [9:0] psel = nib_q << LBPP;
     wire [SRC_BPP-1:0] px = rd_q[psel +: SRC_BPP];            // pixel, SRC_BPP-wide (4=ZX RGBI, 8=NES index)
+    wire [SRC_BPP-1:0] pxp = rdp_q[psel +: SRC_BPP];          // B0198: тот же пиксель в кадре N-1
     // ---- палитра: одна таблица на любой SRC_BPP, с записью из ARM ----
     localparam integer PAL_N  = (SRC_BPP >= 8) ? 256 : 16;
     localparam integer PAL_AW = (SRC_BPP >= 8) ? 8   : 4;
@@ -479,8 +511,16 @@ module fb_line_disp #(
     wire palw_pulse = palw_s[2] ^ palw_s[1];
     always @(posedge rd_clk) if (palw_pulse) pal[pal_addr[PAL_AW-1:0]] <= pal_rgb;
 
+    /* 🥇 B0198 СМЕШЕНИЕ КАДРОВ (эмуляция послесвечения ЭЛТ). Среднее кадров N и N-1 по каждому каналу.
+       Та же ступень конвейера, что и прежний вывод цвета, - задержка пикселя НЕ меняется, поэтому ни
+       картинка, ни наложение OSD не сдвигаются. Без смешения (blend_q = 0) ветка бит в бит прежняя. */
+    wire [23:0] c_now = pal[px[PAL_AW-1:0]];
+    wire [23:0] c_old = pal[pxp[PAL_AW-1:0]];
+    wire [8:0]  mr = {1'b0,c_now[23:16]} + {1'b0,c_old[23:16]};
+    wire [8:0]  mg = {1'b0,c_now[15:8]}  + {1'b0,c_old[15:8]};
+    wire [8:0]  mb = {1'b0,c_now[7:0]}   + {1'b0,c_old[7:0]};
     always @(posedge rd_clk)
-        rgb <= (in_pic_q && have_q) ? pal[px[PAL_AW-1:0]] : 24'h505050;
+        rgb <= (in_pic_q && have_q) ? (blend_q ? {mr[8:1], mg[8:1], mb[8:1]} : c_now) : 24'h505050;
 
 
     // ---- приборы читателя, одним словом в регистре 0x1C8 = {stale_base_cnt, underrun_cnt} ----

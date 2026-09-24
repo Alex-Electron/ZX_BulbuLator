@@ -2,7 +2,7 @@
 
 Языки: [English](README.md) · **Русский**
 
-Боевое состояние: ядро **B0196**, прошивка **v0.15.444**. Всё, что ниже, проверено на живой плате.
+Боевое состояние: ядро **B0198**, прошивка **v0.15.445**. Всё, что ниже, проверено на живой плате.
 
 ![ZX-BulboNavigator: файловый менеджер с полноцветным интерфейсом в стиле DOS Navigator, работающий на управляющей плоскости ARM поверх живого экрана Spectrum](../14-color-osd/images/navigator-step14.jpg)
 
@@ -105,7 +105,7 @@ MiSTer-48 и NES/Денди. Оболочка над ними машино-не�
 
 ### Лента
 
-`.tap`, `.tzx`, `.wav`, `.mp3`; мгновенная загрузка через ловушку в ПЗУ, разгон до 8× с автоматическим
+`.tap`, `.tzx`, `.wav`, `.mp3`; мгновенная загрузка стандартной ленты 48K (SMART LOAD читает файл и запускает его как снэпшот), разгон до 8× с автоматическим
 выбором момента, распознавание пилот-тона в MP3 и WAV. **Разрешение проигрывать ленту отделено от
 разрешения ускорять процессор** — из-за их слияния вторая часть демки SHOCK меряла между блоками чужую
 длительность кадра и уходила не в ту ветвь.
@@ -309,14 +309,14 @@ research/15-pentagon/flash/mkboot_zx.sh <core.bit> BOOT.BIN
 sources/osd_ddr_rd.v               DDR->HDMI true-colour OSD reader (AXI-HP1)
 sources/osd_compositor.v           per-pixel alpha compositor + independent banner (transparent PAUSE)
 sources/tape_player.v              machine-agnostic PULSE tape replay (T-state lock-step, FIFO drain-on-stop)
-sources/bulbulator_zx_ddr_top.v    top level: shell + machine wiring (VERSION 0xB01B0196)
+sources/bulbulator_zx_ddr_top.v    top level: shell + machine wiring (VERSION 0xB01B0198)
 sources/axi_ctl.v                  control plane: DDR-OSD, tape, machine and video registers
 arm/loader_main.c                  the ZX-BulboNavigator (browser, dialogs, menus, tape station, options)
 arm/player.c                       universal music player (AY/PCM, mux, non-blocking ring)
 arm/mp3dec.c                       shared MP3 source (music + tape), with whole-file RAM preload
 arm/vga866.h                       CP866 VGA 8x16 font (ASCII + box-drawing + Cyrillic)
 arm/lscript.ld                     linker script: D-cache + non-cacheable DDR canvas window
-arm/loader.elf                     prebuilt ARM app (firmware tag v0.15.444)
+arm/loader.elf                     prebuilt ARM app (firmware tag v0.15.445)
 BUILDING.md                        how to build everything from source and put it on the board
 bitstreams/                        prebuilt cores and the boot image
 arm/tv_ui.c                        declarative Turbo Vision / DOS Navigator window framework

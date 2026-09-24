@@ -60,7 +60,8 @@ cp "$S6/kbd_buttons.v" "$S6/hdmi_wrap.sv" \
    "$HERE/get_rom.sh" "$B/"
 
 # --- async FIFO + triple-buffer manager, unchanged since Step 8 ---
-cp "$S8/async_fifo.v" "$S8/fb_bufmgr3.v" "$B/"
+cp "$S8/async_fifo.v" "$B/"
+# B0198: fb_bufmgr3.v шага 8 больше не читается - у шага 15 свой пятибуферный fb_bufmgr5.v (ниже)
 
 # --- per-line display chain, unchanged since Step 11 (osd_compositor + fb_capture_rr are step-local, below) ---
 # fb_wr_axi.v - копия шага 15 (выход idle_o для QUIESCE перед перезагрузкой ядра, v0.15.158). Раньше
@@ -74,7 +75,7 @@ cp "$S12/inject_cdc.v" "$B/"
 # --- Step 14/15 delta (from $HERE): osd_ddr_rd.v, bulbulator_zx_ddr_top.v, fb_capture_rr.v etc. for
 #     colour OSD + step 15 Pentium timing leg (320 lines, paper offsets, floating bus, live tuners).
 #     This tree is the continuation for step 15 (multi-machine). 14-color-osd tree is frozen. ---
-cp "$HERE/mem_zx_bulb.v" "$HERE/axi_ctl.v" "$HERE/bulbulator_zx_ddr_top.v" "$HERE/mister48_core.sv" "$HERE/hybrid_zx_core.sv" "$HERE/osd_compositor.v" "$HERE/osd_ddr_rd.v" "$HERE/tape_bram_fifo.v" "$HERE/tape_player.v" "$HERE/ps2_tx.v" "$HERE/ddr_probe.v" "$HERE/ddr_mem.v" "$HERE/control_plane.v" "$HERE/bdi_activity_icon.v" "$HERE/turbosound_bulb.v" "$HERE/beta_disk.v" "$HERE/wd1793.sv" "$HERE/nemo_ide.v" "$HERE/kempston_mouse.v" "$HERE/usd_bulb.v" "$HERE/divmmc_card.v" "$HERE/gs_wq_fifo.v" "$HERE/gs_flow.v" "$HERE/fb_capture_rr.v" "$HERE/fb_line_disp.v" "$HERE/clock_zx.v" "$HERE/build.tcl" "$HERE/bulbulator_ddr.xdc" "$B/"
+cp "$HERE/mem_zx_bulb.v" "$HERE/axi_ctl.v" "$HERE/bulbulator_zx_ddr_top.v" "$HERE/mister48_core.sv" "$HERE/hybrid_zx_core.sv" "$HERE/osd_compositor.v" "$HERE/osd_ddr_rd.v" "$HERE/tape_bram_fifo.v" "$HERE/tape_player.v" "$HERE/ps2_tx.v" "$HERE/ddr_probe.v" "$HERE/ddr_mem.v" "$HERE/control_plane.v" "$HERE/bdi_activity_icon.v" "$HERE/turbosound_bulb.v" "$HERE/beta_disk.v" "$HERE/wd1793.sv" "$HERE/nemo_ide.v" "$HERE/kempston_mouse.v" "$HERE/usd_bulb.v" "$HERE/divmmc_card.v" "$HERE/gs_wq_fifo.v" "$HERE/gs_flow.v" "$HERE/fb_capture_rr.v" "$HERE/fb_line_disp.v" "$HERE/fb_bufmgr5.v" "$HERE/clock_zx.v" "$HERE/build.tcl" "$HERE/bulbulator_ddr.xdc" "$B/"
 cp -R "$HERE/nes_core" "$B/"; cp "$HERE/bulbulator_nes_top.v" "$HERE/build_nes.tcl" "$B/"
 
 ( cd "$B" && sh get_rom.sh >/dev/null )
