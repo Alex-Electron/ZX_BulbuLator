@@ -63,7 +63,10 @@ cp "$S6/kbd_buttons.v" "$S6/hdmi_wrap.sv" \
 cp "$S8/async_fifo.v" "$S8/fb_bufmgr3.v" "$B/"
 
 # --- per-line display chain, unchanged since Step 11 (osd_compositor + fb_capture_rr are step-local, below) ---
-cp "$S11/fb_wr_axi.v" "$B/"   # fb_line_disp is now step-15-local (live margins) - see $HERE cp below
+# fb_wr_axi.v - копия шага 15 (выход idle_o для QUIESCE перед перезагрузкой ядра, v0.15.158). Раньше
+# файл брался из шага 11 и правился там же, поэтому опубликованный шаг 11 и шаг 15 разошлись, и чистый
+# клон шага 15 не собирался. Опубликованные шаги 11-14 остаются со своей версией.
+cp "$HERE/fb_wr_axi.v" "$B/"   # fb_line_disp is now step-15-local (live margins) - see $HERE cp below
 
 # --- AXI-RESET CDC, unchanged since Step 12 (build.tcl + the XDC are now step-local, below) ---
 cp "$S12/inject_cdc.v" "$B/"
