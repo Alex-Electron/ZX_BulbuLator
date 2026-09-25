@@ -306,6 +306,8 @@ module bulbulator_zx_ddr_top
     // растре, - если после B0154 какая-то демка поедет, бит27 возвращает поведение B0153
     // без пересборки ядра. Подробности у входа `io_cont_early` в atlas_core/main.v.
     (* ASYNC_REG="TRUE" *) reg [1:0] iocont_s = 2'b00;
+    // B0200: бит29 = порт #FF Пентагона отдаёт атрибут (Sizif-512); 0 = #FF (MiSTer). Прошивка ставит его только Пентагону.
+    (* ASYNC_REG="TRUE" *) reg [1:0] ffattr_s = 2'b00;
     (* ASYNC_REG="TRUE" *) reg [1:0] kjen_s   = 2'b00;
     // B0120: маска недостающих старших бит банка - 3 бита, тот же двухступенчатый конвейер.
     (* ASYNC_REG="TRUE" *) reg [2:0] ramnb_s0 = 3'b000, ramnb_s1 = 3'b000;
@@ -316,6 +318,7 @@ module bulbulator_zx_ddr_top
         trdosen_s <= {trdosen_s[0], mach_cfg_w[8]};   // MACHINE_CFG бит8 = разрешить трап TR-DOS.
         bdialways_s <= {bdialways_s[0], mach_cfg_w[10]}; // B0079: временный upstream-like BDI A/B
         dossvc_s  <= {dossvc_s[0],  mach_cfg_w[25]}; // B0146 бит25 = пара {DOS, 7FFD[4]} выбирает страницу
+        ffattr_s  <= {ffattr_s[0],  mach_cfg_w[29]}; // B0200 бит29 = порт #FF Пентагона: атрибут
         iocont_s  <= {iocont_s[0],  mach_cfg_w[27]}; // B0154 бит27 = окно контеншена ПОРТОВ как до B0154 (на такт раньше эталона); умолчание 0 = фаза настоящей машины
         kjen_s    <= {kjen_s[0],    mach_cfg_w[28]}; // B0175 бит28 = джойстик Kempston ЕСТЬ; умолчание 0 = голый 48K, порты с a[5]=0 отдают плавающую шину
         saamode_s0  <= mach_cfg_w[12:11];             // B0087: SAA1099 0 AUTO / 1 ON / 2 OFF
@@ -491,7 +494,9 @@ module bulbulator_zx_ddr_top
 //  localparam [31:0] BUILD_VERSION = 32'hB01B0086; // BDI floppy activity icon bottom-right HDMI (outside machine window).
 //  localparam [31:0] BUILD_VERSION = 32'hB01B0087; // НАСТОЯЩИЙ SAA1099 (в битстриме была
 //  localparam [31:0] BUILD_VERSION = 32'hB01B0088; // SAA1099 получает РОВНО 8 МГц (был 8.0952 =
-    localparam [31:0] BUILD_VERSION = 32'hB01B0198;  // B0198: смешение кадров на выводе (Display -> Frame blend), 5 буферов кадра
+    localparam [31:0] BUILD_VERSION = 32'hB01B0200;  // B0200: порт #FF Пентагона - опция машины (#FF / ATTRIBUTE, MACHINE_CFG бит29)
+//  localparam [31:0] BUILD_VERSION = 32'hB01B0199;  // B0199: длительность INT Пентагона - опция машины (PENT_INT[14:9], 0 = 36 T)
+//  localparam [31:0] BUILD_VERSION = 32'hB01B0198;  // B0198: смешение кадров на выводе (Display -> Frame blend), 5 буферов кадра
 //  localparam [31:0] BUILD_VERSION = 32'hB01B0196;  // B0196: снимок адреса строки помечен кадром - верхняя кромка
 //  localparam [31:0] BUILD_VERSION = 32'hB01B0195;  // B0188 real border; native CPU speed in standard tape inter-block pauses.
                                                      // irqBeg 2/6 -> 4/8 (MiSTer ula.sv:169 hc_next==4/8).
@@ -1652,6 +1657,7 @@ module bulbulator_zx_ddr_top
         // и связь вне `ifndef` уронила бы обе ветви на синтезе МОЛЧА (эта мина уже стоила шести дней,
         // см. B0148 ниже про четыре связи карты).
         .io_cont_early(iocont_s[1]),
+        .ff_attr(ffattr_s[1]),    // B0200: та же мина, что у io_cont_early - порт есть только у Atlas, держать под ifndef
         .kj_en(kjen_s[1]),            // B0175: та же мина, что у io_cont_early - порт есть ТОЛЬКО у Atlas
         .ram_nobit(ram_nobit_sp), // B0120: каких старших бит банка у машины НЕТ (MACHINE_CFG [16:14])
         .mem_wait(zx_mem_wait),

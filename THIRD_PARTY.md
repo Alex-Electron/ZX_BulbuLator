@@ -32,6 +32,7 @@ which permits this combination.
 | ├ **T65** — 6502 CPU | in the NES core | permissive (Wallner-style) | © Daniel Wallner and contributors | fetched (via NES core) |
 | **z80emu** ([anotherlin/z80emu](https://github.com/anotherlin/z80emu) v1.1.3) — Z80 interpreter on the ARM, used for the General Sound card | GS card CPU | "This code is free, do whatever you want with it" (upstream header) | © 2012-2017 Lin Ke-Fong | vendored; `z80user.h` replaced by our binding — see `research/15-pentagon/arm/z80emu/ВЕНДОРЕНО.md` |
 | **Terminus** (`CyrKoi-TerminusBoldVGA16`) — the 8×16 CP866 OSD font | shell text | **SIL OFL 1.1** | © Dimitar Zhekov and contributors | vendored as `arm/vga866.h` (bitmap extracted) |
+| **zxtests** by Jan Bobrowski — `DELAY`, `ALIGNINT`, `FRAME_TIME`, `INT_TIME`, `EI_PREFIX` and the stime/btime frame bodies | Pentagon timing test tapes (`research/15-pentagon/tools/penttest/`) | GPL / LGPL (per the file headers) | © Jan Bobrowski | vendored (IM2 table address changed in `instint.asm`) |
 | **FatFs** (via the Xilinx `xilffs` BSP library) — FAT16/FAT32 on the SD card | file service | BSD-style 1-clause (ChaN) | © ChaN | build dependency, not vendored here |
 
 ### ROM sets and device firmware — see [`research/15-pentagon/roms/PROVENANCE.md`](research/15-pentagon/roms/PROVENANCE.md)

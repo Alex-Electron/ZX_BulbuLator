@@ -2,7 +2,7 @@
 
 Languages: **English** · [Русский](README.ru.md)
 
-Production state: core **B0198**, firmware **v0.15.446**. Everything below was checked on real hardware.
+Production state: core **B0200**, firmware **v0.15.448**. Everything below was checked on real hardware.
 
 ![The ZX-BulboNavigator: a true-colour, DOS Navigator-style file manager running on the ARM control plane over the live Spectrum screen](../14-color-osd/images/navigator-step14.jpg)
 
@@ -137,7 +137,7 @@ be switchable off** — the sound card's diagnostic trace was itself breaking th
 | [`docs/`](docs/) | write-ups (Russian): the shell, every machine fix with its evidence, what the emulation can do, the SD card layout, and the tracker audit |
 | `sources/` | RTL: machine cores, control plane, video path, devices |
 | `arm/` | the shell firmware |
-| `tools/` | instruments: frame grab, screen decode, host-side remote, card upload |
+| `tools/` | instruments: frame grab, screen decode, host-side remote, card upload, the Pentagon timing test (`tools/penttest/`) |
 | `sim/` | simulator benches and Z80 measurement programs |
 | `flash/` | boot image assembly and JTAG upload |
 
@@ -312,14 +312,14 @@ The ZX core and the firmware built this way are identical, byte for byte, to the
 sources/osd_ddr_rd.v               DDR->HDMI true-colour OSD reader (AXI-HP1)
 sources/osd_compositor.v           per-pixel alpha compositor + independent banner (transparent PAUSE)
 sources/tape_player.v              machine-agnostic PULSE tape replay (T-state lock-step, FIFO drain-on-stop)
-sources/bulbulator_zx_ddr_top.v    top level: shell + machine wiring (VERSION 0xB01B0198)
+sources/bulbulator_zx_ddr_top.v    top level: shell + machine wiring (VERSION 0xB01B0200)
 sources/axi_ctl.v                  control plane: DDR-OSD, tape, machine and video registers
 arm/loader_main.c                  the ZX-BulboNavigator (browser, dialogs, menus, tape station, options)
 arm/player.c                       universal music player (AY/PCM, mux, non-blocking ring)
 arm/mp3dec.c                       shared MP3 source (music + tape), with whole-file RAM preload
 arm/vga866.h                       CP866 VGA 8x16 font (ASCII + box-drawing + Cyrillic)
 arm/lscript.ld                     linker script: D-cache + non-cacheable DDR canvas window
-arm/loader.elf                     prebuilt ARM app (firmware tag v0.15.446)
+arm/loader.elf                     prebuilt ARM app (firmware tag v0.15.448)
 BUILDING.md                        how to build everything from source and put it on the board
 bitstreams/                        prebuilt cores and the boot image
 arm/tv_ui.c                        declarative Turbo Vision / DOS Navigator window framework
@@ -340,6 +340,7 @@ flash/fsbl.bin                     first-stage boot loader (same as Step 14)
 tools/put_retry.tcl                safe file upload to the card over JTAG
 tools/card_ls.tcl                  card directory listing over JTAG (size check)
 tools/card_mv.tcl                  rename on the card over JTAG
+tools/penttest/                    Pentagon timing test tapes (PENTTEST, stime/btime sweeps, frame rate) + host scripts
 ```
 
 ## Credits
@@ -347,4 +348,5 @@ tools/card_mv.tcl                  rename on the card over JTAG
 - **AYUMI** — accurate AY-3-8910 / YM2149 emulation by **Peter Sovietov** ([true-grue/ayumi](https://github.com/true-grue/ayumi), MIT).
 - **minimp3** — public-domain MP3 decoder by **lieff** ([lieff/minimp3](https://github.com/lieff/minimp3), CC0).
 - **speexdsp** resampler — Xiph.Org / Jean-Marc Valin (BSD).
+- **zxtests** — the cycle-exact timing code in the Pentagon test tapes is by **Jan Bobrowski** (GPL/LGPL).
 - The OSD's look, dialogs, and keyboard follow **DOS Navigator** (RIT Research Labs) as the visual reference; the CP866 cell font is **Terminus** (OFL).

@@ -2,7 +2,7 @@
 
 Языки: [English](README.md) · **Русский**
 
-Боевое состояние: ядро **B0198**, прошивка **v0.15.446**. Всё, что ниже, проверено на живой плате.
+Боевое состояние: ядро **B0200**, прошивка **v0.15.448**. Всё, что ниже, проверено на живой плате.
 
 ![ZX-BulboNavigator: файловый менеджер с полноцветным интерфейсом в стиле DOS Navigator, работающий на управляющей плоскости ARM поверх живого экрана Spectrum](../14-color-osd/images/navigator-step14.jpg)
 
@@ -134,7 +134,7 @@ MiSTer-48 и NES/Денди. Оболочка над ними машино-не�
 | [`docs/`](docs/) | описания: [оболочка](docs/NAVIGATOR.ru.md), [машины и каждая правка с доказательством](docs/MACHINES.ru.md), [возможности эмуляции](docs/EMULATION.ru.md), [раскладка карты памяти](docs/SDCARD.ru.md), [сверка трекера с кодом](docs/ISSUES_AUDIT.ru.md) |
 | `sources/` | RTL: ядра машин, плоскость управления, видеотракт, устройства |
 | `arm/` | прошивка оболочки |
-| `tools/` | приборы: снимок кадра, разбор экрана, пульт к плате, заливка на карту |
+| `tools/` | приборы: снимок кадра, разбор экрана, пульт к плате, заливка на карту, тест таймингов Пентагона (`tools/penttest/`) |
 | `sim/` | стенды в симуляторе и измерительные программы на Z80 |
 | `flash/` | сборка загрузочного образа и заливка по JTAG |
 
@@ -309,14 +309,14 @@ research/15-pentagon/flash/mkboot_zx.sh <core.bit> BOOT.BIN
 sources/osd_ddr_rd.v               DDR->HDMI true-colour OSD reader (AXI-HP1)
 sources/osd_compositor.v           per-pixel alpha compositor + independent banner (transparent PAUSE)
 sources/tape_player.v              machine-agnostic PULSE tape replay (T-state lock-step, FIFO drain-on-stop)
-sources/bulbulator_zx_ddr_top.v    top level: shell + machine wiring (VERSION 0xB01B0198)
+sources/bulbulator_zx_ddr_top.v    top level: shell + machine wiring (VERSION 0xB01B0200)
 sources/axi_ctl.v                  control plane: DDR-OSD, tape, machine and video registers
 arm/loader_main.c                  the ZX-BulboNavigator (browser, dialogs, menus, tape station, options)
 arm/player.c                       universal music player (AY/PCM, mux, non-blocking ring)
 arm/mp3dec.c                       shared MP3 source (music + tape), with whole-file RAM preload
 arm/vga866.h                       CP866 VGA 8x16 font (ASCII + box-drawing + Cyrillic)
 arm/lscript.ld                     linker script: D-cache + non-cacheable DDR canvas window
-arm/loader.elf                     prebuilt ARM app (firmware tag v0.15.446)
+arm/loader.elf                     prebuilt ARM app (firmware tag v0.15.448)
 BUILDING.md                        how to build everything from source and put it on the board
 bitstreams/                        prebuilt cores and the boot image
 arm/tv_ui.c                        declarative Turbo Vision / DOS Navigator window framework
@@ -337,6 +337,7 @@ flash/fsbl.bin                     first-stage boot loader (same as Step 14)
 tools/put_retry.tcl                safe file upload to the card over JTAG
 tools/card_ls.tcl                  card directory listing over JTAG (size check)
 tools/card_mv.tcl                  rename on the card over JTAG
+tools/penttest/                    Pentagon timing test tapes (PENTTEST, stime/btime sweeps, frame rate) + host scripts
 ```
 
 ## Благодарности
@@ -344,4 +345,5 @@ tools/card_mv.tcl                  rename on the card over JTAG
 - **AYUMI** — точная эмуляция AY-3-8910 / YM2149 от **Peter Sovietov** ([true-grue/ayumi](https://github.com/true-grue/ayumi), MIT).
 - **minimp3** — MP3-декодер, находящийся в общественном достоянии, автор **lieff** ([lieff/minimp3](https://github.com/lieff/minimp3), CC0).
 - **speexdsp** — ресамплер от Xiph.Org / Жан-Марка Валина (BSD).
+- **zxtests** — точный до такта замерный код в тестовых лентах Пентагона написал **Ян Бобровский** (GPL/LGPL).
 - Внешний вид OSD, диалоговые окна и клавиатура повторяют стиль **DOS Navigator** (RIT Research Labs); шрифт CP866 — **Terminus** (OFL).

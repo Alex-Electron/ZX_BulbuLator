@@ -1233,7 +1233,7 @@ static void browser_status(const char* s){   /* transient feedback (MOUNT/READ/F
 /* Title screen (shown when the OSD opens with F12): just the name, centred, scale 2. */
 /* Firmware build tag shown on the F12 splash (bump per milestone). The PL core VERSION
    (0x4000_0000) is shown live too, so the splash states exactly which firmware + bitstream run. */
-#define BULB_FW "v0.15.446"
+#define BULB_FW "v0.15.448"
 static char hexnib(uint32_t v){ return (v<10) ? ('0'+v) : ('A'+v-10); }
 /* Single source of truth for the version line ("v0.13 core 0xB01B0013"): the ARM firmware tag
    BULB_FW + the live PL core VERSION read from register 0x00. Used by BOTH the F12 splash
@@ -1808,6 +1808,29 @@ static int   g_mute          = 0;        /* KP* global mute: 1 = whole audio mix
    pentagon flag), so tuning them can NEVER disturb ZX 128K. Baked defaults = owner-tuned (Atarin good).
    These belong to the machine; when more cores arrive they become a per-machine set. */
 static int   opt_pintv       = 299;      /* Pentagon INT line (owner-tuned 299) */
+/* v0.15.447 (ядро B0199) ДЛИТЕЛЬНОСТЬ INT ПЕНТАГОНА - опция машины (владелец 24.09: «по умолчанию 36»).
+   Источники расходятся, поэтому переключатель, а не выбор за владельца:
+     36 T - Fuse, ZEsarUX, Потапов (ep4spectrum); так было у нас всегда. Умолчание.
+     32 T - Sizif-512, MiSTer (режим Пентагона), Unreal Speccy, ZX-Evo, TS-Conf.
+     44 T - намерено minfo (Бобровский) на живой плате: там длину задаёт RC-цепочка, у разных плат она разная.
+   Когда трогать: софт, который считает такты внутри обработчика прерывания или ловит второй приём того же
+   INT (двойной вход в короткий обработчик на длинном INT), ведёт себя по-разному. Если демка/тест рассчитаны
+   на конкретный эмулятор или клон - ставить его значение. В ядро уходит в PENT_INT[14:9] (такты). */
+static int   opt_pintw       = 0;        /* индекс в CH_PINTW / PINTW_T */
+static const char* const CH_PINTW[] = {"36 T","32 T","44 T"};
+static const unsigned PINTW_T[] = {36u, 32u, 44u};
+/* v0.15.448 (ядро B0200) ЧТЕНИЕ ПОРТА #FF У ПЕНТАГОНА - опция машины (#103). Эталоны расходятся:
+     #FF       - MiSTer (`mZX ? ff_data : 8'hFF`): плавающей шины у Пентагона нет, незанятый порт
+                 читается как #FF. Так было у нас всегда. Умолчание.
+     ATTRIBUTE - Sizif-512 (cpld/rtl/video.sv:283-289) и часть живых клонов: чтение порта с младшим байтом #FF
+                 на бумаге отдаёт ПОСЛЕДНИЙ выбранный атрибут, вне бумаги #FF.
+   Когда трогать: игры и демки, написанные под Синклер и синхронизирующиеся по плавающей шине через
+   IN A,(#FF) (Arkanoid, Cobra, Sidewize, Short Circuit и прочие «ждут атрибут»): на #FF они виснут или
+   мерцают, на ATTRIBUTE идут. Наоборот, софт, узнающий Пентагон по вечному #FF, может принять ATTRIBUTE
+   за Синклер. Под TR-DOS порт #FF - регистр Beta Disk, ему опция не мешает; SAA1099 на #FF только пишет,
+   чтение ему безразлично. В ядро уходит в MACHINE_CFG бит29, только машине Пентагон. */
+static int   opt_pff         = 0;        /* 0 = #FF, 1 = ATTRIBUTE */
+static const char* const CH_PFF[] = {"#FF","ATTRIBUTE"};
 static int   opt_pinth       = 326;      /* 🥇 Pentagon INT start hc. 12.08 владелец выставил 326 и
                                             бордюр сошёлся с центральным экраном. Это ЭТАЛОННОЕ число:
                                             MiSTer ula.sv:170 даёт INT на hc_next==326, Sizif — то же.
@@ -2195,7 +2218,10 @@ typedef struct { int pint_v, pint_h, paper_h, paper_v, crop_l, crop_r, crop_t, c
                  int divmmc; /* v327: DivMMC 0 OFF / 1 ON */
                  int dmmode; /* v327: 0 FOLDER / 1 IMAGE */
                  char dmfile[96]; /* v327: path; empty = 0:/DIVMMC or 0:/DIVMMC.IMG */
-                 } mach_params;        /* v207: ИМЯ файла набора ПЗУ в 0:/ROMS/ ("" = вшитое в битстрим).
+                                  int pint_w;                            /* v447: индекс длительности INT Пентагона (CH_PINTW). В КОНЦЕ
+                                                           структуры намеренно: первые поля g_mp[] заданы по позициям */
+                 int pff;                               /* v448: чтение порта #FF у Пентагона, 0 #FF / 1 ATTRIBUTE (тоже В КОНЦЕ) */
+} mach_params;        /* v207: ИМЯ файла набора ПЗУ в 0:/ROMS/ ("" = вшитое в битстрим).
                                                            Хранится ИМЯ, а не индекс: список строится обходом карты и
                                                            его порядок меняется от состава каталога. */           /* v0.15.199: ТИП джойстика каждого игрока (см. CH_JTYPE) */
 #define JOY_ZX_P1  {0x74,0x6B,0x72,0x75,0x73,0x6C,0x69,0x7A} /* NumPad: R6 L4 D2 U8 F5; extra bits 7/1/3 */
@@ -2248,7 +2274,7 @@ static void mp_store(int m){ if(m<0||m>=N_MACHINES) return;
             g_joymap[1][b]=0;
         }
     }
-    g_mp[m].pint_v=opt_pintv; g_mp[m].pint_h=opt_pinth; g_mp[m].paper_h=opt_paper_h; g_mp[m].paper_v=opt_paper_v;
+    g_mp[m].pint_v=opt_pintv; g_mp[m].pint_h=opt_pinth; g_mp[m].pint_w=(opt_pintw>=0&&opt_pintw<=2)?opt_pintw:0; g_mp[m].pff=opt_pff?1:0; g_mp[m].paper_h=opt_paper_h; g_mp[m].paper_v=opt_paper_v;
     g_mp[m].crop_l=opt_crop_l; g_mp[m].crop_r=opt_crop_r; g_mp[m].crop_t=opt_crop_t; g_mp[m].crop_b=opt_crop_b;
     g_mp[m].ula_late=opt_ulalate; g_mp[m].numjoy=opt_numjoy;
     g_mp[m].jsrc[0]=opt_jsrc1; g_mp[m].jsrc[1]=opt_jsrc2;
@@ -2277,7 +2303,7 @@ static void mp_store(int m){ if(m<0||m>=N_MACHINES) return;
     for(int pl=0;pl<2;pl++) for(int b=0;b<8;b++) g_mp[m].joy[pl][b]=g_joymap[pl][b]; }
 static void mp_load (int m){ if(m<0||m>=N_MACHINES) return;
     zx_joy_profile_sanitize(m);
-    opt_pintv=g_mp[m].pint_v; opt_pinth=g_mp[m].pint_h; opt_paper_h=g_mp[m].paper_h; opt_paper_v=g_mp[m].paper_v;
+    opt_pintv=g_mp[m].pint_v; opt_pinth=g_mp[m].pint_h; opt_pintw=(g_mp[m].pint_w>=0&&g_mp[m].pint_w<=2)?g_mp[m].pint_w:0; opt_pff=g_mp[m].pff?1:0; opt_paper_h=g_mp[m].paper_h; opt_paper_v=g_mp[m].paper_v;
     opt_crop_l=g_mp[m].crop_l; opt_crop_r=g_mp[m].crop_r; opt_crop_t=g_mp[m].crop_t; opt_crop_b=g_mp[m].crop_b;
     opt_ulalate=g_mp[m].ula_late; opt_numjoy=g_mp[m].numjoy;
     opt_jsrc1=g_mp[m].jsrc[0]; opt_jsrc2=g_mp[m].jsrc[1];
@@ -9395,6 +9421,8 @@ static void cfg_set(const char* k, const char* v){
                    меньше любого из порогов и проходят как проходили. */
                 if     (!cicmp(sk,"pint_v")){ if(d>319)d=319; g_mp[m].pint_v=d; }
                 else if(!cicmp(sk,"pint_h")){ if(d>447)d=447; g_mp[m].pint_h=d; }
+                else if(!cicmp(sk,"pint_w")){ if(d>2)d=0; g_mp[m].pint_w=d; }   /* v447 */
+                else if(!cicmp(sk,"port_ff")){ g_mp[m].pff = d ? 1 : 0; }         /* v448 */
                 else if(!cicmp(sk,"paper_h")){ if(d>447)d=447; g_mp[m].paper_h=d; }
                 else if(!cicmp(sk,"paper_v")){ if(d>319)d=319; g_mp[m].paper_v=d; }
                 else if(!cicmp(sk,"crop_l")){ if(d>190)d=190; g_mp[m].crop_l=d; }
@@ -9608,7 +9636,7 @@ static int config_save(void){                  /* 1 = written OK, 0 = failed (ca
     mp_store((opt_defmachine>=0&&opt_defmachine<N_MACHINES)?opt_defmachine:0);   /* flush live opt_* into g_mp[current] before writing ALL machines */
     for(int m=0;m<N_MACHINES;m++){ const char* tg=MACHINE_TAG[m]; char b[8];
         #define SAVEKV(nm,val) do{ p=appstr(o,p,tg); p=appch(o,p,'.'); p=appstr(o,p,nm "="); itoa_u((unsigned)(val),b); p=appstr(o,p,b); p=appch(o,p,'\r'); p=appch(o,p,'\n'); }while(0)
-        SAVEKV("pint_v",g_mp[m].pint_v);  SAVEKV("pint_h",g_mp[m].pint_h);
+        SAVEKV("pint_v",g_mp[m].pint_v);  SAVEKV("pint_h",g_mp[m].pint_h);  SAVEKV("pint_w",g_mp[m].pint_w);  SAVEKV("port_ff",g_mp[m].pff);   /* v447, v448 */
         SAVEKV("paper_h",g_mp[m].paper_h);SAVEKV("paper_v",g_mp[m].paper_v);
         SAVEKV("crop_l",g_mp[m].crop_l);  SAVEKV("crop_r",g_mp[m].crop_r);
         SAVEKV("crop_t",g_mp[m].crop_t);  SAVEKV("crop_b",g_mp[m].crop_b);
@@ -9793,7 +9821,9 @@ static void apply_pos(void){ DDR_OSD_POS = ((unsigned)opt_y<<16) | (unsigned)opt
 /* Step 15: apply the selected machine model. Owner rule: a model change is NEVER live - it always
    cold-reboots the machine (the F11 RESET+wipe path), like a real machine swap. At boot we only set
    the register (the machine cold-starts anyway). index 1 = Pentagon 1024K -> Pentagon timing bit. */
-static void apply_pint(void){ PENT_INT = ((unsigned)opt_pintv<<16) | (unsigned)opt_pinth; }  /* LIVE only: pokes register. Core keeps running, border not broken. */
+static void apply_pint(void){   /* v447: у Пентагона ещё длительность INT в [14:9]; у 48K эти биты - лаборатория, туда 0 */
+    unsigned w = (opt_defmachine == 1 && opt_pintw >= 0 && opt_pintw <= 2) ? PINTW_T[opt_pintw] : 0u;
+    PENT_INT = ((unsigned)opt_pintv<<16) | (w << 9) | (unsigned)opt_pinth; }  /* LIVE only: pokes register. Core keeps running, border not broken. */
 static void apply_crop(void);   /* v0.15.434: панорама живёт в кропе, объявление нужно раньше тела */
 static void apply_blend(void){ FRAME_BLEND_REG = (uint32_t)((opt_blend >= 0 && opt_blend <= 2) ? opt_blend : 1); }   /* v445: ядра до B0198 запись молча игнорируют */
 /* v0.15.434: пункт двигает ДВА механизма - растровый (Пентагон) и оконный (все остальные),
@@ -10019,6 +10049,9 @@ static unsigned machine_cfg_word(void){
        перебивать плавающую шину: измерено на стенде - из 1659 чтений за кадр джойстик отдавал 831.
        Умолчание 0 (нет интерфейса) - решение владельца 09.09; включать опцией под игру. */
     if(opt_kj && opt_defmachine != 4) cfg |= (1u << 28);
+    /* v448 бит29 = порт #FF Пентагона отдаёт атрибут (ядро B0200). Только Пентагону: у Синклеров там своя
+       плавающая шина и бит ядро у них не смотрит, но слово держим чистым. Ядра до B0200 бит игнорируют. */
+    if(opt_defmachine == 1 && opt_pff) cfg |= (1u << 29);
     /* v383/v387 Бит скорости SPI принадлежит ОБЩЕМУ движку карты, а не одному транспорту: карта в
        фабрике одна, и оба порта (#57 у Z-Controller, #EB у DivMMC) сдвигают через неё же. Раньше бит
        ставился только внутри ветки Z-Controller, поэтому конфигурация «DivMMC включён, ZC выключен»
@@ -10147,6 +10180,7 @@ static int rom_port_ok(void){
     return 0;
 }
 static void apply_snow(void){ MACHINE_CFG = machine_cfg_word(); }
+static void apply_pff(void){ MACHINE_CFG = machine_cfg_word(); }   /* v448: бит29 живой, сброс не нужен */
 static void apply_kj(void){ MACHINE_CFG = machine_cfg_word(); }   /* B0175: бит28 живой, сброс не нужен */   /* v145: LIVE ULA-snow toggle. Only bit4 changes vs the running mode -> the vmmA1 mux flips, no ROM/paging glitch, no reset. */
 /* v0.15.207 ROM SET: смена набора ПЗУ - это смена ЛИЦА машины, поэтому обязателен холодный старт
    (иначе Z80 продолжит исполнять адреса прежнего ПЗУ). MACHINE_CFG перетолкивается ПОСЛЕ заливки:
@@ -10620,7 +10654,9 @@ static menu_item opt_items[] = {
     {"BORDER MODE", ITEM_CHOICE,&opt_border_mode,CH_BORDMODE,2,0,apply_ulatune},       /* [90] */
     {"KEMPSTON JOYSTICK", ITEM_CHOICE, &opt_kj, CH_NOYES, 2, 0, apply_kj},              /* [91] B0175: интерфейса на голом 48K нет; ВЫКЛ = порты с a5=0 отдают плавающую шину */
     {"TAPE LOAD VIA", ITEM_CHOICE, &opt_tape128, CH_TAPE128, 3, 0},
-    {"FRAME BLEND", ITEM_CHOICE, &opt_blend, CH_BLEND, 3, 0, apply_blend},                /* [93] v445: смешение кадров на выводе */                     /* [92] v443: как автостарт входит в загрузку на 128K/Пентагоне */
+    {"FRAME BLEND", ITEM_CHOICE, &opt_blend, CH_BLEND, 3, 0, apply_blend},                /* [93] v445: смешение кадров на выводе */
+    {"PENTAGON INT LENGTH", ITEM_CHOICE, &opt_pintw, CH_PINTW, 3, 0, apply_pint},       /* [94] v447: 36 / 32 / 44 тактов */
+    {"PENTAGON PORT #FF", ITEM_CHOICE, &opt_pff, CH_PFF, 2, 0, apply_pff},             /* [95] v448: #FF / ATTRIBUTE */
 };
 /* (no opt_menu instance any more: opt_items[] feed the Options > Settings nested dropdown directly) */
 
@@ -10787,7 +10823,7 @@ static const struct { short ix; const char* lab; } MENU_IX_EXPECT[] = {
     {78,"DIVMMC WRITE"},{79,"Z-CONTROLLER WRITE"},
     {80,"IO CONT DLY"},{81,"BORD PHASE"},{82,"BORD DELAY"},{83,"PAPER DELAY"},{84,"IRQ PHASE"},
     {85,"INT SOURCE"},{86,"ULA PHASE"},{87,"TUNE OVERRIDE"},{88,"MEM CONT DLY"},
-    {89,"FLOAT BUS DLY"},{90,"BORDER MODE"},{91,"KEMPSTON JOYSTICK"},{92,"TAPE LOAD VIA"},{93,"FRAME BLEND"},   /* v443: 91 сторож тоже не проверял */                                                /* v433 */
+    {89,"FLOAT BUS DLY"},{90,"BORDER MODE"},{91,"KEMPSTON JOYSTICK"},{92,"TAPE LOAD VIA"},{93,"FRAME BLEND"},{94,"PENTAGON INT LENGTH"},{95,"PENTAGON PORT #FF"},   /* v443: 91 сторож тоже не проверял */                                                /* v433 */
 };
 /* v231 АУДИТ ВЫСОТ МЕНЮ. Тот же приём, что MENU_IX_EXPECT для индексов: проверяем инвариант на
    старте, а не ждём жалобы на артефакты. Подменю машин уже дважды перерастало окружение, когда в
@@ -10857,6 +10893,8 @@ static const MenuItem mi_machine_pent[] = {
   {"ULA snow",       0,0,NULL, NULL, &opt_items[39]},   /* v352: у Пентагона его нет - дефолт OFF, но A/B оставлен */
   {"Pentagon INT V", 0,0,NULL, NULL, &opt_items[22]},
   {"Pentagon INT H", 0,0,NULL, NULL, &opt_items[23]},
+  {"Pentagon INT length",0,0,NULL, NULL, &opt_items[94]},   /* v447: 36 (умолчание) / 32 / 44 тактов */
+  {"Port #FF read",  0,0,NULL, NULL, &opt_items[95]},   /* v448: #FF (умолчание) / ATTRIBUTE как Sizif-512 */
   {"Kempston map",   0,0,NULL, NULL, &opt_items[15]},
   {"NumPad as joystick",0,0,NULL, NULL, &opt_items[43]},
   {"Kempston mouse", 0,0,NULL, NULL, &opt_items[67]},   /* v304 */

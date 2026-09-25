@@ -8,6 +8,7 @@ module main
 	input  wire       mem_wait, // 1 = память не готова (расширенный банк в DDR) -> ТАКТ ОЖИДАНИЯ процессора
 	input  wire       snow_off, // 1 = ULA snow OFF (clean raster fetch); 0 = faithful 128 snow (default) - MACHINE_CFG bit4
 	input  wire       io_cont_early, // B0154: 1 = окно контеншена ПОРТОВ как до B0154, на такт РАНЬШЕ
+	input  wire       ff_attr,  // B0200: 1 = Пентагон отдаёт на чтение #xxFF атрибут (как Sizif-512), 0 = #FF (как MiSTer). MACHINE_CFG бит29
 	input  wire       kj_en,        // B0175: джойстик Kempston ЕСТЬ (MACHINE_CFG бит28). На голом
 	                                //        48K интерфейса нет, и порты с a[5]=0 обязаны отдавать
 	                                //        плавающую шину - иначе тесты 35/36/37 Timing Tests 48K
@@ -424,6 +425,7 @@ wire[12:0] vduA;
 // объявление vdu_dbg_h/vdu_dbg_v поднято ВЫШЕ (к cpuck): его читает ck_lock_v
 wire[ 7:0] vduD = vmmD;
 wire[ 7:0] vduQ;
+wire[ 7:0] vduQattr;                      // B0200: атрибут для порта #FF Пентагона
 wire       vdu_scr_we;                    // BulbuLator: ULA screen-fetch strobe (from video)
 assign scr_capA  = vduA;                  // raw ZX screen address (native interleaved layout)
 assign scr_capD  = vduD;                  // = vmmD: byte from the displayed bank (shadow-aware)
@@ -452,6 +454,7 @@ video Video
 	.a      (vduA   ),
 	.d      (vduD   ),
 	.q      (vduQ   ),
+	.qattr  (vduQattr),
 	.blank  (blank  ),
 	.hsync  (hsync  ),
 	.vsync  (vsync  ),
@@ -1121,7 +1124,11 @@ assign d
 	: !ioEB ? usdQ
 	: !ioFE ? { 1'b1, ear|speaker, 1'b1, keyQ }
 	: !ioFFFD ? psgQ
-	: pentagon ? 8'hFF                             // Pentagon has NO floating bus: unmapped IN = 0xFF (MiSTer: mZX ? ff_data : 8'hFF)
+	: pentagon ? ((ff_attr && a[7:0] == 8'hFF) ? vduQattr : 8'hFF)
+	                                               /* Pentagon has NO floating bus: unmapped IN = 0xFF (MiSTer: mZX ? ff_data : 8'hFF).
+	                                                  B0200 ff_attr: чтение #xxFF отдаёт атрибут (Sizif-512). Только младший
+	                                                  байт #FF, как у Sizif; под TR-DOS порт раньше забирает bd_oe (Beta Disk),
+	                                                  у SAA1099 на #FF только запись - ему чтение не мешает. */
 	: vduQ;                                        // Sinclair floating bus (video fetch byte)
 
 //-------------------------------------------------------------------------------------------------

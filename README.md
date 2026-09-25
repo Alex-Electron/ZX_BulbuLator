@@ -69,8 +69,8 @@ the bitstream. The other files add machines and devices. Paths on the left are r
 
 | From the repo | To the card | What it is |
 |---|---|---|
-| `bitstreams/BOOT_B0198_v0.15.446.BIN` | `BOOT.BIN` | boot image: first-stage loader, ZX core and the shell firmware |
-| `bitstreams/ATLAS_B0198.bit.bin` | `CORES/ATLAS.BIT.BIN` | the ZX core; the shell reloads it from here when you switch machines |
+| `bitstreams/BOOT_B0200_v0.15.448.BIN` | `BOOT.BIN` | boot image: first-stage loader, ZX core and the shell firmware |
+| `bitstreams/ATLAS_B0200.bit.bin` | `CORES/ATLAS.BIT.BIN` | the ZX core; the shell reloads it from here when you switch machines |
 | `bitstreams/NES_CE29.bit.bin` | `CORES/NES.BIT.BIN` | NES / Dendy |
 | `roms/*.ROM` | `ROMS/` | ROM sets, picked per machine with `ROM SET` |
 | `roms/GS105B.ROM` | `GS/GS105B.ROM` | General Sound firmware |
@@ -156,12 +156,14 @@ button-capture wizard.
 
 - **Real floppy drive** — routing the WD1793 signals out to GPIO through a 3.3 V → 5 V level shifter, so
   a physical drive can hang off the board. The part I most want to build.
-- **Networking** ([Step 16](https://github.com/Alex-Electron/ZX_BulbuLator/issues/82)) — a web remote panel with the live screen, keyboard
+- **ATM Turbo 2 and CP/M** ([Step 16](https://github.com/Alex-Electron/ZX_BulbuLator/issues/109)) — a new machine with an 80×25 text
+  mode and RAM at `#0000`, so CP/M runs with a proper 80-column screen and Turbo Pascal runs on the board.
+- **Networking** ([Step 17](https://github.com/Alex-Electron/ZX_BulbuLator/issues/82)) — a web remote panel with the live screen, keyboard
   and an SD file manager. The firmware side is written; this board's Ethernet hangs off FPGA pins rather
   than the processor's, so it needs a bitstream that routes the controller out to the PHY.
 - **[ULAplus and the 64-colour palette](https://github.com/Alex-Electron/ZX_BulbuLator/issues/84)** —
   an exact optional replacement-ULA, isolated from the normal video path.
-- **More machines** — C64 first, then ATM Turbo.
+- **More machines** — C64 after the ATM Turbo 2.
 - **More sound formats** — tracker and register-dump chiptunes, and the YM2203 of TurboSound-FM.
 - **Sinclair Interface 2 and Sega / Dendy gamepads.**
 - **Save states** — snapshots load today, but cannot yet be written back.
@@ -215,8 +217,11 @@ provenance, in [`research/15-pentagon/roms/`](research/15-pentagon/roms/).
 
 Step 15 also closed four tracker issues: [#43](https://github.com/Alex-Electron/ZX_BulbuLator/issues/43) (Pentagon 128/256/1024), [#52](https://github.com/Alex-Electron/ZX_BulbuLator/issues/52) (TR-DOS / Beta Disk), [#53](https://github.com/Alex-Electron/ZX_BulbuLator/issues/53) (esxDOS through DivMMC, `.hdf` through NEMO-IDE) and the umbrella [#51](https://github.com/Alex-Electron/ZX_BulbuLator/issues/51) (virtual disks). What's still open for the Pentagon is collected in [#96](https://github.com/Alex-Electron/ZX_BulbuLator/issues/96).
 
-Next: the network. **Step 16** puts a web remote panel on the board — live screen, keyboard and an SD
-file manager in a browser. The firmware side already exists; the obstacle is physical, since this
+Next: **Step 16** is a new machine, the ATM Turbo 2. It has what CP/M needs and a plain Spectrum
+lacks: RAM at `#0000` and an 80×25 text mode, so CP/M gets a real 80-column screen and Turbo Pascal
+runs on the board. It will be a separate core, loaded from the SD card like the NES one.
+**Step 17** is the network: a web remote panel with the live screen, keyboard and an SD file
+manager in a browser. The firmware side already exists; the obstacle is physical, since this
 board's Ethernet hangs off FPGA pins rather than the processor's, so it needs a bitstream that routes
 the controller out to the PHY.
 
@@ -338,7 +343,10 @@ So far:
   NEMO-IDE, DivMMC/esxDOS, Z-Controller), six sound sources including a General Sound that plays music,
   and a tape station that no longer fools a demo's own 48K/128K detector. Ships with prebuilt cores and
   documented ROM sets.
-- **Step 16 — the network (planned).** A web remote panel for the board: live screen, keyboard and an SD
+- **Step 16 — ATM Turbo 2 and CP/M (planned).** A new machine for CP/M with 80-column text: the ATM
+  paging with RAM at `#0000`, its 80×25 text, 640×200 and 320×200 modes, and the 7 MHz turbo. Tracked in
+  [#109](https://github.com/Alex-Electron/ZX_BulbuLator/issues/109).
+- **Step 17 — the network (planned).** A web remote panel for the board: live screen, keyboard and an SD
   file manager in a browser. The firmware side is written; what is missing is a bitstream that routes
   the Ethernet controller out to this board's PHY pins, because the Ethernet is wired to the FPGA rather
   than to the processor.
@@ -346,6 +354,8 @@ So far:
 More steps get added as I get them working.
 
 ## Changelog
+- **2026-09-25 — Pentagon checked against the real machine: core B0200, firmware v0.15.448.** The Pentagon finally has an automatic test. [PENTTEST](research/15-pentagon/tools/penttest/) is a self-checking tape in the spirit of the 48K Timing Tests, built on Jan Bobrowski's timing code: frame length, `EI`, INT length, the IM2 vector, port `#FF`, RAM size and the absence of contention in every bank. It passes 9 of 9. Two raster tapes step Bobrowski's stime and btime through T-states on their own, and a host script reads the results from frame snapshots. They agree with a real Pentagon to within half a T-state: btime 17762 (real 17762–17763), stime 17984 visible and 17985 not (the real machine flickers at 17984). Where the references disagree, the machine now has options instead of one hard-coded answer. *Pentagon INT length* is 36 T by default (Fuse, ZEsarUX), with 32 T (Sizif-512, MiSTer, Unreal) and 44 T (measured on a real board). *Port #FF read* returns `#FF` by default, like a stock Pentagon, or the current attribute like Sizif-512 and modified boards, for Sinclair games that sync on the floating bus. A frame counter tape also measured the CPU clock at 3.5416 MHz on every machine, about 1 % faster than a real 48K or Pentagon.
+
 - **2026-09-24 — firmware v0.15.446.** *Load via (128K) = 48 LOCK* now really locks paging on the Pentagon. On a Pentagon 1024, bit 5 of `#7FFD` is a lock only in the standard 128K mode (`#EFF7` bit 2); after reset the machine is in 1024 mode, where the same bit selects a memory bank. Auto-start now switches to standard mode first and then locks, as the real machine does.
 
 - **2026-09-24 — Step 15: frame blend, core B0198, firmware v0.15.445.** Demos that flip between the two screens every frame (the rotating shadow in Eklhaft SP2, gigascreen pictures) blend into a steady image on a CRT but flicker at 25 Hz on an LCD. *Display → Frame blend* now shows the average of the machine's last two frames on HDMI: OFF, AUTO (the default: on only while the machine flips screens almost every frame, so games and loading stripes stay sharp) or ON. The frame buffer grew from three to five, so the pair is always two consecutive machine frames, even when the 50.02 Hz machine gets a frame ahead of the 50.00 Hz HDMI. The machine and its timing are untouched: with blending off the output is pixel for pixel what it was, and Timing Tests pass 3/3 on 48K and 68/68 on 128K.

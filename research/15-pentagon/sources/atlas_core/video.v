@@ -23,6 +23,7 @@ module video
 	output reg [12:0] a,
 	input  wire[ 7:0] d,
 	output wire[ 7:0] q,          // B0175: плавающая шина стала мультиплексором, а не регистром
+	output wire[ 7:0] qattr,      // B0200: порт #FF Пентагона в режиме ATTRIBUTE (последний выбранный атрибут, вне бумаги #FF)
 
 	output wire       blank,
 	output wire       hsync,
@@ -38,8 +39,8 @@ module video
 //-------------------------------------------------------------------------------------------------
 
 // Pentagon: 448 clk/line (224 T, like 48K) x 320 lines = 71680 T/frame; INT on line 239 late in the
-// line (hc 326..397, 36 T) - constants cross-checked against MiSTer ula.sv, ZX-Uno pal_sync_generator
-// and Speccy2010 (all agree). 128K keeps 456x311, 48K keeps 448x312.
+// line (hc 326, length = machine option, default 36 T - see irqWidth). Frame geometry agrees with MiSTer
+// ula.sv, ZX-Uno, Speccy2010, Sizif-512 and Fuse; INT LENGTH does not (32 vs 36 vs RC-measured 43/44). 128K keeps 456x311, 48K keeps 448x312.
 wire[8:0] hCountEnd = pentagon ? 9'd448 : (model ? 9'd456 : 9'd448);
 wire[8:0] vCountEnd = pentagon ? 9'd320 : (model ? 9'd311 : 9'd312);
 
@@ -60,7 +61,14 @@ wire[8:0] tune_irq_beg = tune_irq_sum[9]
                        ? tune_irq_sum + 10'sd448
                        : tune_irq_sum[8:0];
 wire[8:0] irqBeg   = pentagon ? pent_int_h : (tune_en ? tune_irq_beg : (model ? 9'd6 : 9'd4)   /* B0191: 48K = 4 (проверено, TIMING48 100%); 128K возвращён на 6 - при 8 тест 128K валит уже тест 4 занятый (лишняя итерация) */);
-wire[8:0] irqWidth = pentagon ? 9'd72 : (model ? 9'd72 : 9'd64);
+/* 🥇 B0199 ДЛИТЕЛЬНОСТЬ INT ПЕНТАГОНА - ОПЦИЯ МАШИНЫ (владелец 24.09: «вводим в опцию, по умолчанию 36»).
+   Источники расходятся: 32 такта у Sizif-512, MiSTer (режим Пентагона), Unreal, ZX-Evo, TS-Conf; 36 у Fuse,
+   ZEsarUX, Потапова; на одной живой плате minfo намерил 43/44 (там длину задаёт RC-цепочка, она у плат разная).
+   Прежний комментарий «сверено с MiSTer» был неверен: у MiSTer 72 тика только у ULA 128K, у Пентагона 64.
+   Длительность в ТАКТАХ приходит в PENT_INT[14:9] (у 48K эти биты - лаборатория, но только при tune_en,
+   то есть не у Пентагона); 0 = прежние 36 тактов, поэтому старая прошивка поведения не меняет. */
+wire[8:0] pentIrqW = (ula_tune[14:9] == 6'd0) ? 9'd72 : {2'b00, ula_tune[14:9], 1'b0};
+wire[8:0] irqWidth = pentagon ? pentIrqW : (model ? 9'd72 : 9'd64);
 // A negative delta from native h=2 belongs to the PREVIOUS raster line. The IRQ pulse can then
 // continue through h=0 of irqLine. Track the start line explicitly; an h-only modular comparator
 // would incorrectly start such a pulse at h=0 of line 248 and collapse all deltas below -2.
@@ -264,6 +272,22 @@ always @(posedge clock) if(ce) if(dataInputLoad) dataInput <= d;
 
 reg[7:0] attrInput;
 always @(posedge clock) if(ce) if(attrInputLoad) attrInput <= d;
+
+/* 🥇 B0200 ПОРТ #FF ПЕНТАГОНА, РЕЖИМ ATTRIBUTE (опция машины, MACHINE_CFG бит29). Эталон - Sizif-512
+   cpld/rtl/video.sv:283-289 (живой апстрим, сверено 24.09): у Пентагона чтение порта с младшим байтом #FF
+   во время выборки бумаги отдаёт attr_next - ПОСЛЕДНИЙ выбранный атрибут, а вне бумаги шину никто не
+   ведёт (#FF). Здесь то же: регистр держит байт с последнего строба attrInputLoad и сбрасывается в #FF
+   вне окна выборки (dataEnable). Отличие от Sizif в первые такты строки до первой выборки атрибута: у
+   Sizif там лежит цвет бордюра {00,border,border}, у нас #FF - софт, синхронизирующийся по атрибуту,
+   ждёт конкретное значение атрибута, и ни то ни другое его не обманет. Фаза выдачи с точностью до такта
+   с живым клоном НЕ сверена (прибора нет). Отдельный регистр, а не attrInput: attrInput держит байт
+   прошлой строки на всём гашении, и порт отдавал бы атрибут там, где у Sizif #FF. */
+reg[7:0] attrBus = 8'hFF;
+always @(posedge clock) if(ce) begin
+    if(!dataEnable) attrBus <= 8'hFF;
+    else if(attrInputLoad) attrBus <= d;
+end
+assign qattr = attrBus;
 
 /* Отвод для зеркала экрана BulbuLator: на стробе (a, d) - адрес и байт одной выборки ULA,
    родитель складывает их в 6912-байтное зеркало в фабрике = «экран как он лёг».
